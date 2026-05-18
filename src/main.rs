@@ -18,7 +18,12 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = LspService::build(Backend::new)
+        .custom_method("ifc/openFromDisk", Backend::open_from_disk)
+        .custom_method("ifc/closeFromDisk", Backend::close_from_disk)
+        .custom_method("ifc/diagnostics", Backend::diagnostics)
+        .custom_method("ifc/visibleDiagnostics", Backend::visible_diagnostics)
+        .finish();
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }

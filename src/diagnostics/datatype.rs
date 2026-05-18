@@ -3,7 +3,8 @@
 //! reports arity, reference, primitive, aggregate, enumeration, and select-type mismatches.
 //! General EXPRESS `WHERE` rules are intentionally out of scope for the current implementation.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
+use tree_sitter::Node;
 
 use crate::document::{Document, EntityInstanceInfo, ParameterValue};
 use crate::schema::{
@@ -16,6 +17,42 @@ pub fn collect_with_schema_name(
     schema: &SchemaDoc,
     schema_name: Option<&str>,
 ) -> Vec<Diagnostic> {
+    collect_with_options(
+        document,
+        schema,
+        schema_name,
+        DiagnosticOptions {
+            reference_document: None,
+        },
+    )
+}
+
+pub fn collect_visible_with_schema_name(
+    document: &Document,
+    reference_document: &Document,
+    schema: &SchemaDoc,
+    schema_name: Option<&str>,
+) -> Vec<Diagnostic> {
+    collect_with_options(
+        document,
+        schema,
+        schema_name,
+        DiagnosticOptions {
+            reference_document: Some(reference_document),
+        },
+    )
+}
+
+struct DiagnosticOptions<'a> {
+    reference_document: Option<&'a Document>,
+}
+
+fn collect_with_options(
+    document: &Document,
+    schema: &SchemaDoc,
+    schema_name: Option<&str>,
+    options: DiagnosticOptions<'_>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = collect_syntax_diagnostics(document);
 
     for instance in &document.instances {
@@ -24,7 +61,14 @@ pub fn collect_with_schema_name(
             continue;
         };
 
-        validate_instance(document, schema, entity, instance, &mut diagnostics);
+        validate_instance(
+            document,
+            schema,
+            entity,
+            instance,
+            &mut diagnostics,
+            &options,
+        );
     }
 
     diagnostics
@@ -36,6 +80,7 @@ fn validate_instance(
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
     diagnostics: &mut Vec<Diagnostic>,
+    options: &DiagnosticOptions<'_>,
 ) {
     if instance.parameters.len() != entity.attributes.len() {
         diagnostics.push(Diagnostic {
@@ -54,7 +99,7 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Some(message) = validate_value(document, schema, value, attribute) {
+        if let Some(message) = validate_value(document, schema, value, attribute, options) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -89,6 +134,7 @@ fn validate_value(
     schema: &SchemaDoc,
     value: &ParameterValue,
     attribute: &EntityAttributeDoc,
+    options: &DiagnosticOptions<'_>,
 ) -> Option<String> {
     match value {
         ParameterValue::Null { .. } => {
@@ -105,7 +151,7 @@ fn validate_value(
                 Some("`*` is not supported for this attribute".to_string())
             }
         }
-        _ => validate_non_null_value(document, schema, value, &attribute.ty),
+        _ => validate_non_null_value(document, schema, value, &attribute.ty, options),
     }
 }
 
@@ -114,17 +160,20 @@ fn validate_non_null_value(
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected: &TypeRef,
+    options: &DiagnosticOptions<'_>,
 ) -> Option<String> {
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
-        TypeRef::Aggregate(aggregate) => validate_aggregate(document, schema, value, aggregate),
+        TypeRef::Aggregate(aggregate) => {
+            validate_aggregate(document, schema, value, aggregate, options)
+        }
         TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => None,
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
-                validate_entity_reference(document, schema, value, &named.name)
+                validate_entity_reference(document, schema, value, &named.name, options)
             }
             NamedTypeKind::Type | NamedTypeKind::Unresolved => {
-                validate_named_type(document, schema, value, &named.name)
+                validate_named_type(document, schema, value, &named.name, options)
             }
         },
     }
@@ -135,6 +184,7 @@ fn validate_named_type(
     schema: &SchemaDoc,
     value: &ParameterValue,
     type_name: &str,
+    options: &DiagnosticOptions<'_>,
 ) -> Option<String> {
     let type_def = schema.type_decl(type_name)?;
     match type_def {
@@ -158,10 +208,10 @@ fn validate_named_type(
                         type_name
                     ))
                 } else {
-                    validate_non_null_value(document, schema, &inner[0], &alias.target)
+                    validate_non_null_value(document, schema, &inner[0], &alias.target, options)
                 }
             } else {
-                validate_non_null_value(document, schema, value, &alias.target)
+                validate_non_null_value(document, schema, value, &alias.target, options)
             }
         }
         TypeDoc::Enumeration(enum_def) => {
@@ -190,7 +240,7 @@ fn validate_named_type(
                 validate_enum_value(value, &enum_def.items)
             }
         }
-        TypeDoc::Select(select) => validate_select(document, schema, value, select),
+        TypeDoc::Select(select) => validate_select(document, schema, value, select, options),
     }
 }
 
@@ -199,11 +249,12 @@ fn validate_select(
     schema: &SchemaDoc,
     value: &ParameterValue,
     select: &SelectTypeDef,
+    options: &DiagnosticOptions<'_>,
 ) -> Option<String> {
     if select
         .options
         .iter()
-        .any(|option| validate_non_null_value(document, schema, value, option).is_none())
+        .any(|option| validate_non_null_value(document, schema, value, option, options).is_none())
     {
         None
     } else {
@@ -238,6 +289,7 @@ fn validate_aggregate(
     schema: &SchemaDoc,
     value: &ParameterValue,
     aggregate: &AggregateTypeRef,
+    options: &DiagnosticOptions<'_>,
 ) -> Option<String> {
     let ParameterValue::List { items, .. } = value else {
         return Some(format!(
@@ -269,7 +321,9 @@ fn validate_aggregate(
     }
 
     for item in items {
-        if let Some(message) = validate_non_null_value(document, schema, item, &aggregate.item) {
+        if let Some(message) =
+            validate_non_null_value(document, schema, item, &aggregate.item, options)
+        {
             return Some(message);
         }
     }
@@ -282,6 +336,7 @@ fn validate_entity_reference(
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected_entity: &str,
+    options: &DiagnosticOptions<'_>,
 ) -> Option<String> {
     let ParameterValue::Reference { id, .. } = value else {
         return Some(format!(
@@ -291,21 +346,51 @@ fn validate_entity_reference(
         ));
     };
 
-    let Some(definition) = document.definitions.get(id) else {
+    let reference_document = options.reference_document.unwrap_or(document);
+    let Some(definition) = reference_document.definitions.get(id) else {
         return Some(format!(
             "reference `#{}` does not resolve to a local entity",
             id
         ));
     };
 
-    if schema.is_entity_compatible(&definition.entity_name, expected_entity) {
+    let entity_name = definition
+        .entity_name
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| lazy_definition_entity_name(reference_document, definition.entity_range));
+    let Some(entity_name) = entity_name.as_deref() else {
+        return Some(format!(
+            "reference `#{}` does not have entity type information",
+            id
+        ));
+    };
+
+    if schema.is_entity_compatible(entity_name, expected_entity) {
         None
     } else {
         Some(format!(
             "expected reference to `{}` but `#{}` points to `{}`",
-            expected_entity, id, definition.entity_name
+            expected_entity, id, entity_name
         ))
     }
+}
+
+fn lazy_definition_entity_name(document: &Document, range: Range) -> Option<String> {
+    let mut node = document.node_at_position(range.start)?;
+    while node.kind() != "entity_instance" {
+        node = node.parent()?;
+    }
+
+    entity_name_child(node, &document.text)
+}
+
+fn entity_name_child(node: Node<'_>, text: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind() == "entity_name")
+        .and_then(|child| child.utf8_text(text.as_bytes()).ok())
+        .map(str::to_ascii_uppercase)
 }
 
 fn validate_primitive(value: &ParameterValue, primitive: &PrimitiveType) -> Option<String> {
@@ -492,6 +577,7 @@ mod tests {
             text: "#1=IFCWALL('gid',.MOVABLE.);".to_string(),
             tree: None,
             schema_name: None,
+            parse_mode: crate::document::DocumentParseMode::Full,
             definitions: HashMap::new(),
             references: HashMap::new(),
             instances: vec![crate::document::EntityInstanceInfo {

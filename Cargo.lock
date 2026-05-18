@@ -537,6 +537,8 @@ name = "ifc-language-server"
 version = "0.3.0"
 dependencies = [
  "espr",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "tower-lsp",

@@ -4,6 +4,7 @@
 //! It also stores structured parameter values so diagnostics can validate attribute arguments.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter::{Node, Parser, Point, Tree, TreeCursor};
@@ -13,17 +14,61 @@ pub struct Document {
     pub text: String,
     pub tree: Option<Tree>,
     pub schema_name: Option<String>,
+    pub parse_mode: DocumentParseMode,
     pub definitions: HashMap<u32, DefinitionInfo>,
     pub references: HashMap<u32, Vec<Range>>,
     pub instances: Vec<EntityInstanceInfo>,
     pub(crate) instance_indexes_by_id: HashMap<u32, usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentParseMode {
+    Full,
+    NavigationOnly,
+}
+
+impl DocumentParseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::NavigationOnly => "navigation-only",
+        }
+    }
+
+    fn should_parse_parameters(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn should_index_references(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentParseMetrics {
+    pub mode: DocumentParseMode,
+    pub source_bytes: usize,
+    pub tree_parse_ms: u128,
+    pub schema_detect_ms: u128,
+    pub index_build_ms: u128,
+    pub definitions: usize,
+    pub reference_groups: usize,
+    pub reference_ranges: usize,
+    pub instances: usize,
+    pub parameter_values: usize,
+}
+
+impl DocumentParseMetrics {
+    pub fn total_parse_ms(&self) -> u128 {
+        self.tree_parse_ms + self.schema_detect_ms + self.index_build_ms
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefinitionInfo {
     pub id_range: Range,
     pub entity_range: Range,
-    pub entity_name: String,
+    pub entity_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,24 +156,65 @@ impl ParameterValue {
 }
 
 impl Document {
+    #[cfg(test)]
     pub fn parse(parser: &mut Parser, text: String) -> Self {
+        Self::parse_with_metrics(parser, text, DocumentParseMode::Full).0
+    }
+
+    pub fn parse_with_metrics(
+        parser: &mut Parser,
+        text: String,
+        mode: DocumentParseMode,
+    ) -> (Self, DocumentParseMetrics) {
+        let source_bytes = text.len();
+
+        let tree_started = Instant::now();
         let tree = parser.parse(&text, None);
+        let tree_parse_ms = tree_started.elapsed().as_millis();
+
+        let schema_started = Instant::now();
         let schema_name = detect_schema(&tree, &text);
-        let (definitions, references, instances) = build_indexes(&tree, &text);
+        let schema_detect_ms = schema_started.elapsed().as_millis();
+
+        let index_started = Instant::now();
+        let (definitions, references, instances) = build_indexes(&tree, &text, mode);
+        let index_build_ms = index_started.elapsed().as_millis();
+
+        let reference_ranges = references.values().map(Vec::len).sum();
+        let parameter_values = instances
+            .iter()
+            .map(|instance| count_parameter_values(&instance.parameters))
+            .sum();
+        let metrics = DocumentParseMetrics {
+            mode,
+            source_bytes,
+            tree_parse_ms,
+            schema_detect_ms,
+            index_build_ms,
+            definitions: definitions.len(),
+            reference_groups: references.len(),
+            reference_ranges,
+            instances: instances.len(),
+            parameter_values,
+        };
+
         let instance_indexes_by_id = instances
             .iter()
             .enumerate()
             .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
             .collect();
-        Self {
+        let document = Self {
             text,
             tree,
             schema_name,
+            parse_mode: mode,
             definitions,
             references,
             instances,
             instance_indexes_by_id,
-        }
+        };
+
+        (document, metrics)
     }
 
     pub fn node_at_position(&self, position: Position) -> Option<Node<'_>> {
@@ -146,6 +232,17 @@ impl Document {
             .get(&id)
             .and_then(|index| self.instances.get(*index))
     }
+}
+
+fn count_parameter_values(parameters: &[ParameterValue]) -> usize {
+    parameters
+        .iter()
+        .map(|parameter| match parameter {
+            ParameterValue::List { items, .. } => 1 + count_parameter_values(items),
+            ParameterValue::Typed { inner, .. } => 1 + count_parameter_values(inner),
+            _ => 1,
+        })
+        .sum()
 }
 
 fn detect_schema(tree: &Option<Tree>, text: &str) -> Option<String> {
@@ -222,7 +319,7 @@ fn extract_first_string(node: Node<'_>, text: &str) -> Option<String> {
     None
 }
 
-fn build_indexes(tree: &Option<Tree>, text: &str) -> DocumentIndexes {
+fn build_indexes(tree: &Option<Tree>, text: &str, mode: DocumentParseMode) -> DocumentIndexes {
     let mut definitions = HashMap::new();
     let mut references = HashMap::new();
     let mut instances = Vec::new();
@@ -236,6 +333,7 @@ fn build_indexes(tree: &Option<Tree>, text: &str) -> DocumentIndexes {
     traverse(
         &mut cursor,
         text,
+        mode,
         &mut definitions,
         &mut references,
         &mut instances,
@@ -247,6 +345,7 @@ fn build_indexes(tree: &Option<Tree>, text: &str) -> DocumentIndexes {
 fn traverse(
     cursor: &mut TreeCursor,
     text: &str,
+    mode: DocumentParseMode,
     definitions: &mut HashMap<u32, DefinitionInfo>,
     references: &mut HashMap<u32, Vec<Range>>,
     instances: &mut Vec<EntityInstanceInfo>,
@@ -255,7 +354,7 @@ fn traverse(
         let node = cursor.node();
 
         if node.kind() == "entity_instance" {
-            if let Some(instance) = parse_entity_instance(node, text) {
+            if let Some(instance) = parse_entity_instance(node, text, mode) {
                 if let Some(id) = instance.id {
                     definitions.insert(
                         id,
@@ -264,13 +363,18 @@ fn traverse(
                                 .id_range
                                 .expect("definition ids should have a range"),
                             entity_range: instance.entity_range,
-                            entity_name: instance.entity_name.clone(),
+                            entity_name: mode
+                                .should_parse_parameters()
+                                .then(|| instance.entity_name.clone()),
                         },
                     );
                 }
-                instances.push(instance);
+                if mode.should_parse_parameters() {
+                    instances.push(instance);
+                }
             }
-        } else if node.kind() == "reference"
+        } else if mode.should_index_references()
+            && node.kind() == "reference"
             && let Ok(ref_text) = node.utf8_text(text.as_bytes())
             && let Ok(id) = ref_text.trim_start_matches('#').parse::<u32>()
         {
@@ -278,7 +382,7 @@ fn traverse(
         }
 
         if cursor.goto_first_child() {
-            traverse(cursor, text, definitions, references, instances);
+            traverse(cursor, text, mode, definitions, references, instances);
             cursor.goto_parent();
         }
 
@@ -288,7 +392,11 @@ fn traverse(
     }
 }
 
-fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+fn parse_entity_instance(
+    node: Node<'_>,
+    text: &str,
+    mode: DocumentParseMode,
+) -> Option<EntityInstanceInfo> {
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
@@ -311,7 +419,9 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
             }
             "parameter_list" => {
                 parameter_list_range = Some(node_range(&child));
-                parameters = parse_parameter_list(child, text);
+                if mode.should_parse_parameters() {
+                    parameters = parse_parameter_list(child, text);
+                }
             }
             _ => {}
         }
@@ -533,6 +643,10 @@ mod tests {
         let document = parse_document(text);
         assert!(document.definitions.contains_key(&1));
         assert!(document.references.is_empty());
+        assert_eq!(
+            document.definitions[&1].entity_name.as_deref(),
+            Some("IFCWALL")
+        );
         // "#1" starts at column 0, row 0 and ends at column 2, row 0
         assert_eq!(
             document.definitions[&1].id_range,
@@ -586,5 +700,31 @@ mod tests {
         let instance = document.instance_by_id(2).expect("instance should exist");
 
         assert_eq!(instance.entity_name, "IFCDOOR");
+    }
+
+    #[test]
+    fn navigation_only_parse_skips_full_instances() {
+        let text = "#1=IFCWALL(#2);\n#2=IFCDOOR($);";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+
+        let (document, metrics) = Document::parse_with_metrics(
+            &mut parser,
+            text.to_string(),
+            DocumentParseMode::NavigationOnly,
+        );
+
+        assert_eq!(document.parse_mode, DocumentParseMode::NavigationOnly);
+        assert_eq!(document.definitions.len(), 2);
+        assert!(document.references.is_empty());
+        assert!(document.instances.is_empty());
+        assert!(document.instance_indexes_by_id.is_empty());
+        assert_eq!(document.definitions[&1].entity_name, None);
+        assert_eq!(metrics.reference_groups, 0);
+        assert_eq!(metrics.reference_ranges, 0);
+        assert_eq!(metrics.instances, 0);
+        assert_eq!(metrics.parameter_values, 0);
     }
 }

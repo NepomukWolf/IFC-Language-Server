@@ -504,6 +504,7 @@ mod tests {
             text: "#1=IFCWALL($);".to_string(),
             tree: None,
             schema_name: None,
+            parse_mode: crate::document::DocumentParseMode::Full,
             definitions: HashMap::new(),
             references: HashMap::new(),
             instances: Vec::new(),
