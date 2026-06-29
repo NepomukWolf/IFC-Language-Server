@@ -35,24 +35,32 @@ jobs:
             os_name: linux-x86_64
             bin_name: ifc-language-server
             asset_name: ifc-language-server-${{ github.ref_name }}-linux-x86_64.tar.gz
+            release_dir: target/x86_64-unknown-linux-musl/release
+            rust_target: x86_64-unknown-linux-musl
             rustflags: ""
 
           - runner: windows-2025
             os_name: windows-x86_64
             bin_name: ifc-language-server.exe
             asset_name: ifc-language-server-${{ github.ref_name }}-windows-x86_64.zip
+            release_dir: target/release
+            rust_target: ""
             rustflags: "-C target-feature=+crt-static"
 
           - runner: macos-14
             os_name: macos-arm64
             bin_name: ifc-language-server
             asset_name: ifc-language-server-${{ github.ref_name }}-macos-arm64.tar.gz
+            release_dir: target/release
+            rust_target: ""
             rustflags: ""
 
           - runner: macos-15-intel
             os_name: macos-x86_64
             bin_name: ifc-language-server
             asset_name: ifc-language-server-${{ github.ref_name }}-macos-x86_64.tar.gz
+            release_dir: target/release
+            rust_target: ""
             rustflags: ""
 
     runs-on: ${{ matrix.runner }}
@@ -64,19 +72,47 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux musl toolchain
+        if: matrix.rust_target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
       - name: Run tests
         run: cargo test --locked
 
       - name: Build release binary
+        if: matrix.rust_target == ''
         run: cargo build --release --locked
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Build Linux musl release binary
+        if: matrix.rust_target == 'x86_64-unknown-linux-musl'
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Verify Linux musl binary
+        if: matrix.rust_target == 'x86_64-unknown-linux-musl'
+        run: |
+          binary="${{ matrix.release_dir }}/${{ matrix.bin_name }}"
+          file "$binary"
+          if readelf --version-info "$binary" 2>/dev/null | grep -q "GLIBC_"; then
+            echo "Linux musl binary unexpectedly references glibc"
+            exit 1
+          fi
+          if readelf -d "$binary" 2>/dev/null | grep -q "Shared library: \\[libc\\.so"; then
+            echo "Linux musl binary unexpectedly has a dynamic libc dependency"
+            exit 1
+          fi
 
       - name: Package Unix binary
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          tar -czf "dist/${{ matrix.asset_name }}" -C target/release "${{ matrix.bin_name }}"
+          tar -czf "dist/${{ matrix.asset_name }}" -C "${{ matrix.release_dir }}" "${{ matrix.bin_name }}"
 
       - name: Package Windows binary
         if: runner.os == 'Windows'
@@ -84,7 +120,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive `
-            -Path "target/release/${{ matrix.bin_name }}" `
+            -Path "${{ matrix.release_dir }}/${{ matrix.bin_name }}" `
             -DestinationPath "dist/${{ matrix.asset_name }}"
 
       - name: Upload packaged asset
