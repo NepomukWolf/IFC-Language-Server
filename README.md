@@ -12,6 +12,7 @@
 - Find-references within the current document
 - Document highlight for local STEP ids such as `#123`
 - Signature help for IFC entity parameter lists
+- Document symbols for editor Outline, breadcrumbs, and go-to-symbol navigation
 - Range-based semantic tokens for syntax highlighting
 - Schema-aware diagnostics for:
   - invalid local reference targets

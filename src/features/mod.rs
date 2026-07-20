@@ -4,6 +4,7 @@
 
 pub mod definition;
 pub mod document_highlight;
+pub mod document_symbols;
 pub mod hover;
 pub mod inlay_hints;
 pub mod references;

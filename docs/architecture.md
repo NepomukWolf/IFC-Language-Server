@@ -79,6 +79,7 @@ The server advertises:
 - `textDocument/hover`
 - full text document sync
 - `textDocument/definition`
+- `textDocument/documentSymbol`
 - `textDocument/references`
 - `textDocument/documentHighlight`
 - `textDocument/signatureHelp`
