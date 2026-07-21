@@ -319,6 +319,7 @@ fn render_spatial_scaffold(schema: IfcSchema, context: &mut RenderContext) -> St
     let rel_building_storey_guid = context.next_guid();
     let owner_history = support_entities(context, 8);
     let context_and_units = context_and_units(14);
+    let local_placements = local_placements(23, "#17");
 
     let project = ifc_project(
         schema,
@@ -334,21 +335,21 @@ fn render_spatial_scaffold(schema: IfcSchema, context: &mut RenderContext) -> St
         &site_guid,
         "#8",
         &context.placeholder(4, "Site Name"),
-        "#17",
+        "#23",
     );
     let building = ifc_building(
         3,
         &building_guid,
         "#8",
         &context.placeholder(5, "Building Name"),
-        "#17",
+        "#24",
     );
     let storey = ifc_building_storey(
         4,
         &storey_guid,
         "#8",
         &context.placeholder(6, "Storey Name"),
-        "#17",
+        "#25",
     );
     let rel_project_site = ifc_rel_aggregates(
         5,
@@ -376,7 +377,7 @@ fn render_spatial_scaffold(schema: IfcSchema, context: &mut RenderContext) -> St
     );
 
     format!(
-        "{}{project}{site}{building}{storey}{rel_project_site}{rel_site_building}{rel_building_storey}{owner_history}{context_and_units}{}\nENDSEC;\nEND-ISO-10303-21;\n",
+        "{}{project}{site}{building}{storey}{rel_project_site}{rel_site_building}{rel_building_storey}{owner_history}{context_and_units}{local_placements}{}\nENDSEC;\nEND-ISO-10303-21;\n",
         context.header(schema),
         context.final_tabstop()
     )
@@ -422,6 +423,17 @@ fn context_and_units(first_id: u32) -> String {
         area_unit = first_id + 6,
         volume_unit = first_id + 7,
         unit_assignment = first_id + 8,
+    )
+}
+
+fn local_placements(first_id: u32, relative_placement: &str) -> String {
+    let building_placement = first_id + 1;
+    let storey_placement = first_id + 2;
+
+    format!(
+        "#{first_id}=IFCLOCALPLACEMENT($,{relative_placement});\n\
+         #{building_placement}=IFCLOCALPLACEMENT(#{first_id},{relative_placement});\n\
+         #{storey_placement}=IFCLOCALPLACEMENT(#{building_placement},{relative_placement});\n"
     )
 }
 
@@ -684,5 +696,19 @@ mod tests {
         assert!(output.contains("IFCRELAGGREGATES"));
         assert!(output.contains("IFCUNITASSIGNMENT"));
         assert!(output.contains("IFCGEOMETRICREPRESENTATIONCONTEXT"));
+    }
+
+    #[test]
+    fn spatial_scaffold_uses_object_placements_for_spatial_elements() {
+        let output = render_for_test(ScaffoldLevel::Spatial, IfcSchema::Ifc4x3Add2, "test.ifc");
+
+        assert!(output.contains("#17=IFCAXIS2PLACEMENT3D(#14,#15,#16);"));
+        assert!(output.contains("#18=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#17,$);"));
+        assert!(output.contains("#23=IFCLOCALPLACEMENT($,#17);"));
+        assert!(output.contains("#24=IFCLOCALPLACEMENT(#23,#17);"));
+        assert!(output.contains("#25=IFCLOCALPLACEMENT(#24,#17);"));
+        assert!(output.contains(",#23,$,$,.ELEMENT.,$,$,$,$,$);"));
+        assert!(output.contains(",#24,$,$,.ELEMENT.,$,$,$);"));
+        assert!(output.contains(",#25,$,$,.ELEMENT.,$);"));
     }
 }
