@@ -501,7 +501,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let result = scaffold_completions::completions(document, position, snippet_supported);
+        let result = scaffold_completions::completions(document, &uri, position, snippet_supported);
         debug!(
             has_result = result.is_some(),
             "completion request completed"
