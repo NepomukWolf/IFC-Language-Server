@@ -4,15 +4,19 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::document::Document;
+use crate::schema::IfcVersion;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, InsertTextFormat,
     Position, Range, TextEdit, Url,
 };
 use uuid::Uuid;
 
-const DEFAULT_SCHEMA: IfcSchema = IfcSchema::Ifc4x3Add2;
+const DEFAULT_SCHEMA: IfcVersion = IfcVersion::Ifc4x3Add2;
 const IFC_GUID_ALPHABET: &[u8; 64] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+const METADATA_TEMPLATE: &str = include_str!("scaffold_templates/metadata.ifc.tpl");
+const PROJECT_TEMPLATE: &str = include_str!("scaffold_templates/project.ifc.tpl");
+const SPATIAL_TEMPLATE: &str = include_str!("scaffold_templates/spatial.ifc.tpl");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScaffoldLevel {
@@ -21,37 +25,12 @@ enum ScaffoldLevel {
     Spatial,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IfcSchema {
-    Ifc2x3,
-    Ifc4,
-    Ifc4x3Add2,
-}
-
-impl IfcSchema {
-    fn schema_name(self) -> &'static str {
-        match self {
-            Self::Ifc2x3 => "IFC2X3",
-            Self::Ifc4 => "IFC4",
-            Self::Ifc4x3Add2 => "IFC4X3_ADD2",
-        }
-    }
-
-    fn detail(self) -> &'static str {
-        match self {
-            Self::Ifc2x3 => "IFC 2x3 TC1",
-            Self::Ifc4 => "IFC 4 ADD2 TC1",
-            Self::Ifc4x3Add2 => "IFC 4x3 ADD2",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScaffoldAbbreviation {
     text: String,
     range: Range,
     level: ScaffoldLevel,
-    schema: IfcSchema,
+    schema: IfcVersion,
 }
 
 #[derive(Clone, Debug)]
@@ -114,22 +93,6 @@ impl RenderContext {
 
         compress_uuid(Uuid::new_v4().as_u128())
     }
-
-    fn header(&self, schema: IfcSchema) -> String {
-        format!(
-            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\nFILE_NAME('{}','{}',('{}'),('{}'),'{}','{}','');\nFILE_SCHEMA(('{}'));\nENDSEC;\n\nDATA;\n",
-            self.file_name,
-            self.timestamp.iso_string(),
-            self.placeholder(1, "Author"),
-            self.placeholder(2, "Organization"),
-            step_string(&format!(
-                "ifc-language-server {}",
-                env!("CARGO_PKG_VERSION")
-            )),
-            "ifc-language-server",
-            schema.schema_name()
-        )
-    }
 }
 
 impl Timestamp {
@@ -179,7 +142,7 @@ pub fn completions(
         format!(
             "{} {}",
             abbreviation.level.detail(),
-            abbreviation.schema.detail()
+            schema_detail(abbreviation.schema)
         ),
     );
 
@@ -226,7 +189,7 @@ fn is_abbreviation_character(character: char) -> bool {
     character == '!' || character == ':' || character.is_ascii_alphanumeric()
 }
 
-fn parse_abbreviation(token: &str) -> Option<(ScaffoldLevel, IfcSchema)> {
+fn parse_abbreviation(token: &str) -> Option<(ScaffoldLevel, IfcVersion)> {
     let bang_count = token.bytes().take_while(|byte| *byte == b'!').count();
     let level = match bang_count {
         1 => ScaffoldLevel::Metadata,
@@ -249,16 +212,24 @@ fn parse_abbreviation(token: &str) -> Option<(ScaffoldLevel, IfcSchema)> {
     Some((level, schema))
 }
 
-fn parse_schema_selector(selector: &str) -> Option<IfcSchema> {
+fn parse_schema_selector(selector: &str) -> Option<IfcVersion> {
     if selector.is_empty() {
         return None;
     }
 
     match selector.to_ascii_lowercase().as_str() {
-        "2x3" => Some(IfcSchema::Ifc2x3),
-        "4" => Some(IfcSchema::Ifc4),
-        "4x3" => Some(IfcSchema::Ifc4x3Add2),
+        "2x3" => Some(IfcVersion::Ifc2x3Tc1),
+        "4" => Some(IfcVersion::Ifc4Add2Tc1),
+        "4x3" => Some(IfcVersion::Ifc4x3Add2),
         _ => None,
+    }
+}
+
+fn schema_detail(schema: IfcVersion) -> &'static str {
+    match schema {
+        IfcVersion::Ifc2x3Tc1 => "IFC 2x3 TC1",
+        IfcVersion::Ifc4Add2Tc1 => "IFC 4 ADD2 TC1",
+        IfcVersion::Ifc4x3Add2 => "IFC 4x3 ADD2",
     }
 }
 
@@ -272,7 +243,11 @@ impl ScaffoldLevel {
     }
 }
 
-fn render_scaffold(level: ScaffoldLevel, schema: IfcSchema, context: &mut RenderContext) -> String {
+fn render_scaffold(
+    level: ScaffoldLevel,
+    schema: IfcVersion,
+    context: &mut RenderContext,
+) -> String {
     match level {
         ScaffoldLevel::Metadata => render_metadata_scaffold(schema, context),
         ScaffoldLevel::Project => render_project_scaffold(schema, context),
@@ -280,36 +255,24 @@ fn render_scaffold(level: ScaffoldLevel, schema: IfcSchema, context: &mut Render
     }
 }
 
-fn render_metadata_scaffold(schema: IfcSchema, context: &RenderContext) -> String {
-    format!(
-        "{}{}\nENDSEC;\nEND-ISO-10303-21;\n",
-        context.header(schema),
-        context.final_tabstop()
+fn render_metadata_scaffold(schema: IfcVersion, context: &RenderContext) -> String {
+    render_template(
+        METADATA_TEMPLATE,
+        &common_bindings(schema, context, context.final_tabstop()),
     )
 }
 
-fn render_project_scaffold(schema: IfcSchema, context: &mut RenderContext) -> String {
+fn render_project_scaffold(schema: IfcVersion, context: &mut RenderContext) -> String {
     let project_guid = context.next_guid();
-    let owner_history = support_entities(context, 2);
-    let context_and_units = context_and_units(8);
-    let project = ifc_project(
-        schema,
-        1,
-        &project_guid,
-        "#2",
-        &context.placeholder(3, "Project Name"),
-        "#12",
-        "#16",
-    );
 
-    format!(
-        "{}{project}{owner_history}{context_and_units}{}\nENDSEC;\nEND-ISO-10303-21;\n",
-        context.header(schema),
-        context.final_tabstop()
-    )
+    let mut bindings = common_bindings(schema, context, context.final_tabstop());
+    bindings.push(("project_guid", project_guid));
+    bindings.push(("project_name", context.placeholder(3, "Project Name")));
+
+    render_template(PROJECT_TEMPLATE, &bindings)
 }
 
-fn render_spatial_scaffold(schema: IfcSchema, context: &mut RenderContext) -> String {
+fn render_spatial_scaffold(schema: IfcVersion, context: &mut RenderContext) -> String {
     let project_guid = context.next_guid();
     let site_guid = context.next_guid();
     let building_guid = context.next_guid();
@@ -317,180 +280,55 @@ fn render_spatial_scaffold(schema: IfcSchema, context: &mut RenderContext) -> St
     let rel_project_site_guid = context.next_guid();
     let rel_site_building_guid = context.next_guid();
     let rel_building_storey_guid = context.next_guid();
-    let owner_history = support_entities(context, 8);
-    let context_and_units = context_and_units(14);
-    let local_placements = local_placements(23, "#17");
 
-    let project = ifc_project(
-        schema,
-        1,
-        &project_guid,
-        "#8",
-        &context.placeholder(3, "Project Name"),
-        "#18",
-        "#22",
-    );
-    let site = ifc_site(
-        2,
-        &site_guid,
-        "#8",
-        &context.placeholder(4, "Site Name"),
-        "#23",
-    );
-    let building = ifc_building(
-        3,
-        &building_guid,
-        "#8",
-        &context.placeholder(5, "Building Name"),
-        "#24",
-    );
-    let storey = ifc_building_storey(
-        4,
-        &storey_guid,
-        "#8",
-        &context.placeholder(6, "Storey Name"),
-        "#25",
-    );
-    let rel_project_site = ifc_rel_aggregates(
-        5,
-        &rel_project_site_guid,
-        "#8",
-        "Project aggregation",
-        "#1",
-        "#2",
-    );
-    let rel_site_building = ifc_rel_aggregates(
-        6,
-        &rel_site_building_guid,
-        "#8",
-        "Site aggregation",
-        "#2",
-        "#3",
-    );
-    let rel_building_storey = ifc_rel_aggregates(
-        7,
-        &rel_building_storey_guid,
-        "#8",
-        "Building aggregation",
-        "#3",
-        "#4",
-    );
+    let mut bindings = common_bindings(schema, context, context.final_tabstop());
+    bindings.push(("project_guid", project_guid));
+    bindings.push(("site_guid", site_guid));
+    bindings.push(("building_guid", building_guid));
+    bindings.push(("storey_guid", storey_guid));
+    bindings.push(("rel_project_site_guid", rel_project_site_guid));
+    bindings.push(("rel_site_building_guid", rel_site_building_guid));
+    bindings.push(("rel_building_storey_guid", rel_building_storey_guid));
+    bindings.push(("project_name", context.placeholder(3, "Project Name")));
+    bindings.push(("site_name", context.placeholder(4, "Site Name")));
+    bindings.push(("building_name", context.placeholder(5, "Building Name")));
+    bindings.push(("storey_name", context.placeholder(6, "Storey Name")));
 
-    format!(
-        "{}{project}{site}{building}{storey}{rel_project_site}{rel_site_building}{rel_building_storey}{owner_history}{context_and_units}{local_placements}{}\nENDSEC;\nEND-ISO-10303-21;\n",
-        context.header(schema),
-        context.final_tabstop()
-    )
+    render_template(SPATIAL_TEMPLATE, &bindings)
 }
 
-fn support_entities(context: &mut RenderContext, first_id: u32) -> String {
-    let person = first_id + 2;
-    let organization = first_id + 3;
-    let application = first_id + 4;
-    let application_organization = first_id + 5;
-
-    format!(
-        "#{first_id}=IFCOWNERHISTORY(#{person_and_organization},#{application},$,.ADDED.,{timestamp},#{person_and_organization},#{application},{timestamp});\n\
-         #{person_and_organization}=IFCPERSONANDORGANIZATION(#{person},#{organization},$);\n\
-         #{person}=IFCPERSON($,'{}',$,$,$,$,$,$);\n\
-         #{organization}=IFCORGANIZATION($,'{}',$,$,$);\n\
-         #{application}=IFCAPPLICATION(#{application_organization},'{}','ifc-language-server','ifc-language-server');\n\
-         #{application_organization}=IFCORGANIZATION($,'ifc-language-server',$,$,$);\n",
-        context.placeholder(1, "Author"),
-        context.placeholder(2, "Organization"),
-        env!("CARGO_PKG_VERSION"),
-        person_and_organization = first_id + 1,
-        timestamp = context.timestamp.unix_seconds
-    )
+fn common_bindings(
+    schema: IfcVersion,
+    context: &RenderContext,
+    final_tabstop: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("file_name", context.file_name.clone()),
+        ("timestamp_iso", context.timestamp.iso_string()),
+        ("timestamp_unix", context.timestamp.unix_seconds.to_string()),
+        ("author", context.placeholder(1, "Author")),
+        ("organization", context.placeholder(2, "Organization")),
+        ("originating_system", lsp_tool_name_with_version()),
+        ("preprocessor_version", "ifc-language-server".to_string()),
+        ("application_version", env!("CARGO_PKG_VERSION").to_string()),
+        ("schema_name", schema.schema_name().to_string()),
+        ("final_tabstop", final_tabstop.to_string()),
+    ]
 }
 
-fn context_and_units(first_id: u32) -> String {
-    format!(
-        "#{first_id}=IFCCARTESIANPOINT((0.,0.,0.));\n\
-         #{z_direction}=IFCDIRECTION((0.,0.,1.));\n\
-         #{x_direction}=IFCDIRECTION((1.,0.,0.));\n\
-         #{placement}=IFCAXIS2PLACEMENT3D(#{first_id},#{z_direction},#{x_direction});\n\
-         #{representation_context}=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#{placement},$);\n\
-         #{length_unit}=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
-         #{area_unit}=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);\n\
-         #{volume_unit}=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);\n\
-         #{unit_assignment}=IFCUNITASSIGNMENT((#{length_unit},#{area_unit},#{volume_unit}));\n",
-        z_direction = first_id + 1,
-        x_direction = first_id + 2,
-        placement = first_id + 3,
-        representation_context = first_id + 4,
-        length_unit = first_id + 5,
-        area_unit = first_id + 6,
-        volume_unit = first_id + 7,
-        unit_assignment = first_id + 8,
-    )
+fn lsp_tool_name_with_version() -> String {
+    step_string(&format!(
+        "ifc-language-server {}",
+        env!("CARGO_PKG_VERSION")
+    ))
 }
 
-fn local_placements(first_id: u32, relative_placement: &str) -> String {
-    let building_placement = first_id + 1;
-    let storey_placement = first_id + 2;
-
-    format!(
-        "#{first_id}=IFCLOCALPLACEMENT($,{relative_placement});\n\
-         #{building_placement}=IFCLOCALPLACEMENT(#{first_id},{relative_placement});\n\
-         #{storey_placement}=IFCLOCALPLACEMENT(#{building_placement},{relative_placement});\n"
-    )
-}
-
-fn ifc_project(
-    schema: IfcSchema,
-    id: u32,
-    guid: &str,
-    owner_history: &str,
-    name: &str,
-    representation_context: &str,
-    unit_assignment: &str,
-) -> String {
-    match schema {
-        IfcSchema::Ifc2x3 => format!(
-            "#{id}=IFCPROJECT('{guid}',{owner_history},'{name}',$,$,$,$,({representation_context}),{unit_assignment});\n"
-        ),
-        IfcSchema::Ifc4 | IfcSchema::Ifc4x3Add2 => format!(
-            "#{id}=IFCPROJECT('{guid}',{owner_history},'{name}',$,$,$,$,({representation_context}),{unit_assignment});\n"
-        ),
+fn render_template(template: &str, bindings: &[(&str, String)]) -> String {
+    let mut output = template.to_string();
+    for (name, value) in bindings {
+        output = output.replace(&format!("{{{{{name}}}}}"), value);
     }
-}
-
-fn ifc_site(id: u32, guid: &str, owner_history: &str, name: &str, placement: &str) -> String {
-    format!(
-        "#{id}=IFCSITE('{guid}',{owner_history},'{name}',$,$,{placement},$,$,.ELEMENT.,$,$,$,$,$);\n"
-    )
-}
-
-fn ifc_building(id: u32, guid: &str, owner_history: &str, name: &str, placement: &str) -> String {
-    format!(
-        "#{id}=IFCBUILDING('{guid}',{owner_history},'{name}',$,$,{placement},$,$,.ELEMENT.,$,$,$);\n"
-    )
-}
-
-fn ifc_building_storey(
-    id: u32,
-    guid: &str,
-    owner_history: &str,
-    name: &str,
-    placement: &str,
-) -> String {
-    format!(
-        "#{id}=IFCBUILDINGSTOREY('{guid}',{owner_history},'{name}',$,$,{placement},$,$,.ELEMENT.,$);\n"
-    )
-}
-
-fn ifc_rel_aggregates(
-    id: u32,
-    guid: &str,
-    owner_history: &str,
-    name: &str,
-    relating_object: &str,
-    related_object: &str,
-) -> String {
-    format!(
-        "#{id}=IFCRELAGGREGATES('{guid}',{owner_history},'{name}',$,{relating_object},({related_object}));\n"
-    )
+    output
 }
 
 fn file_name_from_uri(uri: &Url) -> String {
@@ -565,7 +403,7 @@ mod tests {
         Some((item, new_text))
     }
 
-    fn render_for_test(level: ScaffoldLevel, schema: IfcSchema, file_name: &str) -> String {
+    fn render_for_test(level: ScaffoldLevel, schema: IfcVersion, file_name: &str) -> String {
         let mut context = RenderContext::for_test(file_name, true);
         render_scaffold(level, schema, &mut context)
     }
@@ -574,19 +412,19 @@ mod tests {
     fn parses_supported_scaffold_abbreviations() {
         assert_eq!(
             parse_abbreviation("!ifc"),
-            Some((ScaffoldLevel::Metadata, IfcSchema::Ifc4x3Add2))
+            Some((ScaffoldLevel::Metadata, IfcVersion::Ifc4x3Add2))
         );
         assert_eq!(
             parse_abbreviation("!!ifc:2x3"),
-            Some((ScaffoldLevel::Project, IfcSchema::Ifc2x3))
+            Some((ScaffoldLevel::Project, IfcVersion::Ifc2x3Tc1))
         );
         assert_eq!(
             parse_abbreviation("!!!ifc:4"),
-            Some((ScaffoldLevel::Spatial, IfcSchema::Ifc4))
+            Some((ScaffoldLevel::Spatial, IfcVersion::Ifc4Add2Tc1))
         );
         assert_eq!(
             parse_abbreviation("!!!ifc:4x3"),
-            Some((ScaffoldLevel::Spatial, IfcSchema::Ifc4x3Add2))
+            Some((ScaffoldLevel::Spatial, IfcVersion::Ifc4x3Add2))
         );
     }
 
@@ -620,18 +458,36 @@ mod tests {
 
     #[test]
     fn escapes_file_name_for_step_strings() {
-        let output = render_for_test(ScaffoldLevel::Metadata, IfcSchema::Ifc4, "owner's.ifc");
+        let output = render_for_test(
+            ScaffoldLevel::Metadata,
+            IfcVersion::Ifc4Add2Tc1,
+            "owner's.ifc",
+        );
 
         assert!(output.contains("FILE_NAME('owner''s.ifc'"));
     }
 
     #[test]
     fn renders_lsp_tool_metadata_in_header() {
-        let output = render_for_test(ScaffoldLevel::Metadata, IfcSchema::Ifc4x3Add2, "test.ifc");
+        let output = render_for_test(ScaffoldLevel::Metadata, IfcVersion::Ifc4x3Add2, "test.ifc");
 
         assert!(output.contains("'2024-11-14T10:09:36'"));
         assert!(output.contains("ifc-language-server 0.4.1"));
         assert!(output.contains("'ifc-language-server'"));
+    }
+
+    #[test]
+    fn scaffold_templates_render_without_unresolved_placeholders() {
+        for level in [
+            ScaffoldLevel::Metadata,
+            ScaffoldLevel::Project,
+            ScaffoldLevel::Spatial,
+        ] {
+            let output = render_for_test(level, IfcVersion::Ifc4x3Add2, "test.ifc");
+
+            assert!(!output.contains("{{"));
+            assert!(!output.contains("}}"));
+        }
     }
 
     #[test]
@@ -669,7 +525,7 @@ mod tests {
 
     #[test]
     fn project_scaffold_includes_owner_history_and_application() {
-        let output = render_for_test(ScaffoldLevel::Project, IfcSchema::Ifc4, "test.ifc");
+        let output = render_for_test(ScaffoldLevel::Project, IfcVersion::Ifc4Add2Tc1, "test.ifc");
 
         assert!(output.contains("IFCOWNERHISTORY"));
         assert!(output.contains("IFCPERSONANDORGANIZATION"));
@@ -684,7 +540,7 @@ mod tests {
 
     #[test]
     fn spatial_scaffold_for_ifc4x3_has_valid_building_arity() {
-        let output = render_for_test(ScaffoldLevel::Spatial, IfcSchema::Ifc4x3Add2, "test.ifc");
+        let output = render_for_test(ScaffoldLevel::Spatial, IfcVersion::Ifc4x3Add2, "test.ifc");
         let building_line = output
             .lines()
             .find(|line| line.contains("=IFCBUILDING("))
@@ -700,7 +556,7 @@ mod tests {
 
     #[test]
     fn spatial_scaffold_uses_object_placements_for_spatial_elements() {
-        let output = render_for_test(ScaffoldLevel::Spatial, IfcSchema::Ifc4x3Add2, "test.ifc");
+        let output = render_for_test(ScaffoldLevel::Spatial, IfcVersion::Ifc4x3Add2, "test.ifc");
 
         assert!(output.contains("#17=IFCAXIS2PLACEMENT3D(#14,#15,#16);"));
         assert!(output.contains("#18=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#17,$);"));
