@@ -17,7 +17,7 @@ use crate::diagnostics;
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
     definition, document_highlight, document_symbols, hover, inlay_hints, references,
-    semantic_tokens, signature_help,
+    scaffold_completions, semantic_tokens, signature_help,
 };
 use crate::schema::{
     SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -30,6 +30,7 @@ struct ConfigState {
     pending_init_config: Option<ServerConfig>,
     ast_file_size_limit_bytes: usize,
     semantic_tokens_enabled: bool,
+    completion_snippet_support: bool,
 }
 
 impl Default for ConfigState {
@@ -40,6 +41,7 @@ impl Default for ConfigState {
             pending_init_config: None,
             ast_file_size_limit_bytes: DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             semantic_tokens_enabled: true,
+            completion_snippet_support: false,
         }
     }
 }
@@ -366,6 +368,17 @@ fn new_parser() -> tree_sitter::Parser {
     parser
 }
 
+fn completion_snippet_support(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|capabilities| capabilities.completion.as_ref())
+        .and_then(|capabilities| capabilities.completion_item.as_ref())
+        .and_then(|capabilities| capabilities.snippet_support)
+        .unwrap_or(false)
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     #[instrument(skip(self, params))]
@@ -375,6 +388,7 @@ impl LanguageServer for Backend {
             .as_ref()
             .map(parse_server_config)
             .unwrap_or_default();
+        let completion_snippet_support = completion_snippet_support(&params);
         let semantic_tokens_enabled = pending_init_config.semantic_tokens_enabled;
         let semantic_tokens_provider = semantic_tokens_enabled.then(|| {
             SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
@@ -387,6 +401,7 @@ impl LanguageServer for Backend {
 
         let mut config = self.config.write().await;
         config.semantic_tokens_enabled = semantic_tokens_enabled;
+        config.completion_snippet_support = completion_snippet_support;
         config.pending_init_config = Some(pending_init_config);
         info!("received initialize request");
 
@@ -406,6 +421,11 @@ impl LanguageServer for Backend {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: Some(vec!["!".to_string(), ":".to_string()]),
+                    ..CompletionOptions::default()
+                }),
                 semantic_tokens_provider,
                 ..Default::default()
             },
@@ -468,6 +488,26 @@ impl LanguageServer for Backend {
         self.ast_skip_warning_shown.write().await.remove(&uri);
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
         info!("document closed");
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.text_document_position.text_document.uri))]
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let snippet_supported = self.config.read().await.completion_snippet_support;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+
+        let result = scaffold_completions::completions(document, position, snippet_supported);
+        debug!(
+            has_result = result.is_some(),
+            "completion request completed"
+        );
+
+        Ok(result)
     }
 
     #[instrument(skip(self, params), fields(uri = %params.text_document_position_params.text_document.uri))]
