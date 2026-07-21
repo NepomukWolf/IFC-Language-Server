@@ -1,10 +1,9 @@
 //! IFC scaffold completion snippets.
 //! This module handles Emmet-like abbreviations such as `!ifc:4x3` without requiring AST state.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::document::Document;
 use crate::schema::IfcVersion;
+use time::OffsetDateTime;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, InsertTextFormat,
     Position, Range, TextEdit, Url,
@@ -37,19 +36,8 @@ struct ScaffoldAbbreviation {
 struct RenderContext {
     file_name: String,
     snippet: bool,
-    timestamp: Timestamp,
+    timestamp: OffsetDateTime,
     guid_seed: Option<u128>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Timestamp {
-    unix_seconds: u64,
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
 }
 
 impl RenderContext {
@@ -57,7 +45,7 @@ impl RenderContext {
         Self {
             file_name: step_string(&file_name_from_uri(uri)),
             snippet,
-            timestamp: Timestamp::now(),
+            timestamp: OffsetDateTime::now_utc(),
             guid_seed: None,
         }
     }
@@ -67,7 +55,8 @@ impl RenderContext {
         Self {
             file_name: step_string(file_name),
             snippet,
-            timestamp: Timestamp::from_unix_seconds(1_731_578_976),
+            timestamp: OffsetDateTime::from_unix_timestamp(1_731_578_976)
+                .expect("test timestamp should be valid"),
             guid_seed: Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
         }
     }
@@ -92,39 +81,6 @@ impl RenderContext {
         }
 
         compress_uuid(Uuid::new_v4().as_u128())
-    }
-}
-
-impl Timestamp {
-    fn now() -> Self {
-        let unix_seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        Self::from_unix_seconds(unix_seconds)
-    }
-
-    fn from_unix_seconds(unix_seconds: u64) -> Self {
-        let days = (unix_seconds / 86_400) as i64;
-        let seconds_of_day = (unix_seconds % 86_400) as u32;
-        let (year, month, day) = civil_from_days(days);
-
-        Self {
-            unix_seconds,
-            year,
-            month,
-            day,
-            hour: seconds_of_day / 3_600,
-            minute: (seconds_of_day % 3_600) / 60,
-            second: seconds_of_day % 60,
-        }
-    }
-
-    fn iso_string(self) -> String {
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second
-        )
     }
 }
 
@@ -304,8 +260,11 @@ fn common_bindings(
 ) -> Vec<(&'static str, String)> {
     vec![
         ("file_name", context.file_name.clone()),
-        ("timestamp_iso", context.timestamp.iso_string()),
-        ("timestamp_unix", context.timestamp.unix_seconds.to_string()),
+        ("timestamp_iso", step_timestamp(context.timestamp)),
+        (
+            "timestamp_unix",
+            context.timestamp.unix_timestamp().to_string(),
+        ),
         ("author", context.placeholder(1, "Author")),
         ("organization", context.placeholder(2, "Organization")),
         ("originating_system", lsp_tool_name_with_version()),
@@ -331,6 +290,18 @@ fn render_template(template: &str, bindings: &[(&str, String)]) -> String {
     output
 }
 
+fn step_timestamp(timestamp: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        timestamp.year(),
+        u8::from(timestamp.month()),
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute(),
+        timestamp.second()
+    )
+}
+
 fn file_name_from_uri(uri: &Url) -> String {
     uri.to_file_path()
         .ok()
@@ -353,22 +324,6 @@ fn compress_uuid(mut value: u128) -> String {
     }
 
     String::from_utf8(output.to_vec()).expect("IFC GUID alphabet should be ASCII")
-}
-
-fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
-    let days = days_since_unix_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
-
-    (year as i32, month as u32, day as u32)
 }
 
 #[cfg(test)]
