@@ -5,6 +5,7 @@
 pub mod definition;
 pub mod document_highlight;
 pub mod hover;
+pub mod inlay_hints;
 pub mod references;
 pub mod semantic_tokens;
 pub mod signature_help;

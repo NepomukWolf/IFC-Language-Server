@@ -16,7 +16,7 @@ use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config}
 use crate::diagnostics;
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
-    definition, document_highlight, hover, references, semantic_tokens, signature_help,
+    definition, document_highlight, hover, inlay_hints, references, semantic_tokens, signature_help,
 };
 use crate::schema::{
     SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -403,6 +403,7 @@ impl LanguageServer for Backend {
                     retrigger_characters: Some(vec![",".to_string()]),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider,
                 ..Default::default()
             },
@@ -608,6 +609,31 @@ impl LanguageServer for Backend {
         debug!(
             has_result = result.is_some(),
             "signature help request completed"
+        );
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.text_document.uri))]
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let forced_schema_name = self.config.read().await.forced_schema_name.clone();
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema_docs = self.schema_docs.read().await;
+
+        let result = inlay_hints::inlay_hints(
+            document,
+            params.range,
+            &schema_docs,
+            forced_schema_name.as_deref(),
+        );
+        debug!(
+            result_count = result.as_ref().map_or(0, Vec::len),
+            "inlay hint request completed"
         );
 
         Ok(result)
