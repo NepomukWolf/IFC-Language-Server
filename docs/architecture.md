@@ -20,6 +20,7 @@ The shipped LSP features are:
 - find-references
 - document highlight
 - signature help
+- inlay hints
 - range-based semantic tokens
 - schema-aware diagnostics
 
@@ -81,6 +82,7 @@ The server advertises:
 - `textDocument/references`
 - `textDocument/documentHighlight`
 - `textDocument/signatureHelp`
+- `textDocument/inlayHint`
 - `textDocument/semanticTokens/range`
 
 Diagnostics are published with `textDocument/publishDiagnostics` on open, change, and request-time reloads.
@@ -170,7 +172,7 @@ When a file is larger than the limit:
 - tree-sitter parsing is skipped
 - schema diagnostics are disabled
 - derived `*` hover is disabled
-- basic hover, navigation, document highlight, signature help, and range-based semantic tokens remain available from the text index/source text
+- basic hover, navigation, document highlight, signature help, inlay hints, and range-based semantic tokens remain available from the text index/source text
 
 ## Feature AST Usage
 
@@ -182,6 +184,7 @@ These features do not require an AST:
 - find-references for local `#id` tokens
 - document highlight for local `#id` tokens
 - signature help for IFC entity parameter lists, when schema docs are available
+- schema-backed inlay hints for STEP entity arguments
 - schema name detection from `FILE_SCHEMA(...)`
 - range-based semantic tokens
 
@@ -238,6 +241,11 @@ top-level commas before the cursor to choose the active parameter.
 
 Signature help ignores commas inside nested parameter lists, strings, and block comments. It does
 not use tree-sitter AST state.
+
+### Inlay Hints
+
+`src/features/inlay_hints.rs` labels positional STEP arguments with schema attribute names using a
+range-scoped text scanner. It includes inherited attributes and does not use tree-sitter AST state.
 
 ### Semantic Tokens
 
