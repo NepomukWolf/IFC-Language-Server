@@ -551,90 +551,42 @@ mod tests {
         }
     }
     fn schema() -> SchemaDoc {
+        let root = ["IFCROOT"];
+        let product = ["IFCROOT", "IFCPRODUCT"];
+        let spatial = ["IFCROOT", "IFCSPATIALELEMENT", "IFCPRODUCT"];
+        let spatial_structure = ["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"];
+        let mut entities: HashMap<String, EntityDoc> = [
+            ("IFCPROJECT", root.as_slice()),
+            ("IFCSITE", spatial_structure.as_slice()),
+            ("IFCBUILDING", spatial_structure.as_slice()),
+            ("IFCBUILDINGSTOREY", spatial_structure.as_slice()),
+            ("IFCSPACE", spatial.as_slice()),
+            ("IFCWALL", product.as_slice()),
+            ("IFCFURNISHINGELEMENT", product.as_slice()),
+            ("IFCELEMENTASSEMBLY", product.as_slice()),
+            ("IFCFACILITY", spatial_structure.as_slice()),
+            ("IFCCARTESIANPOINT", &["IFCREPRESENTATIONITEM"]),
+        ]
+        .into_iter()
+        .map(|(name, supers)| (name.into(), entity(name, supers, &[])))
+        .collect();
+
+        let object_attributes = ["A", "B", "C", "D", "RelatingObject", "RelatedObjects"];
+        for name in ["IFCRELAGGREGATES", "IFCRELNESTS"] {
+            entities.insert(name.into(), entity(name, &[], &object_attributes));
+        }
+        let containment_attributes = ["A", "B", "C", "D", "RelatedElements", "RelatingStructure"];
+        entities.insert(
+            "IFCRELCONTAINEDINSPATIALSTRUCTURE".into(),
+            entity(
+                "IFCRELCONTAINEDINSPATIALSTRUCTURE",
+                &[],
+                &containment_attributes,
+            ),
+        );
+
         SchemaDoc {
-            entities: HashMap::from([
-                ("IFCPROJECT".into(), entity("IFCPROJECT", &["IFCROOT"], &[])),
-                (
-                    "IFCSITE".into(),
-                    entity(
-                        "IFCSITE",
-                        &["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"],
-                        &[],
-                    ),
-                ),
-                (
-                    "IFCBUILDING".into(),
-                    entity(
-                        "IFCBUILDING",
-                        &["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"],
-                        &[],
-                    ),
-                ),
-                (
-                    "IFCBUILDINGSTOREY".into(),
-                    entity(
-                        "IFCBUILDINGSTOREY",
-                        &["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"],
-                        &[],
-                    ),
-                ),
-                (
-                    "IFCSPACE".into(),
-                    entity(
-                        "IFCSPACE",
-                        &["IFCROOT", "IFCSPATIALELEMENT", "IFCPRODUCT"],
-                        &[],
-                    ),
-                ),
-                (
-                    "IFCWALL".into(),
-                    entity("IFCWALL", &["IFCROOT", "IFCPRODUCT"], &[]),
-                ),
-                (
-                    "IFCFURNISHINGELEMENT".into(),
-                    entity("IFCFURNISHINGELEMENT", &["IFCROOT", "IFCPRODUCT"], &[]),
-                ),
-                (
-                    "IFCELEMENTASSEMBLY".into(),
-                    entity("IFCELEMENTASSEMBLY", &["IFCROOT", "IFCPRODUCT"], &[]),
-                ),
-                (
-                    "IFCFACILITY".into(),
-                    entity(
-                        "IFCFACILITY",
-                        &["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"],
-                        &[],
-                    ),
-                ),
-                (
-                    "IFCCARTESIANPOINT".into(),
-                    entity("IFCCARTESIANPOINT", &["IFCREPRESENTATIONITEM"], &[]),
-                ),
-                (
-                    "IFCRELAGGREGATES".into(),
-                    entity(
-                        "IFCRELAGGREGATES",
-                        &[],
-                        &["A", "B", "C", "D", "RelatingObject", "RelatedObjects"],
-                    ),
-                ),
-                (
-                    "IFCRELNESTS".into(),
-                    entity(
-                        "IFCRELNESTS",
-                        &[],
-                        &["A", "B", "C", "D", "RelatingObject", "RelatedObjects"],
-                    ),
-                ),
-                (
-                    "IFCRELCONTAINEDINSPATIALSTRUCTURE".into(),
-                    entity(
-                        "IFCRELCONTAINEDINSPATIALSTRUCTURE",
-                        &[],
-                        &["A", "B", "C", "D", "RelatedElements", "RelatingStructure"],
-                    ),
-                ),
-            ]),
+            entities,
             types: HashMap::new(),
         }
     }
