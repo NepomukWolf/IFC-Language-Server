@@ -9,15 +9,12 @@ use tower_lsp::lsp_types::LSPAny;
 
 use crate::document::DEFAULT_AST_FILE_SIZE_LIMIT_BYTES;
 
-pub const DEFAULT_OUTLINE_MAX_SYMBOLS: usize = 20_000;
-
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub overwrite_exp_schema_with_local: Option<PathBuf>,
     pub add_local_schema_to_selection: Vec<PathBuf>,
     pub ast_file_size_limit_bytes: usize,
     pub semantic_tokens_enabled: bool,
-    pub outline_max_symbols: usize,
 }
 
 impl Default for ServerConfig {
@@ -27,7 +24,6 @@ impl Default for ServerConfig {
             add_local_schema_to_selection: Vec::new(),
             ast_file_size_limit_bytes: DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             semantic_tokens_enabled: true,
-            outline_max_symbols: DEFAULT_OUTLINE_MAX_SYMBOLS,
         }
     }
 }
@@ -55,12 +51,6 @@ pub fn parse_server_config(value: &LSPAny) -> ServerConfig {
             .get("semanticTokensEnabled")
             .and_then(|value| value.as_bool())
             .unwrap_or(true),
-        outline_max_symbols: object
-            .get("outlineMaxSymbols")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_OUTLINE_MAX_SYMBOLS),
     }
 }
 

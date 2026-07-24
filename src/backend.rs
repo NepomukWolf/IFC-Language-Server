@@ -12,9 +12,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, info, instrument, warn};
 
-use crate::config::{
-    DEFAULT_OUTLINE_MAX_SYMBOLS, ServerConfig, expand_schema_candidates, parse_server_config,
-};
+use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
 use crate::diagnostics;
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
@@ -32,7 +30,6 @@ struct ConfigState {
     pending_init_config: Option<ServerConfig>,
     ast_file_size_limit_bytes: usize,
     semantic_tokens_enabled: bool,
-    outline_max_symbols: usize,
 }
 
 impl Default for ConfigState {
@@ -43,7 +40,6 @@ impl Default for ConfigState {
             pending_init_config: None,
             ast_file_size_limit_bytes: DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             semantic_tokens_enabled: true,
-            outline_max_symbols: DEFAULT_OUTLINE_MAX_SYMBOLS,
         }
     }
 }
@@ -307,7 +303,6 @@ impl Backend {
         let mut next_state = ConfigState {
             ast_file_size_limit_bytes: config.ast_file_size_limit_bytes,
             semantic_tokens_enabled: config.semantic_tokens_enabled,
-            outline_max_symbols: config.outline_max_symbols,
             ..ConfigState::default()
         };
 
@@ -392,7 +387,6 @@ impl LanguageServer for Backend {
 
         let mut config = self.config.write().await;
         config.semantic_tokens_enabled = semantic_tokens_enabled;
-        config.outline_max_symbols = pending_init_config.outline_max_symbols;
         config.pending_init_config = Some(pending_init_config);
         info!("received initialize request");
 
@@ -553,13 +547,7 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let (max_symbols, forced_schema_name) = {
-            let config = self.config.read().await;
-            (
-                config.outline_max_symbols,
-                config.forced_schema_name.clone(),
-            )
-        };
+        let forced_schema_name = self.config.read().await.forced_schema_name.clone();
 
         let mut documents = self.documents.write().await;
         let diagnostics = match self.ensure_document_loaded(&mut documents, &uri).await {
@@ -580,7 +568,7 @@ impl LanguageServer for Backend {
         let schema = schema_name
             .as_deref()
             .and_then(|schema_name| schema_docs.get(schema_name));
-        let result = document_symbols::document_symbols(document, schema, max_symbols);
+        let result = document_symbols::document_symbols(document, schema);
         drop(schema_docs);
         drop(documents);
 
