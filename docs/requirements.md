@@ -85,6 +85,12 @@ When the cursor is inside a STEP entity instance argument list, the server shoul
 
 Signature help should not require tree-sitter AST state.
 
+### Inlay Hints
+
+The language server should label positional STEP entity arguments with schema attribute names.
+Hints should be range-scoped, include inherited attributes, and remain available without tree-sitter
+AST state.
+
 ### Semantic Tokens
 
 The language server should provide range-based semantic tokens for IFC STEP syntax highlighting.
@@ -108,6 +114,7 @@ For files above the configured AST parsing limit:
 - find-references should remain available for local `#id` tokens
 - document highlight should remain available for local `#id` tokens
 - signature help should remain available for IFC entity parameter lists when schema docs are available
+- schema-backed inlay hints should remain available
 - range-based semantic tokens should remain available
 - AST-backed schema diagnostics may be disabled
 - derived `*` hover may be disabled
