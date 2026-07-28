@@ -69,7 +69,7 @@ fn resolve_all_attributes(
     }));
 
     for attribute in &mut attributes {
-        if matches_derived_override(attribute, &derived_attributes) {
+        if matches_derived_override(attribute, derived_attributes) {
             attribute.allows_omitted = true;
         }
     }

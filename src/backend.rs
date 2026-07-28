@@ -131,13 +131,13 @@ impl Backend {
             return Vec::new();
         }
 
-        let selected_schema_name = self.selected_schema_name(&document).await;
+        let selected_schema_name = self.selected_schema_name(document).await;
         if let Some(schema_name) = selected_schema_name.as_deref() {
             let schema_docs = self.schema_docs.read().await;
             let diagnostics = schema_docs
                 .get(schema_name)
                 .map(|schema| {
-                    diagnostics::collect_with_schema_name(&document, schema, Some(schema_name))
+                    diagnostics::collect_with_schema_name(document, schema, Some(schema_name))
                 })
                 .unwrap_or_default();
             debug!(

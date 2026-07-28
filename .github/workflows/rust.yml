@@ -1,23 +1,44 @@
-name: test-dev
+name: CI
 
 on:
   push:
-    branches: [ "dev" ]
+    branches: [dev, production]
   pull_request:
-    branches: [ "dev" ]
+    branches: [dev, production]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  verify:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out repository
+        uses: actions/checkout@v6
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --verbose
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit dependencies
+        run: cargo audit
+
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked

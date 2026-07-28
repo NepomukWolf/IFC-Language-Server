@@ -432,10 +432,10 @@ fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInsta
     loop {
         let node = cursor.node();
 
-        if node.kind() == "entity_instance" {
-            if let Some(instance) = parse_entity_instance(node, text) {
-                instances.push(instance);
-            }
+        if node.kind() == "entity_instance"
+            && let Some(instance) = parse_entity_instance(node, text)
+        {
+            instances.push(instance);
         }
 
         if cursor.goto_first_child() {

@@ -76,8 +76,12 @@ The following commands must pass for a change to be verified:
 
 ```bash
 cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo audit
 cargo test --locked
 cargo build --release --locked
 ```
+
+`cargo audit` requires `cargo-audit` 0.22.2 or newer.
 
 If the tests fail repeatedly when implementing a new feature, the run should be halted and the issues presented to the user.
