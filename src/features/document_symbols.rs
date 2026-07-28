@@ -17,6 +17,8 @@ enum Class {
 enum EdgeKind {
     Aggregate,
     Nest,
+    Void,
+    Fill,
     Containment,
 }
 
@@ -243,6 +245,20 @@ fn relationship_parameters<'a>(
                 EdgeKind::Aggregate,
             ),
             "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
+            "IFCRELVOIDSELEMENT" => (
+                "RELATINGBUILDINGELEMENT",
+                "RELATEDOPENINGELEMENT",
+                4,
+                5,
+                EdgeKind::Void,
+            ),
+            "IFCRELFILLSELEMENT" => (
+                "RELATINGOPENINGELEMENT",
+                "RELATEDBUILDINGELEMENT",
+                4,
+                5,
+                EdgeKind::Fill,
+            ),
             "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
                 "RELATINGSTRUCTURE",
                 "RELATEDELEMENTS",
@@ -299,6 +315,9 @@ fn valid_edge(edge: Edge, classes: &[Option<Class>]) -> bool {
             Some(Class::Product) => parent == Some(Class::Product),
             _ => false,
         },
+        EdgeKind::Void | EdgeKind::Fill => {
+            parent == Some(Class::Product) && child == Some(Class::Product)
+        }
         EdgeKind::Containment => parent == Some(Class::Spatial) && child == Some(Class::Product),
     }
 }
@@ -307,12 +326,15 @@ fn priority(class: Class, kind: EdgeKind) -> u8 {
         Class::Project | Class::Spatial => match kind {
             EdgeKind::Aggregate => 0,
             EdgeKind::Nest => 1,
-            EdgeKind::Containment => 2,
+            EdgeKind::Void | EdgeKind::Fill => 2,
+            EdgeKind::Containment => 3,
         },
         Class::Product => match kind {
             EdgeKind::Aggregate => 0,
             EdgeKind::Nest => 1,
-            EdgeKind::Containment => 2,
+            EdgeKind::Void => 2,
+            EdgeKind::Fill => 3,
+            EdgeKind::Containment => 4,
         },
     }
 }
@@ -406,8 +428,8 @@ fn instance_symbol(
     children: Vec<DocumentSymbol>,
 ) -> DocumentSymbol {
     DocumentSymbol {
-        name: instance_symbol_name(lines, schema, item),
-        detail: Some(item.entity_name.clone()),
+        name: instance_symbol_name(item),
+        detail: instance_symbol_detail(lines, schema, item),
         kind: symbol_kind(class),
         tags: None,
         #[allow(deprecated)]
@@ -462,12 +484,18 @@ fn message_symbol(name: &str, detail: &str) -> DocumentSymbol {
         children: None,
     }
 }
-fn instance_symbol_name(
+fn instance_symbol_name(item: &EntityInstanceInfo) -> String {
+    match item.id {
+        Some(id) => format!("{} #{id}", item.entity_name),
+        None => item.entity_name.clone(),
+    }
+}
+fn instance_symbol_detail(
     lines: &[&str],
     schema: Option<&SchemaDoc>,
     item: &EntityInstanceInfo,
-) -> String {
-    let name = schema
+) -> Option<String> {
+    schema
         .filter(|s| s.is_entity_compatible(&item.entity_name, "IFCROOT"))
         .and_then(|_| item.parameters.get(2))
         .and_then(|v| {
@@ -476,12 +504,8 @@ fn instance_symbol_name(
             } else {
                 None
             }
-        });
-    match (item.id, name) {
-        (Some(id), Some(name)) if !name.is_empty() => format!("#{id} {name}"),
-        (Some(id), _) => format!("#{id}"),
-        _ => item.entity_name.clone(),
-    }
+        })
+        .filter(|name| !name.is_empty())
 }
 fn text_for_range(lines: &[&str], range: Range) -> Option<String> {
     if range.start.line != range.end.line {

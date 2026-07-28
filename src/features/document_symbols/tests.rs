@@ -40,6 +40,9 @@ fn schema() -> SchemaDoc {
         ("IFCBUILDINGSTOREY", spatial_structure.as_slice()),
         ("IFCSPACE", spatial.as_slice()),
         ("IFCWALL", product.as_slice()),
+        ("IFCOPENINGELEMENT", product.as_slice()),
+        ("IFCWINDOW", product.as_slice()),
+        ("IFCDOOR", product.as_slice()),
         ("IFCFURNISHINGELEMENT", product.as_slice()),
         ("IFCELEMENTASSEMBLY", product.as_slice()),
         ("IFCFACILITY", spatial_structure.as_slice()),
@@ -61,6 +64,30 @@ fn schema() -> SchemaDoc {
             &[],
             &containment_attributes,
         ),
+    );
+    let voids_attributes = [
+        "A",
+        "B",
+        "C",
+        "D",
+        "RelatingBuildingElement",
+        "RelatedOpeningElement",
+    ];
+    entities.insert(
+        "IFCRELVOIDSELEMENT".into(),
+        entity("IFCRELVOIDSELEMENT", &[], &voids_attributes),
+    );
+    let fills_attributes = [
+        "A",
+        "B",
+        "C",
+        "D",
+        "RelatingOpeningElement",
+        "RelatedBuildingElement",
+    ];
+    entities.insert(
+        "IFCRELFILLSELEMENT".into(),
+        entity("IFCRELFILLSELEMENT", &[], &fills_attributes),
     );
 
     SchemaDoc {
@@ -108,9 +135,9 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
         panic!()
     };
     let all = names(&out[0]);
-    assert!(all.iter().any(|n| n == "#5 R"));
+    assert!(all.iter().any(|n| n == "IFCSPACE #5"));
     assert!(all.iter().any(|n| n == "IFCELEMENTASSEMBLY (1)"));
-    assert!(all.iter().any(|n| n == "#7 W"));
+    assert!(all.iter().any(|n| n == "IFCWALL #7"));
     assert_eq!(
         out[0].range,
         lsp_range(
@@ -128,8 +155,8 @@ fn handles_duplicates_cycles_missing_refs_and_multiple_roots() {
     else {
         panic!()
     };
-    assert_eq!(out.iter().filter(|s| s.name.starts_with('#')).count(), 2);
-    assert!(out.iter().any(|s| s.name == "#2 B"));
+    assert_eq!(out.iter().filter(|s| s.name.starts_with("IFC")).count(), 2);
+    assert!(out.iter().any(|s| s.name == "IFCPROJECT #2"));
     assert!(
         out.iter()
             .any(|s| s.name.starts_with("Uncontained products"))
@@ -145,10 +172,12 @@ fn emits_all_products_and_preserves_utf16_ranges() {
         panic!()
     };
     let all = names(&out[0]);
-    assert!(all.iter().any(|n| n == "#2 S"));
-    assert_eq!(all.iter().filter(|n| n.starts_with("#3 ")).count(), 1);
-    assert_eq!(all.iter().filter(|n| n.starts_with("#4 ")).count(), 1);
+    assert!(all.iter().any(|n| n == "IFCSPACE #2"));
+    assert_eq!(all.iter().filter(|n| *n == "IFCWALL #3").count(), 1);
+    assert_eq!(all.iter().filter(|n| *n == "IFCWALL #4").count(), 1);
     let project = &out[0];
+    assert_eq!(project.name, "IFCPROJECT #1");
+    assert_eq!(project.detail.as_deref(), Some("😀"));
     let statement = "#1=IFCPROJECT('g',$,'😀',$,$,$,$,$,$);";
     assert_eq!(
         project.range.end.character,
@@ -178,7 +207,7 @@ fn schema_less_outline_keeps_core_backbone_and_excludes_unknown_endpoints() {
         panic!()
     };
     assert_eq!(out.len(), 1);
-    assert_eq!(names(&out[0]), vec!["#1", "#2"]);
+    assert_eq!(names(&out[0]), vec!["IFCPROJECT #1", "IFCSITE #2"]);
 }
 
 #[test]
@@ -194,9 +223,12 @@ fn product_whole_part_precedes_spatial_containment() {
     let assembly_bucket = &space.children.as_ref().unwrap()[0];
     let assembly = &assembly_bucket.children.as_ref().unwrap()[0];
     let wall_bucket = &assembly.children.as_ref().unwrap()[0];
-    assert_eq!(wall_bucket.children.as_ref().unwrap()[0].name, "#4 W");
+    assert_eq!(wall_bucket.children.as_ref().unwrap()[0].name, "IFCWALL #4");
     assert_eq!(
-        names(&out[0]).iter().filter(|name| *name == "#4 W").count(),
+        names(&out[0])
+            .iter()
+            .filter(|name| *name == "IFCWALL #4")
+            .count(),
         1
     );
 }
@@ -209,14 +241,40 @@ fn contained_products_attach_to_the_correct_spatial_container_and_type_bucket() 
     assert_eq!(
         structure(&nested_symbols(&doc)),
         [
-            "#1 P",
-            "  #2 Storey",
-            "    #3 Space",
+            "IFCPROJECT #1",
+            "  IFCBUILDINGSTOREY #2",
+            "    IFCSPACE #3",
             "      IFCFURNISHINGELEMENT (1)",
-            "        #5 Chair",
+            "        IFCFURNISHINGELEMENT #5",
             "    IFCWALL (1)",
-            "      #4 Wall",
+            "      IFCWALL #4",
         ]
+    );
+}
+
+#[test]
+fn openings_and_fillings_attach_to_their_host_element() {
+    let doc = parse(
+        "DATA;\n#1=IFCPROJECT('g',$,'Project',$,$,$,$,$,$);\n#2=IFCBUILDINGSTOREY('g',$,'Storey',$,$,$,$,$,$);\n#3=IFCWALL('g',$,'Wall',$,$,$,$,$,$);\n#4=IFCOPENINGELEMENT('g',$,'Opening',$,$,$,$,$,$);\n#5=IFCWINDOW('g',$,'Window',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#3),#2);\n#12=IFCRELVOIDSELEMENT('g',$,$,$,#3,#4);\n#13=IFCRELFILLSELEMENT('g',$,$,$,#4,#5);\nENDSEC;",
+    );
+    let symbols = nested_symbols(&doc);
+    assert_eq!(
+        structure(&symbols),
+        [
+            "IFCPROJECT #1",
+            "  IFCBUILDINGSTOREY #2",
+            "    IFCWALL (1)",
+            "      IFCWALL #3",
+            "        IFCOPENINGELEMENT (1)",
+            "          IFCOPENINGELEMENT #4",
+            "            IFCWINDOW (1)",
+            "              IFCWINDOW #5",
+        ]
+    );
+    assert!(
+        !structure(&symbols)
+            .iter()
+            .any(|item| item.contains("Uncontained products"))
     );
 }
 
@@ -231,12 +289,12 @@ fn breaks_a_non_project_product_cycle_deterministically_and_emits_each_product_o
         [
             "Uncontained products",
             "  IFCELEMENTASSEMBLY (1)",
-            "    #2 Second",
+            "    IFCELEMENTASSEMBLY #2",
             "      IFCELEMENTASSEMBLY (1)",
-            "        #1 First",
+            "        IFCELEMENTASSEMBLY #1",
         ]
     );
-    for name in ["#1 First", "#2 Second"] {
+    for name in ["IFCELEMENTASSEMBLY #1", "IFCELEMENTASSEMBLY #2"] {
         assert_eq!(
             structure(&symbols)
                 .iter()
@@ -252,7 +310,7 @@ fn excludes_schema_known_low_level_support_entities() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCCARTESIANPOINT((1.,2.,3.));\nENDSEC;",
     );
-    assert_eq!(structure(&nested_symbols(&doc)), ["#1 P"]);
+    assert_eq!(structure(&nested_symbols(&doc)), ["IFCPROJECT #1"]);
 }
 
 #[test]
@@ -262,7 +320,7 @@ fn keeps_multiple_projects_and_orphan_space_roots_in_source_order() {
     );
     assert_eq!(
         structure(&nested_symbols(&doc)),
-        ["#1 First", "#2 Orphan", "#3 Second"]
+        ["IFCPROJECT #1", "IFCSPACE #2", "IFCPROJECT #3"]
     );
 }
 
@@ -273,7 +331,7 @@ fn includes_schema_compatible_ifc4x3_spatial_subtypes_as_spatial_nodes() {
     );
     assert_eq!(
         structure(&nested_symbols(&doc)),
-        ["#1 P", "  #2 Rail Facility"]
+        ["IFCPROJECT #1", "  IFCFACILITY #2"]
     );
 }
 
@@ -286,13 +344,13 @@ fn contained_vendor_mapped_sites_are_products_but_decomposed_site_remains_spatia
     assert_eq!(
         structure(&symbols),
         [
-            "#1 Project",
-            "  #2 Real site",
-            "    #3 Building",
-            "      #4 Storey",
+            "IFCPROJECT #1",
+            "  IFCSITE #2",
+            "    IFCBUILDING #3",
+            "      IFCBUILDINGSTOREY #4",
             "        IFCSITE (2)",
-            "          #5 Bench A",
-            "          #6 Bench B",
+            "          IFCSITE #5",
+            "          IFCSITE #6",
         ]
     );
     let storey = &symbols[0].children.as_ref().unwrap()[0]
@@ -320,7 +378,7 @@ fn decomposition_wins_when_a_spatial_entity_is_also_contained() {
     );
     assert_eq!(
         structure(&nested_symbols(&doc)),
-        ["#1 Project", "  #2 Site", "  #3 Storey"]
+        ["IFCPROJECT #1", "  IFCSITE #2", "  IFCBUILDINGSTOREY #3"]
     );
 }
 
@@ -334,7 +392,12 @@ fn schema_less_contained_core_site_is_contextually_a_product() {
     };
     assert_eq!(
         structure(&symbols),
-        ["#1", "  #2", "    IFCSITE (1)", "      #3"]
+        [
+            "IFCPROJECT #1",
+            "  IFCBUILDINGSTOREY #2",
+            "    IFCSITE (1)",
+            "      IFCSITE #3"
+        ]
     );
     assert_eq!(
         symbols[0].children.as_ref().unwrap()[0]
@@ -355,19 +418,14 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
         outer.start <= inner.start && inner.end <= outer.end
     }
     fn verify(symbol: &DocumentSymbol) {
-        if symbol
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.starts_with("IFC"))
-            && symbol.kind != SymbolKind::NULL
-        {
+        if symbol.kind != SymbolKind::ARRAY && symbol.kind != SymbolKind::NULL {
             assert!(
                 contains(symbol.range, symbol.selection_range),
                 "selection for {} is outside its statement range",
                 symbol.name
             );
         }
-        if symbol.detail.is_none() {
+        if symbol.kind == SymbolKind::ARRAY {
             let first = &symbol.children.as_ref().unwrap()[0];
             assert_eq!(
                 symbol.selection_range, first.selection_range,
@@ -387,13 +445,13 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
     assert_eq!(
         structure(&symbols),
         [
-            "#1 P",
-            "  #2 Room",
+            "IFCPROJECT #1",
+            "  IFCSPACE #2",
             "    IFCWALL (1)",
-            "      #3 Wall",
+            "      IFCWALL #3",
             "Uncontained products",
             "  IFCFURNISHINGELEMENT (1)",
-            "    #4 Desk",
+            "    IFCFURNISHINGELEMENT #4",
         ]
     );
     for symbol in &symbols {
