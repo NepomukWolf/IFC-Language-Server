@@ -30,6 +30,12 @@ struct Edge {
     order: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ProductRenderMode {
+    Direct,
+    GroupMultiOnly,
+}
+
 pub fn document_symbols(
     document: &Document,
     schema: Option<&SchemaDoc>,
@@ -158,6 +164,7 @@ pub fn document_symbols(
     if !uncontained.is_empty() {
         let grouped = render_product_groups(
             &uncontained,
+            ProductRenderMode::GroupMultiOnly,
             document,
             schema,
             &lines,
@@ -380,14 +387,29 @@ fn render_real(
         .filter(|child| classes[*child] == Some(Class::Product))
         .collect();
     nested.extend(render_product_groups(
-        &products, document, schema, lines, classes, children, emitted,
+        &products,
+        product_render_mode(classes[index]),
+        document,
+        schema,
+        lines,
+        classes,
+        children,
+        emitted,
     ));
     instance_symbol(lines, schema, item, classes[index], nested)
+}
+
+fn product_render_mode(parent_class: Option<Class>) -> ProductRenderMode {
+    match parent_class {
+        Some(Class::Product) => ProductRenderMode::Direct,
+        _ => ProductRenderMode::GroupMultiOnly,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_product_groups(
     indices: &[usize],
+    mode: ProductRenderMode,
     document: &Document,
     schema: Option<&SchemaDoc>,
     lines: &[&str],
@@ -395,6 +417,18 @@ fn render_product_groups(
     children: &HashMap<usize, Vec<usize>>,
     emitted: &mut HashSet<usize>,
 ) -> Vec<DocumentSymbol> {
+    if matches!(mode, ProductRenderMode::Direct) {
+        let mut result = Vec::new();
+        for &index in indices {
+            if !emitted.contains(&index) {
+                result.push(render_real(
+                    index, document, schema, lines, classes, children, emitted,
+                ));
+            }
+        }
+        return result;
+    }
+
     let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &index in indices {
         if !emitted.contains(&index) {
@@ -413,7 +447,9 @@ fn render_product_groups(
                 index, document, schema, lines, classes, children, emitted,
             ));
         }
-        if !items.is_empty() {
+        if items.len() == 1 {
+            result.extend(items);
+        } else if !items.is_empty() {
             result.push(bucket_symbol(&format!("{entity} ({total})"), items));
         }
     }

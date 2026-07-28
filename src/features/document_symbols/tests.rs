@@ -136,7 +136,7 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
     };
     let all = names(&out[0]);
     assert!(all.iter().any(|n| n == "IFCSPACE #5"));
-    assert!(all.iter().any(|n| n == "IFCELEMENTASSEMBLY (1)"));
+    assert!(all.iter().any(|n| n == "IFCELEMENTASSEMBLY #6"));
     assert!(all.iter().any(|n| n == "IFCWALL #7"));
     assert_eq!(
         out[0].range,
@@ -220,10 +220,9 @@ fn product_whole_part_precedes_spatial_containment() {
         panic!()
     };
     let space = &out[0].children.as_ref().unwrap()[0];
-    let assembly_bucket = &space.children.as_ref().unwrap()[0];
-    let assembly = &assembly_bucket.children.as_ref().unwrap()[0];
-    let wall_bucket = &assembly.children.as_ref().unwrap()[0];
-    assert_eq!(wall_bucket.children.as_ref().unwrap()[0].name, "IFCWALL #4");
+    let assembly = &space.children.as_ref().unwrap()[0];
+    assert_eq!(assembly.name, "IFCELEMENTASSEMBLY #3");
+    assert_eq!(assembly.children.as_ref().unwrap()[0].name, "IFCWALL #4");
     assert_eq!(
         names(&out[0])
             .iter()
@@ -244,10 +243,8 @@ fn contained_products_attach_to_the_correct_spatial_container_and_type_bucket() 
             "IFCPROJECT #1",
             "  IFCBUILDINGSTOREY #2",
             "    IFCSPACE #3",
-            "      IFCFURNISHINGELEMENT (1)",
-            "        IFCFURNISHINGELEMENT #5",
-            "    IFCWALL (1)",
-            "      IFCWALL #4",
+            "      IFCFURNISHINGELEMENT #5",
+            "    IFCWALL #4",
         ]
     );
 }
@@ -263,12 +260,9 @@ fn openings_and_fillings_attach_to_their_host_element() {
         [
             "IFCPROJECT #1",
             "  IFCBUILDINGSTOREY #2",
-            "    IFCWALL (1)",
-            "      IFCWALL #3",
-            "        IFCOPENINGELEMENT (1)",
-            "          IFCOPENINGELEMENT #4",
-            "            IFCWINDOW (1)",
-            "              IFCWINDOW #5",
+            "    IFCWALL #3",
+            "      IFCOPENINGELEMENT #4",
+            "        IFCWINDOW #5",
         ]
     );
     assert!(
@@ -288,10 +282,8 @@ fn breaks_a_non_project_product_cycle_deterministically_and_emits_each_product_o
         structure(&symbols),
         [
             "Uncontained products",
-            "  IFCELEMENTASSEMBLY (1)",
-            "    IFCELEMENTASSEMBLY #2",
-            "      IFCELEMENTASSEMBLY (1)",
-            "        IFCELEMENTASSEMBLY #1",
+            "  IFCELEMENTASSEMBLY #2",
+            "    IFCELEMENTASSEMBLY #1",
         ]
     );
     for name in ["IFCELEMENTASSEMBLY #1", "IFCELEMENTASSEMBLY #2"] {
@@ -392,18 +384,10 @@ fn schema_less_contained_core_site_is_contextually_a_product() {
     };
     assert_eq!(
         structure(&symbols),
-        [
-            "IFCPROJECT #1",
-            "  IFCBUILDINGSTOREY #2",
-            "    IFCSITE (1)",
-            "      IFCSITE #3"
-        ]
+        ["IFCPROJECT #1", "  IFCBUILDINGSTOREY #2", "    IFCSITE #3"]
     );
     assert_eq!(
         symbols[0].children.as_ref().unwrap()[0]
-            .children
-            .as_ref()
-            .unwrap()[0]
             .children
             .as_ref()
             .unwrap()[0]
@@ -447,11 +431,9 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
         [
             "IFCPROJECT #1",
             "  IFCSPACE #2",
-            "    IFCWALL (1)",
-            "      IFCWALL #3",
+            "    IFCWALL #3",
             "Uncontained products",
-            "  IFCFURNISHINGELEMENT (1)",
-            "    IFCFURNISHINGELEMENT #4",
+            "  IFCFURNISHINGELEMENT #4",
         ]
     );
     for symbol in &symbols {
