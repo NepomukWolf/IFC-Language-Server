@@ -69,15 +69,15 @@ pub fn document_symbols(
             continue;
         };
         for child_id in references(children_parameter) {
-            if let Some(&child) = by_id.get(&child_id) {
-                if child != parent {
-                    edges.push(Edge {
-                        parent,
-                        child,
-                        kind,
-                        order,
-                    });
-                }
+            if let Some(&child) = by_id.get(&child_id)
+                && child != parent
+            {
+                edges.push(Edge {
+                    parent,
+                    child,
+                    kind,
+                    order,
+                });
             }
         }
     }
