@@ -18,5 +18,5 @@ tracing = { version = "0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 ureq = "3"
