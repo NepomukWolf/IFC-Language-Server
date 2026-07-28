@@ -43,6 +43,8 @@ fn schema() -> SchemaDoc {
         ("IFCOPENINGELEMENT", product.as_slice()),
         ("IFCWINDOW", product.as_slice()),
         ("IFCDOOR", product.as_slice()),
+        ("IFCDISTRIBUTIONELEMENT", product.as_slice()),
+        ("IFCDISTRIBUTIONPORT", product.as_slice()),
         ("IFCFURNISHINGELEMENT", product.as_slice()),
         ("IFCELEMENTASSEMBLY", product.as_slice()),
         ("IFCFACILITY", spatial_structure.as_slice()),
@@ -88,6 +90,11 @@ fn schema() -> SchemaDoc {
     entities.insert(
         "IFCRELFILLSELEMENT".into(),
         entity("IFCRELFILLSELEMENT", &[], &fills_attributes),
+    );
+    let port_attributes = ["A", "B", "C", "D", "RelatingPort", "RelatedElement"];
+    entities.insert(
+        "IFCRELCONNECTSPORTTOELEMENT".into(),
+        entity("IFCRELCONNECTSPORTTOELEMENT", &[], &port_attributes),
     );
 
     SchemaDoc {
@@ -263,6 +270,28 @@ fn openings_and_fillings_attach_to_their_host_element() {
             "    IFCWALL #3",
             "      IFCOPENINGELEMENT #4",
             "        IFCWINDOW #5",
+        ]
+    );
+    assert!(
+        !structure(&symbols)
+            .iter()
+            .any(|item| item.contains("Uncontained products"))
+    );
+}
+
+#[test]
+fn distribution_ports_connect_to_their_related_element() {
+    let doc = parse(
+        "DATA;\n#1=IFCPROJECT('g',$,'Project',$,$,$,$,$,$);\n#2=IFCBUILDINGSTOREY('g',$,'Storey',$,$,$,$,$,$);\n#3=IFCDISTRIBUTIONELEMENT('g',$,'Terminal',$,$,$,$,$,$);\n#4=IFCDISTRIBUTIONPORT('g',$,'Supply',$,$,$,$,$,$,.SOURCE.,.DUCT.,.AIRCONDITIONING.);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#3),#2);\n#12=IFCRELCONNECTSPORTTOELEMENT('g',$,$,$,#4,#3);\nENDSEC;",
+    );
+    let symbols = nested_symbols(&doc);
+    assert_eq!(
+        structure(&symbols),
+        [
+            "IFCPROJECT #1",
+            "  IFCBUILDINGSTOREY #2",
+            "    IFCDISTRIBUTIONELEMENT #3",
+            "      IFCDISTRIBUTIONPORT #4",
         ]
     );
     assert!(

@@ -19,6 +19,7 @@ enum EdgeKind {
     Nest,
     Void,
     Fill,
+    PortContainment,
     Containment,
 }
 
@@ -266,6 +267,13 @@ fn relationship_parameters<'a>(
                 5,
                 EdgeKind::Fill,
             ),
+            "IFCRELCONNECTSPORTTOELEMENT" => (
+                "RELATEDELEMENT",
+                "RELATINGPORT",
+                5,
+                4,
+                EdgeKind::PortContainment,
+            ),
             "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
                 "RELATINGSTRUCTURE",
                 "RELATEDELEMENTS",
@@ -322,7 +330,7 @@ fn valid_edge(edge: Edge, classes: &[Option<Class>]) -> bool {
             Some(Class::Product) => parent == Some(Class::Product),
             _ => false,
         },
-        EdgeKind::Void | EdgeKind::Fill => {
+        EdgeKind::Void | EdgeKind::Fill | EdgeKind::PortContainment => {
             parent == Some(Class::Product) && child == Some(Class::Product)
         }
         EdgeKind::Containment => parent == Some(Class::Spatial) && child == Some(Class::Product),
@@ -334,14 +342,16 @@ fn priority(class: Class, kind: EdgeKind) -> u8 {
             EdgeKind::Aggregate => 0,
             EdgeKind::Nest => 1,
             EdgeKind::Void | EdgeKind::Fill => 2,
-            EdgeKind::Containment => 3,
+            EdgeKind::PortContainment => 3,
+            EdgeKind::Containment => 4,
         },
         Class::Product => match kind {
             EdgeKind::Aggregate => 0,
             EdgeKind::Nest => 1,
             EdgeKind::Void => 2,
             EdgeKind::Fill => 3,
-            EdgeKind::Containment => 4,
+            EdgeKind::PortContainment => 4,
+            EdgeKind::Containment => 5,
         },
     }
 }
