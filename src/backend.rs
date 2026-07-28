@@ -16,7 +16,8 @@ use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config}
 use crate::diagnostics;
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
-    definition, document_highlight, hover, inlay_hints, references, semantic_tokens, signature_help,
+    definition, document_highlight, document_symbols, hover, inlay_hints, references,
+    semantic_tokens, signature_help,
 };
 use crate::schema::{
     SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -396,6 +397,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 definition_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -535,6 +537,46 @@ impl LanguageServer for Backend {
         } else {
             debug!("go to definition found no target");
         }
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.text_document.uri))]
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let forced_schema_name = self.config.read().await.forced_schema_name.clone();
+
+        let mut documents = self.documents.write().await;
+        let diagnostics = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(diagnostics) => diagnostics,
+            None => return Ok(None),
+        };
+        let document = match documents.get(&uri) {
+            Some(document) => document,
+            None => return Ok(None),
+        };
+        let schema_name = forced_schema_name.or_else(|| {
+            document
+                .schema_name
+                .as_deref()
+                .map(crate::schema::normalize_name)
+        });
+        let schema_docs = self.schema_docs.read().await;
+        let schema = schema_name
+            .as_deref()
+            .and_then(|schema_name| schema_docs.get(schema_name));
+        let result = document_symbols::document_symbols(document, schema);
+        drop(schema_docs);
+        drop(documents);
+
+        self.request_time_diagnostics(diagnostics, &uri).await;
+        debug!(
+            has_result = result.is_some(),
+            "document symbols request completed"
+        );
 
         Ok(result)
     }
