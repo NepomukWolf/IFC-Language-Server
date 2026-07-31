@@ -508,7 +508,10 @@ mod tests {
         let output = render_for_test(ScaffoldLevel::Metadata, IfcVersion::Ifc4x3Add2, "test.ifc");
 
         assert!(output.contains("'2024-11-14T10:09:36'"));
-        assert!(output.contains("ifc-language-server 0.4.1"));
+        assert!(output.contains(&format!(
+            "ifc-language-server {}",
+            env!("CARGO_PKG_VERSION")
+        )));
         assert!(output.contains("'ifc-language-server'"));
     }
 
