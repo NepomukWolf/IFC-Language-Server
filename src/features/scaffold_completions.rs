@@ -28,9 +28,14 @@ enum ScaffoldLevel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ScaffoldAbbreviation {
+struct ScaffoldCompletionRequest {
     text: String,
     range: Range,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScaffoldCompletionCandidate {
+    trigger: &'static str,
     level: ScaffoldLevel,
     schema: IfcVersion,
 }
@@ -93,32 +98,39 @@ pub fn completions(
     position: Position,
     snippet_supported: bool,
 ) -> Option<CompletionResponse> {
-    let abbreviation = abbreviation_at_position(document, position)?;
-    let mut context = RenderContext::from_uri(uri, snippet_supported);
-    let new_text = render_scaffold(abbreviation.level, abbreviation.schema, &mut context);
-    let mut item = CompletionItem::new_simple(
-        abbreviation.text.clone(),
-        format!(
-            "{} {}",
-            abbreviation.level.detail(),
-            schema_detail(abbreviation.schema)
-        ),
-    );
+    let request = completion_request_at_position(document, position)?;
+    let items = completion_candidates(&request.text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let mut context = RenderContext::from_uri(uri, snippet_supported);
+            let new_text = render_scaffold(candidate.level, candidate.schema, &mut context);
+            let mut item = CompletionItem::new_simple(
+                candidate.label(),
+                format!(
+                    "{} {}",
+                    candidate.level.detail(),
+                    schema_detail(candidate.schema)
+                ),
+            );
 
-    item.kind = Some(CompletionItemKind::SNIPPET);
-    item.filter_text = Some(abbreviation.text.clone());
-    item.sort_text = Some("000_ifc_scaffold".to_string());
-    item.insert_text_format = Some(if snippet_supported {
-        InsertTextFormat::SNIPPET
-    } else {
-        InsertTextFormat::PLAIN_TEXT
-    });
-    item.text_edit = Some(CompletionTextEdit::Edit(TextEdit::new(
-        abbreviation.range,
-        new_text,
-    )));
+            item.kind = Some(CompletionItemKind::SNIPPET);
+            item.filter_text = Some(candidate.trigger.to_string());
+            item.sort_text = Some(format!("{index:03}_ifc_scaffold"));
+            item.insert_text_format = Some(if snippet_supported {
+                InsertTextFormat::SNIPPET
+            } else {
+                InsertTextFormat::PLAIN_TEXT
+            });
+            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit::new(
+                request.range,
+                new_text,
+            )));
+            item
+        })
+        .collect::<Vec<_>>();
 
-    Some(CompletionResponse::Array(vec![item]))
+    (!items.is_empty()).then_some(CompletionResponse::Array(items))
 }
 
 pub fn code_actions(
@@ -172,10 +184,10 @@ fn workspace_edit(uri: Url, edit: TextEdit) -> WorkspaceEdit {
     }
 }
 
-fn abbreviation_at_position(
+fn completion_request_at_position(
     document: &Document,
     position: Position,
-) -> Option<ScaffoldAbbreviation> {
+) -> Option<ScaffoldCompletionRequest> {
     let offset = document.position_to_offset(position)?;
     let line_start = *document.line_offsets.get(position.line as usize)?;
     let line_prefix = document.text.get(line_start..offset)?;
@@ -184,14 +196,15 @@ fn abbreviation_at_position(
         .map(|index| index + 1)
         .unwrap_or(0);
     let token = line_prefix.get(token_start..)?;
-    let (level, schema) = parse_abbreviation(token)?;
+    if token.is_empty() {
+        return None;
+    }
+
     let start_offset = line_start + token_start;
 
-    Some(ScaffoldAbbreviation {
+    Some(ScaffoldCompletionRequest {
         text: token.to_string(),
         range: document.range_for_offsets(start_offset, offset)?,
-        level,
-        schema,
     })
 }
 
@@ -199,6 +212,7 @@ fn is_abbreviation_character(character: char) -> bool {
     character == '!' || character == ':' || character.is_ascii_alphanumeric()
 }
 
+#[cfg(test)]
 fn parse_abbreviation(token: &str) -> Option<(ScaffoldLevel, IfcVersion)> {
     let bang_count = token.bytes().take_while(|byte| *byte == b'!').count();
     let level = match bang_count {
@@ -222,6 +236,89 @@ fn parse_abbreviation(token: &str) -> Option<(ScaffoldLevel, IfcVersion)> {
     Some((level, schema))
 }
 
+fn completion_candidates(token: &str) -> Vec<ScaffoldCompletionCandidate> {
+    let include_schema_variants = token.contains(':');
+
+    all_completion_candidates()
+        .iter()
+        .copied()
+        .filter(|candidate| include_schema_variants || !candidate.trigger.contains(':'))
+        .filter(|candidate| starts_with_ignore_ascii_case(candidate.trigger, token))
+        .collect()
+}
+
+fn all_completion_candidates() -> &'static [ScaffoldCompletionCandidate] {
+    &[
+        ScaffoldCompletionCandidate {
+            trigger: "!ifc",
+            level: ScaffoldLevel::Metadata,
+            schema: IfcVersion::Ifc4x3Add2,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!ifc",
+            level: ScaffoldLevel::Project,
+            schema: IfcVersion::Ifc4x3Add2,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!!ifc",
+            level: ScaffoldLevel::Spatial,
+            schema: IfcVersion::Ifc4x3Add2,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!ifc:2x3",
+            level: ScaffoldLevel::Metadata,
+            schema: IfcVersion::Ifc2x3Tc1,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!ifc:2x3",
+            level: ScaffoldLevel::Project,
+            schema: IfcVersion::Ifc2x3Tc1,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!!ifc:2x3",
+            level: ScaffoldLevel::Spatial,
+            schema: IfcVersion::Ifc2x3Tc1,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!ifc:4",
+            level: ScaffoldLevel::Metadata,
+            schema: IfcVersion::Ifc4Add2Tc1,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!ifc:4",
+            level: ScaffoldLevel::Project,
+            schema: IfcVersion::Ifc4Add2Tc1,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!!ifc:4",
+            level: ScaffoldLevel::Spatial,
+            schema: IfcVersion::Ifc4Add2Tc1,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!ifc:4x3",
+            level: ScaffoldLevel::Metadata,
+            schema: IfcVersion::Ifc4x3Add2,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!ifc:4x3",
+            level: ScaffoldLevel::Project,
+            schema: IfcVersion::Ifc4x3Add2,
+        },
+        ScaffoldCompletionCandidate {
+            trigger: "!!!ifc:4x3",
+            level: ScaffoldLevel::Spatial,
+            schema: IfcVersion::Ifc4x3Add2,
+        },
+    ]
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
+#[cfg(test)]
 fn parse_schema_selector(selector: &str) -> Option<IfcVersion> {
     if selector.is_empty() {
         return None;
@@ -250,6 +347,12 @@ impl ScaffoldLevel {
             Self::Project => "IFC project scaffold",
             Self::Spatial => "IFC spatial scaffold",
         }
+    }
+}
+
+impl ScaffoldCompletionCandidate {
+    fn label(self) -> String {
+        format!("{} ({})", self.level.detail(), schema_detail(self.schema))
     }
 }
 
@@ -398,18 +501,29 @@ mod tests {
         position: Position,
         snippet_supported: bool,
     ) -> Option<(CompletionItem, String)> {
+        let item = completion_items(text, uri, position, snippet_supported)?
+            .into_iter()
+            .next()?;
+        let new_text = match item.text_edit.as_ref()? {
+            CompletionTextEdit::Edit(edit) => edit.new_text.clone(),
+            CompletionTextEdit::InsertAndReplace(_) => panic!("expected plain text edit"),
+        };
+        Some((item, new_text))
+    }
+
+    fn completion_items(
+        text: &str,
+        uri: &Url,
+        position: Position,
+        snippet_supported: bool,
+    ) -> Option<Vec<CompletionItem>> {
         let document = document(text);
         let CompletionResponse::Array(items) =
             completions(&document, uri, position, snippet_supported)?
         else {
             panic!("expected completion item array");
         };
-        let item = items.into_iter().next()?;
-        let new_text = match item.text_edit.as_ref()? {
-            CompletionTextEdit::Edit(edit) => edit.new_text.clone(),
-            CompletionTextEdit::InsertAndReplace(_) => panic!("expected plain text edit"),
-        };
-        Some((item, new_text))
+        Some(items)
     }
 
     fn render_for_test(level: ScaffoldLevel, schema: IfcVersion, file_name: &str) -> String {
@@ -475,12 +589,66 @@ mod tests {
     #[test]
     fn replaces_only_the_typed_abbreviation() {
         let document = document("prefix !ifc:4");
-        let abbreviation = abbreviation_at_position(&document, Position::new(0, 13))
-            .expect("expected scaffold abbreviation");
+        let request = completion_request_at_position(&document, Position::new(0, 13))
+            .expect("expected scaffold completion request");
 
-        assert_eq!(abbreviation.text, "!ifc:4");
-        assert_eq!(abbreviation.range.start, Position::new(0, 7));
-        assert_eq!(abbreviation.range.end, Position::new(0, 13));
+        assert_eq!(request.text, "!ifc:4");
+        assert_eq!(request.range.start, Position::new(0, 7));
+        assert_eq!(request.range.end, Position::new(0, 13));
+    }
+
+    #[test]
+    fn offers_default_scaffold_levels_from_single_bang() {
+        let items = completion_items("!", &file_uri("test.ifc"), Position::new(0, 1), true)
+            .expect("expected scaffold completions");
+        let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert_eq!(
+            labels,
+            [
+                "IFC metadata scaffold (IFC 4x3 ADD2)",
+                "IFC project scaffold (IFC 4x3 ADD2)",
+                "IFC spatial scaffold (IFC 4x3 ADD2)"
+            ]
+        );
+    }
+
+    #[test]
+    fn offers_schema_variants_after_schema_separator() {
+        let items = completion_items("!ifc:", &file_uri("test.ifc"), Position::new(0, 5), true)
+            .expect("expected scaffold completions");
+        let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert_eq!(
+            labels,
+            [
+                "IFC metadata scaffold (IFC 2x3 TC1)",
+                "IFC metadata scaffold (IFC 4 ADD2 TC1)",
+                "IFC metadata scaffold (IFC 4x3 ADD2)"
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_completion_replaces_only_the_typed_token() {
+        let items = completion_items(
+            "prefix !!",
+            &file_uri("test.ifc"),
+            Position::new(0, 9),
+            true,
+        )
+        .expect("expected scaffold completions");
+        let edit = match items
+            .first()
+            .and_then(|item| item.text_edit.as_ref())
+            .expect("expected text edit")
+        {
+            CompletionTextEdit::Edit(edit) => edit,
+            CompletionTextEdit::InsertAndReplace(_) => panic!("expected plain text edit"),
+        };
+
+        assert_eq!(edit.range.start, Position::new(0, 7));
+        assert_eq!(edit.range.end, Position::new(0, 9));
     }
 
     #[test]
