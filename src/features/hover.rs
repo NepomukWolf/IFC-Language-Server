@@ -8,8 +8,8 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 
 use crate::document::{Document, ParameterValue};
 use crate::schema::{
-    EntityAttributeDoc, EntityDoc, EnumerationTypeDef, NamedTypeKind, PrimitiveType, SchemaDoc,
-    SchemaDocCollection, TypeDoc, TypeRef,
+    EntityAttributeDoc, EntityDoc, EnumerationTypeDef, IfcVersion, NamedTypeKind, PrimitiveType,
+    SchemaDoc, SchemaDocCollection, TypeDoc, TypeRef,
 };
 use crate::step::ast;
 
@@ -28,6 +28,16 @@ pub fn hover(
                 value: render_reference_hover(document, id)?,
             }),
             range: Some(document.id_range_at_offset(offset)?),
+        });
+    }
+
+    if let Some((keyword, range)) = header_keyword_at_position(document, position) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: render_header_keyword_hover(keyword),
+            }),
+            range: Some(range),
         });
     }
 
@@ -140,6 +150,104 @@ fn render_reference_hover(document: &Document, id: u32) -> Option<String> {
     let preview = document.entity_instance_text_at_definition(id)?;
 
     Some(format!("```ifc\n{}\n```", preview.trim()))
+}
+
+fn header_keyword_at_position(
+    document: &Document,
+    position: Position,
+) -> Option<(&'static str, Range)> {
+    let offset = document.position_to_offset(position)?;
+    let bytes = document.text.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let candidate = if offset < bytes.len() && is_header_identifier_part(bytes[offset]) {
+        offset
+    } else if offset > 0 && is_header_identifier_part(bytes[offset - 1]) {
+        offset - 1
+    } else {
+        return None;
+    };
+
+    let mut start = candidate;
+    while start > 0 && is_header_identifier_part(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = candidate + 1;
+    while end < bytes.len() && is_header_identifier_part(bytes[end]) {
+        end += 1;
+    }
+
+    let keyword = match document.text.get(start..end)?.to_ascii_uppercase().as_str() {
+        "FILE_DESCRIPTION" => "FILE_DESCRIPTION",
+        "FILE_NAME" => "FILE_NAME",
+        "FILE_SCHEMA" => "FILE_SCHEMA",
+        _ => return None,
+    };
+
+    Some((keyword, document.range_for_offsets(start, end)?))
+}
+
+fn is_header_identifier_part(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn render_header_keyword_hover(keyword: &str) -> String {
+    match keyword {
+        "FILE_DESCRIPTION" => render_header_hover(
+            "FILE_DESCRIPTION",
+            &[
+                ("description", "LIST [1:?] OF STRING"),
+                ("implementation_level", "STRING"),
+            ],
+            None,
+        ),
+        "FILE_NAME" => render_header_hover(
+            "FILE_NAME",
+            &[
+                ("name", "STRING"),
+                ("time_stamp", "STRING"),
+                ("author", "LIST [1:?] OF STRING"),
+                ("organization", "LIST [1:?] OF STRING"),
+                ("preprocessor_version", "STRING"),
+                ("originating_system", "STRING"),
+                ("authorization", "STRING"),
+            ],
+            None,
+        ),
+        "FILE_SCHEMA" => render_header_hover(
+            "FILE_SCHEMA",
+            &[("schema_identifiers", "LIST [1:?] OF STRING")],
+            Some(&supported_schema_names()),
+        ),
+        _ => String::new(),
+    }
+}
+
+fn render_header_hover(
+    keyword: &str,
+    attributes: &[(&str, &str)],
+    supported_schema_names: Option<&[&str]>,
+) -> String {
+    let mut markdown = format!("# {keyword}\n\n| # | Attribute | Type |\n| --- | --- | --- |");
+
+    for (index, (name, ty)) in attributes.iter().enumerate() {
+        markdown.push_str(&format!("\n| {} | *{}* | `{}` |", index + 1, name, ty));
+    }
+
+    if let Some(schema_names) = supported_schema_names {
+        markdown.push_str("\n\nSupported schema identifiers:");
+        for schema_name in schema_names {
+            markdown.push_str(&format!("\n- `{schema_name}`"));
+        }
+    }
+
+    markdown
+}
+
+fn supported_schema_names() -> [&'static str; 3] {
+    IfcVersion::supported().map(IfcVersion::schema_name)
 }
 
 fn enum_value_at_position<'a>(
@@ -393,7 +501,7 @@ fn ifc_si_unit_dimensions_hover(document: &Document, instance_id: u32) -> String
     };
 
     format!(
-        "Dimensions: `IfcDimensionalExponents({}, {}, {}, {}, {}, {}, {})`\n\nresolved from `Name`",
+        "Dimensions: `IfcDimensionalExponents({}, {}, {}, {}, {}, {}, {})`\n\nresolved from `self.Name`",
         dimensions[0],
         dimensions[1],
         dimensions[2],
@@ -442,7 +550,7 @@ fn subcontext_inherited_attribute_hover(
         ParameterValue::Null { .. } => format!("{attribute_name}: `$`"),
         _ => return unresolved(),
     };
-    text.push_str("\n\nresolved from `ParentContext`");
+    text.push_str("\n\nresolved from `self.ParentContext`");
     text
 }
 
@@ -720,6 +828,71 @@ mod tests {
     }
 
     #[test]
+    fn hover_returns_file_description_header_attributes_without_ast() {
+        let text = "ISO-10303-21;HEADER;FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');ENDSEC;";
+        let document = Document::new_unloaded(text.to_string());
+
+        let hover = hover(
+            &document,
+            position_at(text, "FILE_DESCRIPTION"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# FILE_DESCRIPTION"));
+        assert!(value.contains("| 1 | *description* | `LIST [1:?] OF STRING` |"));
+        assert!(value.contains("| 2 | *implementation_level* | `STRING` |"));
+    }
+
+    #[test]
+    fn hover_returns_file_name_header_attributes_without_ast() {
+        let text = "ISO-10303-21;HEADER;FILE_NAME('sample.ifc','2026-05-06T00:00:00',('OpenAI'),('OpenAI'),'ifc-language-server','','');ENDSEC;";
+        let document = Document::new_unloaded(text.to_string());
+
+        let hover = hover(
+            &document,
+            position_at(text, "FILE_NAME"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# FILE_NAME"));
+        assert!(value.contains("| 1 | *name* | `STRING` |"));
+        assert!(value.contains("| 2 | *time_stamp* | `STRING` |"));
+        assert!(value.contains("| 3 | *author* | `LIST [1:?] OF STRING` |"));
+        assert!(value.contains("| 4 | *organization* | `LIST [1:?] OF STRING` |"));
+        assert!(value.contains("| 5 | *preprocessor_version* | `STRING` |"));
+        assert!(value.contains("| 6 | *originating_system* | `STRING` |"));
+        assert!(value.contains("| 7 | *authorization* | `STRING` |"));
+    }
+
+    #[test]
+    fn hover_returns_file_schema_header_attributes_and_supported_versions_without_ast() {
+        let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;";
+        let document = Document::new_unloaded(text.to_string());
+
+        let hover = hover(
+            &document,
+            position_at(text, "FILE_SCHEMA"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# FILE_SCHEMA"));
+        assert!(value.contains("| 1 | *schema_identifiers* | `LIST [1:?] OF STRING` |"));
+        assert!(value.contains("Supported schema identifiers:"));
+        assert!(value.contains("- `IFC2X3`"));
+        assert!(value.contains("- `IFC4`"));
+        assert!(value.contains("- `IFC4X3_ADD2`"));
+    }
+
+    #[test]
     fn typed_value_name_detection_finds_inline_type_name() {
         let text = "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));";
         let document = parse_document(text);
@@ -806,7 +979,7 @@ mod tests {
 
         assert!(value.contains("Dimensions"));
         assert!(value.contains("IfcDimensionalExponents(1, 0, 0, 0, 0, 0, 0)"));
-        assert!(value.contains("resolved from `Name`"));
+        assert!(value.contains("resolved from `self.Name`"));
     }
 
     #[test]
@@ -843,7 +1016,7 @@ mod tests {
 
         assert!(value.contains("TrueNorth"));
         assert!(value.contains("TrueNorth: `$`"));
-        assert!(value.contains("resolved from `ParentContext`"));
+        assert!(value.contains("resolved from `self.ParentContext`"));
     }
 
     #[test]
@@ -870,7 +1043,7 @@ mod tests {
         assert!(value.contains("WorldCoordinateSystem"));
         assert!(value.contains("`#7`"));
         assert!(value.contains("#7=IFCAXIS2PLACEMENT3D();"));
-        assert!(value.contains("resolved from `ParentContext`"));
+        assert!(value.contains("resolved from `self.ParentContext`"));
     }
 
     #[test]
