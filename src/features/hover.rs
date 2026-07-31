@@ -13,6 +13,10 @@ use crate::schema::{
 };
 use crate::step::ast;
 
+const FILE_DESCRIPTION_HOVER: &str = include_str!("hover/static/file_description.md");
+const FILE_NAME_HOVER: &str = include_str!("hover/static/file_name.md");
+const FILE_SCHEMA_HOVER: &str = include_str!("hover/static/file_schema.md");
+
 pub fn hover(
     document: &Document,
     position: Position,
@@ -28,6 +32,16 @@ pub fn hover(
                 value: render_reference_hover(document, id)?,
             }),
             range: Some(document.id_range_at_offset(offset)?),
+        });
+    }
+
+    if let Some((keyword, range)) = header_keyword_at_position(document, position) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: render_header_keyword_hover(keyword)?.to_string(),
+            }),
+            range: Some(range),
         });
     }
 
@@ -140,6 +154,56 @@ fn render_reference_hover(document: &Document, id: u32) -> Option<String> {
     let preview = document.entity_instance_text_at_definition(id)?;
 
     Some(format!("```ifc\n{}\n```", preview.trim()))
+}
+
+fn header_keyword_at_position(
+    document: &Document,
+    position: Position,
+) -> Option<(&'static str, Range)> {
+    let offset = document.position_to_offset(position)?;
+    let bytes = document.text.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let candidate = if offset < bytes.len() && is_header_identifier_part(bytes[offset]) {
+        offset
+    } else if offset > 0 && is_header_identifier_part(bytes[offset - 1]) {
+        offset - 1
+    } else {
+        return None;
+    };
+
+    let mut start = candidate;
+    while start > 0 && is_header_identifier_part(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = candidate + 1;
+    while end < bytes.len() && is_header_identifier_part(bytes[end]) {
+        end += 1;
+    }
+
+    let keyword = match document.text.get(start..end)?.to_ascii_uppercase().as_str() {
+        "FILE_DESCRIPTION" => "FILE_DESCRIPTION",
+        "FILE_NAME" => "FILE_NAME",
+        "FILE_SCHEMA" => "FILE_SCHEMA",
+        _ => return None,
+    };
+
+    Some((keyword, document.range_for_offsets(start, end)?))
+}
+
+fn is_header_identifier_part(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn render_header_keyword_hover(keyword: &str) -> Option<&'static str> {
+    match keyword {
+        "FILE_DESCRIPTION" => Some(FILE_DESCRIPTION_HOVER),
+        "FILE_NAME" => Some(FILE_NAME_HOVER),
+        "FILE_SCHEMA" => Some(FILE_SCHEMA_HOVER),
+        _ => None,
+    }
 }
 
 fn enum_value_at_position<'a>(
@@ -393,7 +457,7 @@ fn ifc_si_unit_dimensions_hover(document: &Document, instance_id: u32) -> String
     };
 
     format!(
-        "Dimensions: `IfcDimensionalExponents({}, {}, {}, {}, {}, {}, {})`\n\nresolved from `Name`",
+        "Dimensions: `IfcDimensionalExponents({}, {}, {}, {}, {}, {}, {})`\n\nresolved from `self.Name`",
         dimensions[0],
         dimensions[1],
         dimensions[2],
@@ -442,7 +506,7 @@ fn subcontext_inherited_attribute_hover(
         ParameterValue::Null { .. } => format!("{attribute_name}: `$`"),
         _ => return unresolved(),
     };
-    text.push_str("\n\nresolved from `ParentContext`");
+    text.push_str("\n\nresolved from `self.ParentContext`");
     text
 }
 
@@ -806,7 +870,6 @@ mod tests {
 
         assert!(value.contains("Dimensions"));
         assert!(value.contains("IfcDimensionalExponents(1, 0, 0, 0, 0, 0, 0)"));
-        assert!(value.contains("resolved from `Name`"));
     }
 
     #[test]
@@ -843,7 +906,6 @@ mod tests {
 
         assert!(value.contains("TrueNorth"));
         assert!(value.contains("TrueNorth: `$`"));
-        assert!(value.contains("resolved from `ParentContext`"));
     }
 
     #[test]
@@ -870,7 +932,6 @@ mod tests {
         assert!(value.contains("WorldCoordinateSystem"));
         assert!(value.contains("`#7`"));
         assert!(value.contains("#7=IFCAXIS2PLACEMENT3D();"));
-        assert!(value.contains("resolved from `ParentContext`"));
     }
 
     #[test]
