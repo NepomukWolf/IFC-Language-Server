@@ -1,5 +1,5 @@
 //! IFC scaffold completion snippets and file-level code actions.
-//! This module handles Emmet-like abbreviations such as `!ifc:4x3` and empty-file scaffold
+//! This module handles Emmet-like abbreviations such as `!ifc` and empty-file scaffold
 //! actions without requiring AST state.
 
 use crate::document::Document;
@@ -37,7 +37,6 @@ struct ScaffoldCompletionRequest {
 struct ScaffoldCompletionCandidate {
     trigger: &'static str,
     level: ScaffoldLevel,
-    schema: IfcVersion,
 }
 
 #[derive(Clone, Debug)]
@@ -104,14 +103,10 @@ pub fn completions(
         .enumerate()
         .map(|(index, candidate)| {
             let mut context = RenderContext::from_uri(uri, snippet_supported);
-            let new_text = render_scaffold(candidate.level, candidate.schema, &mut context);
+            let new_text = render_scaffold(candidate.level, &mut context);
             let mut item = CompletionItem::new_simple(
-                candidate.label(),
-                format!(
-                    "{} {}",
-                    candidate.level.detail(),
-                    schema_detail(candidate.schema)
-                ),
+                candidate.level.detail().to_string(),
+                "Insert IFC STEP boilerplate".to_string(),
             );
 
             item.kind = Some(CompletionItemKind::SNIPPET);
@@ -151,7 +146,7 @@ pub fn code_actions(
     .into_iter()
     .map(|(level, title)| {
         let mut context = RenderContext::from_uri(uri, false);
-        let new_text = render_scaffold(level, DEFAULT_SCHEMA, &mut context);
+        let new_text = render_scaffold(level, &mut context);
         CodeActionOrCommand::CodeAction(CodeAction {
             title: title.to_string(),
             kind: Some(CodeActionKind::SOURCE),
@@ -212,37 +207,10 @@ fn is_abbreviation_character(character: char) -> bool {
     character == '!' || character == ':' || character.is_ascii_alphanumeric()
 }
 
-#[cfg(test)]
-fn parse_abbreviation(token: &str) -> Option<(ScaffoldLevel, IfcVersion)> {
-    let bang_count = token.bytes().take_while(|byte| *byte == b'!').count();
-    let level = match bang_count {
-        1 => ScaffoldLevel::Metadata,
-        2 => ScaffoldLevel::Project,
-        3 => ScaffoldLevel::Spatial,
-        _ => return None,
-    };
-
-    let rest = token.get(bang_count..)?;
-    if rest.len() < 3 || !rest[..3].eq_ignore_ascii_case("ifc") {
-        return None;
-    }
-
-    let schema = match rest.get(3..) {
-        Some("") => DEFAULT_SCHEMA,
-        Some(selector) if selector.starts_with(':') => parse_schema_selector(&selector[1..])?,
-        _ => return None,
-    };
-
-    Some((level, schema))
-}
-
 fn completion_candidates(token: &str) -> Vec<ScaffoldCompletionCandidate> {
-    let include_schema_variants = token.contains(':');
-
     all_completion_candidates()
         .iter()
         .copied()
-        .filter(|candidate| include_schema_variants || !candidate.trigger.contains(':'))
         .filter(|candidate| starts_with_ignore_ascii_case(candidate.trigger, token))
         .collect()
 }
@@ -252,62 +220,14 @@ fn all_completion_candidates() -> &'static [ScaffoldCompletionCandidate] {
         ScaffoldCompletionCandidate {
             trigger: "!ifc",
             level: ScaffoldLevel::Metadata,
-            schema: IfcVersion::Ifc4x3Add2,
         },
         ScaffoldCompletionCandidate {
             trigger: "!!ifc",
             level: ScaffoldLevel::Project,
-            schema: IfcVersion::Ifc4x3Add2,
         },
         ScaffoldCompletionCandidate {
             trigger: "!!!ifc",
             level: ScaffoldLevel::Spatial,
-            schema: IfcVersion::Ifc4x3Add2,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!ifc:2x3",
-            level: ScaffoldLevel::Metadata,
-            schema: IfcVersion::Ifc2x3Tc1,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!ifc:2x3",
-            level: ScaffoldLevel::Project,
-            schema: IfcVersion::Ifc2x3Tc1,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!!ifc:2x3",
-            level: ScaffoldLevel::Spatial,
-            schema: IfcVersion::Ifc2x3Tc1,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!ifc:4",
-            level: ScaffoldLevel::Metadata,
-            schema: IfcVersion::Ifc4Add2Tc1,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!ifc:4",
-            level: ScaffoldLevel::Project,
-            schema: IfcVersion::Ifc4Add2Tc1,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!!ifc:4",
-            level: ScaffoldLevel::Spatial,
-            schema: IfcVersion::Ifc4Add2Tc1,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!ifc:4x3",
-            level: ScaffoldLevel::Metadata,
-            schema: IfcVersion::Ifc4x3Add2,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!ifc:4x3",
-            level: ScaffoldLevel::Project,
-            schema: IfcVersion::Ifc4x3Add2,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!!ifc:4x3",
-            level: ScaffoldLevel::Spatial,
-            schema: IfcVersion::Ifc4x3Add2,
         },
     ]
 }
@@ -316,28 +236,6 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
     value
         .get(..prefix.len())
         .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-}
-
-#[cfg(test)]
-fn parse_schema_selector(selector: &str) -> Option<IfcVersion> {
-    if selector.is_empty() {
-        return None;
-    }
-
-    match selector.to_ascii_lowercase().as_str() {
-        "2x3" => Some(IfcVersion::Ifc2x3Tc1),
-        "4" => Some(IfcVersion::Ifc4Add2Tc1),
-        "4x3" => Some(IfcVersion::Ifc4x3Add2),
-        _ => None,
-    }
-}
-
-fn schema_detail(schema: IfcVersion) -> &'static str {
-    match schema {
-        IfcVersion::Ifc2x3Tc1 => "IFC 2x3 TC1",
-        IfcVersion::Ifc4Add2Tc1 => "IFC 4 ADD2 TC1",
-        IfcVersion::Ifc4x3Add2 => "IFC 4x3 ADD2",
-    }
 }
 
 impl ScaffoldLevel {
@@ -350,42 +248,32 @@ impl ScaffoldLevel {
     }
 }
 
-impl ScaffoldCompletionCandidate {
-    fn label(self) -> String {
-        format!("{} ({})", self.level.detail(), schema_detail(self.schema))
-    }
-}
-
-fn render_scaffold(
-    level: ScaffoldLevel,
-    schema: IfcVersion,
-    context: &mut RenderContext,
-) -> String {
+fn render_scaffold(level: ScaffoldLevel, context: &mut RenderContext) -> String {
     match level {
-        ScaffoldLevel::Metadata => render_metadata_scaffold(schema, context),
-        ScaffoldLevel::Project => render_project_scaffold(schema, context),
-        ScaffoldLevel::Spatial => render_spatial_scaffold(schema, context),
+        ScaffoldLevel::Metadata => render_metadata_scaffold(context),
+        ScaffoldLevel::Project => render_project_scaffold(context),
+        ScaffoldLevel::Spatial => render_spatial_scaffold(context),
     }
 }
 
-fn render_metadata_scaffold(schema: IfcVersion, context: &RenderContext) -> String {
+fn render_metadata_scaffold(context: &RenderContext) -> String {
     render_template(
         METADATA_TEMPLATE,
-        &common_bindings(schema, context, context.final_tabstop()),
+        &common_bindings(context, context.final_tabstop()),
     )
 }
 
-fn render_project_scaffold(schema: IfcVersion, context: &mut RenderContext) -> String {
+fn render_project_scaffold(context: &mut RenderContext) -> String {
     let project_guid = context.next_guid();
 
-    let mut bindings = common_bindings(schema, context, context.final_tabstop());
+    let mut bindings = common_bindings(context, context.final_tabstop());
     bindings.push(("project_guid", project_guid));
     bindings.push(("project_name", context.placeholder(3, "Project Name")));
 
     render_template(PROJECT_TEMPLATE, &bindings)
 }
 
-fn render_spatial_scaffold(schema: IfcVersion, context: &mut RenderContext) -> String {
+fn render_spatial_scaffold(context: &mut RenderContext) -> String {
     let project_guid = context.next_guid();
     let site_guid = context.next_guid();
     let building_guid = context.next_guid();
@@ -394,7 +282,7 @@ fn render_spatial_scaffold(schema: IfcVersion, context: &mut RenderContext) -> S
     let rel_site_building_guid = context.next_guid();
     let rel_building_storey_guid = context.next_guid();
 
-    let mut bindings = common_bindings(schema, context, context.final_tabstop());
+    let mut bindings = common_bindings(context, context.final_tabstop());
     bindings.push(("project_guid", project_guid));
     bindings.push(("site_guid", site_guid));
     bindings.push(("building_guid", building_guid));
@@ -410,11 +298,7 @@ fn render_spatial_scaffold(schema: IfcVersion, context: &mut RenderContext) -> S
     render_template(SPATIAL_TEMPLATE, &bindings)
 }
 
-fn common_bindings(
-    schema: IfcVersion,
-    context: &RenderContext,
-    final_tabstop: &str,
-) -> Vec<(&'static str, String)> {
+fn common_bindings(context: &RenderContext, final_tabstop: &str) -> Vec<(&'static str, String)> {
     vec![
         ("file_name", context.file_name.clone()),
         ("timestamp_iso", step_timestamp(context.timestamp)),
@@ -427,7 +311,7 @@ fn common_bindings(
         ("originating_system", lsp_tool_name_with_version()),
         ("preprocessor_version", "ifc-language-server".to_string()),
         ("application_version", env!("CARGO_PKG_VERSION").to_string()),
-        ("schema_name", schema.schema_name().to_string()),
+        ("schema_name", DEFAULT_SCHEMA.schema_name().to_string()),
         ("final_tabstop", final_tabstop.to_string()),
     ]
 }
@@ -526,11 +410,6 @@ mod tests {
         Some(items)
     }
 
-    fn render_for_test(level: ScaffoldLevel, schema: IfcVersion, file_name: &str) -> String {
-        let mut context = RenderContext::for_test(file_name, true);
-        render_scaffold(level, schema, &mut context)
-    }
-
     fn code_action_edits(text: &str, uri: &Url) -> Option<Vec<(String, TextEdit)>> {
         let document = document(text);
         let actions = code_actions(&document, uri, None)?;
@@ -559,42 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_supported_scaffold_abbreviations() {
-        assert_eq!(
-            parse_abbreviation("!ifc"),
-            Some((ScaffoldLevel::Metadata, IfcVersion::Ifc4x3Add2))
-        );
-        assert_eq!(
-            parse_abbreviation("!!ifc:2x3"),
-            Some((ScaffoldLevel::Project, IfcVersion::Ifc2x3Tc1))
-        );
-        assert_eq!(
-            parse_abbreviation("!!!ifc:4"),
-            Some((ScaffoldLevel::Spatial, IfcVersion::Ifc4Add2Tc1))
-        );
-        assert_eq!(
-            parse_abbreviation("!!!ifc:4x3"),
-            Some((ScaffoldLevel::Spatial, IfcVersion::Ifc4x3Add2))
-        );
-    }
-
-    #[test]
-    fn rejects_unsupported_or_incomplete_abbreviations() {
-        assert_eq!(parse_abbreviation("!!!!ifc"), None);
-        assert_eq!(parse_abbreviation("!ifc:"), None);
-        assert_eq!(parse_abbreviation("!ifc:4x2"), None);
-        assert_eq!(parse_abbreviation("!wall"), None);
-    }
-
-    #[test]
     fn replaces_only_the_typed_abbreviation() {
-        let document = document("prefix !ifc:4");
-        let request = completion_request_at_position(&document, Position::new(0, 13))
+        let document = document("prefix !ifc");
+        let request = completion_request_at_position(&document, Position::new(0, 11))
             .expect("expected scaffold completion request");
 
-        assert_eq!(request.text, "!ifc:4");
+        assert_eq!(request.text, "!ifc");
         assert_eq!(request.range.start, Position::new(0, 7));
-        assert_eq!(request.range.end, Position::new(0, 13));
+        assert_eq!(request.range.end, Position::new(0, 11));
     }
 
     #[test]
@@ -606,27 +457,36 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "IFC metadata scaffold (IFC 4x3 ADD2)",
-                "IFC project scaffold (IFC 4x3 ADD2)",
-                "IFC spatial scaffold (IFC 4x3 ADD2)"
+                "IFC metadata scaffold",
+                "IFC project scaffold",
+                "IFC spatial scaffold"
             ]
         );
     }
 
     #[test]
-    fn offers_schema_variants_after_schema_separator() {
-        let items = completion_items("!ifc:", &file_uri("test.ifc"), Position::new(0, 5), true)
+    fn narrows_default_scaffold_levels_from_repeated_bangs() {
+        let items = completion_items("!!", &file_uri("test.ifc"), Position::new(0, 2), true)
             .expect("expected scaffold completions");
         let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
 
-        assert_eq!(
-            labels,
-            [
-                "IFC metadata scaffold (IFC 2x3 TC1)",
-                "IFC metadata scaffold (IFC 4 ADD2 TC1)",
-                "IFC metadata scaffold (IFC 4x3 ADD2)"
-            ]
-        );
+        assert_eq!(labels, ["IFC project scaffold", "IFC spatial scaffold"]);
+    }
+
+    #[test]
+    fn does_not_offer_schema_suffix_completions() {
+        for (text, position) in [
+            ("!ifc:", Position::new(0, 5)),
+            ("!ifc:2x3", Position::new(0, 8)),
+            ("!ifc:4", Position::new(0, 6)),
+        ] {
+            let document = document(text);
+
+            assert_eq!(
+                completions(&document, &file_uri("test.ifc"), position, true),
+                None
+            );
+        }
     }
 
     #[test]
@@ -654,7 +514,7 @@ mod tests {
     #[test]
     fn uses_file_name_from_uri_in_completion() {
         let (_, new_text) =
-            completion_text("!ifc:2x3", &file_uri("test.ifc"), Position::new(0, 8), true)
+            completion_text("!ifc", &file_uri("test.ifc"), Position::new(0, 4), true)
                 .expect("expected completion");
 
         assert!(new_text.contains("FILE_NAME('test.ifc'"));
@@ -662,18 +522,16 @@ mod tests {
 
     #[test]
     fn escapes_file_name_for_step_strings() {
-        let output = render_for_test(
-            ScaffoldLevel::Metadata,
-            IfcVersion::Ifc4Add2Tc1,
-            "owner's.ifc",
-        );
+        let mut context = RenderContext::for_test("owner's.ifc", true);
+        let output = render_scaffold(ScaffoldLevel::Metadata, &mut context);
 
         assert!(output.contains("FILE_NAME('owner''s.ifc'"));
     }
 
     #[test]
     fn renders_lsp_tool_metadata_in_header() {
-        let output = render_for_test(ScaffoldLevel::Metadata, IfcVersion::Ifc4x3Add2, "test.ifc");
+        let mut context = RenderContext::for_test("test.ifc", true);
+        let output = render_scaffold(ScaffoldLevel::Metadata, &mut context);
 
         assert!(output.contains("'2024-11-14T10:09:36'"));
         assert!(output.contains(&format!(
@@ -684,27 +542,13 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_templates_render_without_unresolved_placeholders() {
-        for level in [
-            ScaffoldLevel::Metadata,
-            ScaffoldLevel::Project,
-            ScaffoldLevel::Spatial,
-        ] {
-            let output = render_for_test(level, IfcVersion::Ifc4x3Add2, "test.ifc");
-
-            assert!(!output.contains("{{"));
-            assert!(!output.contains("}}"));
-        }
-    }
-
-    #[test]
     fn renders_snippet_completion_when_supported() {
         let (item, new_text) =
-            completion_text("!ifc:2x3", &file_uri("test.ifc"), Position::new(0, 8), true)
+            completion_text("!ifc", &file_uri("test.ifc"), Position::new(0, 4), true)
                 .expect("expected completion");
 
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
-        assert!(new_text.contains("FILE_SCHEMA(('IFC2X3'))"));
+        assert!(new_text.contains("FILE_SCHEMA(('IFC4X3_ADD2'))"));
         assert!(new_text.contains("${1:Author}"));
         assert!(new_text.contains("$0"));
     }
@@ -712,11 +556,11 @@ mod tests {
     #[test]
     fn renders_plain_text_completion_without_snippet_support() {
         let (item, new_text) =
-            completion_text("!!ifc:4", &file_uri("test.ifc"), Position::new(0, 7), false)
+            completion_text("!!ifc", &file_uri("test.ifc"), Position::new(0, 5), false)
                 .expect("expected completion");
 
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
-        assert!(new_text.contains("FILE_SCHEMA(('IFC4'))"));
+        assert!(new_text.contains("FILE_SCHEMA(('IFC4X3_ADD2'))"));
         assert!(new_text.contains("'Project Name'"));
         assert!(!new_text.contains("${"));
         assert!(!new_text.contains("\\$"));
@@ -800,50 +644,5 @@ mod tests {
 
         assert_eq!(guid.len(), 22);
         assert!(guid.bytes().all(|byte| IFC_GUID_ALPHABET.contains(&byte)));
-    }
-
-    #[test]
-    fn project_scaffold_includes_owner_history_and_application() {
-        let output = render_for_test(ScaffoldLevel::Project, IfcVersion::Ifc4Add2Tc1, "test.ifc");
-
-        assert!(output.contains("IFCOWNERHISTORY"));
-        assert!(output.contains("IFCPERSONANDORGANIZATION"));
-        assert!(output.contains("IFCPERSON"));
-        assert!(output.contains("IFCORGANIZATION"));
-        assert!(output.contains("IFCAPPLICATION"));
-        assert!(output.contains("ifc-language-server"));
-        assert!(output.contains("#1=IFCPROJECT("));
-        assert!(output.contains(",#2,'${3:Project Name}'"));
-        assert!(!output.contains("0000000000000000000000"));
-    }
-
-    #[test]
-    fn spatial_scaffold_for_ifc4x3_has_valid_building_arity() {
-        let output = render_for_test(ScaffoldLevel::Spatial, IfcVersion::Ifc4x3Add2, "test.ifc");
-        let building_line = output
-            .lines()
-            .find(|line| line.contains("=IFCBUILDING("))
-            .expect("expected building line");
-
-        assert_eq!(building_line.matches(',').count() + 1, 12);
-        assert!(output.contains("FILE_SCHEMA(('IFC4X3_ADD2'))"));
-        assert!(output.contains("IFCBUILDINGSTOREY"));
-        assert!(output.contains("IFCRELAGGREGATES"));
-        assert!(output.contains("IFCUNITASSIGNMENT"));
-        assert!(output.contains("IFCGEOMETRICREPRESENTATIONCONTEXT"));
-    }
-
-    #[test]
-    fn spatial_scaffold_uses_object_placements_for_spatial_elements() {
-        let output = render_for_test(ScaffoldLevel::Spatial, IfcVersion::Ifc4x3Add2, "test.ifc");
-
-        assert!(output.contains("#17=IFCAXIS2PLACEMENT3D(#14,#15,#16);"));
-        assert!(output.contains("#18=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#17,$);"));
-        assert!(output.contains("#23=IFCLOCALPLACEMENT($,#17);"));
-        assert!(output.contains("#24=IFCLOCALPLACEMENT(#23,#17);"));
-        assert!(output.contains("#25=IFCLOCALPLACEMENT(#24,#17);"));
-        assert!(output.contains(",#23,$,$,.ELEMENT.,$,$,$,$,$);"));
-        assert!(output.contains(",#24,$,$,.ELEMENT.,$,$,$);"));
-        assert!(output.contains(",#25,$,$,.ELEMENT.,$);"));
     }
 }
