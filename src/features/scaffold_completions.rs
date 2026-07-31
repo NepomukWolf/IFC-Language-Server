@@ -20,26 +20,24 @@ const METADATA_TEMPLATE: &str = include_str!("scaffold_templates/metadata.ifc.tp
 const PROJECT_TEMPLATE: &str = include_str!("scaffold_templates/project.ifc.tpl");
 const SPATIAL_TEMPLATE: &str = include_str!("scaffold_templates/spatial.ifc.tpl");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum ScaffoldLevel {
     Metadata,
     Project,
     Spatial,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct ScaffoldCompletionRequest {
     text: String,
     range: Range,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct ScaffoldCompletionCandidate {
     trigger: &'static str,
     level: ScaffoldLevel,
 }
 
-#[derive(Clone, Debug)]
 struct RenderContext {
     file_name: String,
     snippet: bool,
