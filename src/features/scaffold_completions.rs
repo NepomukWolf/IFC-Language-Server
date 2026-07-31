@@ -1,12 +1,15 @@
-//! IFC scaffold completion snippets.
-//! This module handles Emmet-like abbreviations such as `!ifc:4x3` without requiring AST state.
+//! IFC scaffold completion snippets and file-level code actions.
+//! This module handles Emmet-like abbreviations such as `!ifc:4x3` and empty-file scaffold
+//! actions without requiring AST state.
 
 use crate::document::Document;
 use crate::schema::IfcVersion;
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, InsertTextFormat,
-    Position, Range, TextEdit, Url,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionResponse, CompletionItem,
+    CompletionItemKind, CompletionResponse, CompletionTextEdit, InsertTextFormat, Position, Range,
+    TextEdit, Url, WorkspaceEdit,
 };
 use uuid::Uuid;
 
@@ -116,6 +119,57 @@ pub fn completions(
     )));
 
     Some(CompletionResponse::Array(vec![item]))
+}
+
+pub fn code_actions(
+    document: &Document,
+    uri: &Url,
+    requested_kinds: Option<&[CodeActionKind]>,
+) -> Option<CodeActionResponse> {
+    if !document.text.trim().is_empty() || !code_action_kind_requested(requested_kinds) {
+        return None;
+    }
+
+    let replace_document_range = document.range_for_offsets(0, document.text.len())?;
+    let actions = [
+        (ScaffoldLevel::Metadata, "Insert IFC metadata scaffold"),
+        (ScaffoldLevel::Project, "Insert IFC project scaffold"),
+        (ScaffoldLevel::Spatial, "Insert IFC spatial scaffold"),
+    ]
+    .into_iter()
+    .map(|(level, title)| {
+        let mut context = RenderContext::from_uri(uri, false);
+        let new_text = render_scaffold(level, DEFAULT_SCHEMA, &mut context);
+        CodeActionOrCommand::CodeAction(CodeAction {
+            title: title.to_string(),
+            kind: Some(CodeActionKind::SOURCE),
+            edit: Some(workspace_edit(
+                uri.clone(),
+                TextEdit::new(replace_document_range, new_text),
+            )),
+            ..CodeAction::default()
+        })
+    })
+    .collect();
+
+    Some(actions)
+}
+
+fn code_action_kind_requested(requested_kinds: Option<&[CodeActionKind]>) -> bool {
+    requested_kinds.is_none_or(|kinds| {
+        kinds.iter().any(|kind| {
+            let requested = kind.as_str();
+            requested.is_empty() || CodeActionKind::SOURCE.as_str().starts_with(requested)
+        })
+    })
+}
+
+fn workspace_edit(uri: Url, edit: TextEdit) -> WorkspaceEdit {
+    WorkspaceEdit {
+        changes: Some(HashMap::from([(uri, vec![edit])])),
+        document_changes: None,
+        change_annotations: None,
+    }
 }
 
 fn abbreviation_at_position(
@@ -363,6 +417,33 @@ mod tests {
         render_scaffold(level, schema, &mut context)
     }
 
+    fn code_action_edits(text: &str, uri: &Url) -> Option<Vec<(String, TextEdit)>> {
+        let document = document(text);
+        let actions = code_actions(&document, uri, None)?;
+
+        Some(
+            actions
+                .into_iter()
+                .map(|action| {
+                    let CodeActionOrCommand::CodeAction(action) = action else {
+                        panic!("expected code action");
+                    };
+                    let edit = action
+                        .edit
+                        .and_then(|edit| edit.changes)
+                        .and_then(|mut changes| changes.remove(uri))
+                        .and_then(|mut edits| {
+                            assert_eq!(edits.len(), 1);
+                            edits.pop()
+                        })
+                        .expect("expected text edit");
+
+                    (action.title, edit)
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn parses_supported_scaffold_abbreviations() {
         assert_eq!(
@@ -468,6 +549,78 @@ mod tests {
         assert!(new_text.contains("'Project Name'"));
         assert!(!new_text.contains("${"));
         assert!(!new_text.contains("\\$"));
+    }
+
+    #[test]
+    fn offers_three_code_actions_for_empty_document() {
+        let edits = code_action_edits("", &file_uri("empty.ifc")).expect("expected code actions");
+        let titles: Vec<_> = edits.iter().map(|(title, _)| title.as_str()).collect();
+
+        assert_eq!(
+            titles,
+            [
+                "Insert IFC metadata scaffold",
+                "Insert IFC project scaffold",
+                "Insert IFC spatial scaffold"
+            ]
+        );
+        assert!(
+            edits
+                .iter()
+                .all(|(_, edit)| edit.range == Range::new(Position::new(0, 0), Position::new(0, 0)))
+        );
+    }
+
+    #[test]
+    fn code_actions_replace_whitespace_only_document() {
+        let edits =
+            code_action_edits(" \n\t", &file_uri("blank.ifc")).expect("expected code actions");
+
+        assert!(
+            edits
+                .iter()
+                .all(|(_, edit)| edit.range == Range::new(Position::new(0, 0), Position::new(1, 1)))
+        );
+    }
+
+    #[test]
+    fn code_actions_insert_plain_default_schema_scaffolds() {
+        let edits = code_action_edits("", &file_uri("plain.ifc")).expect("expected code actions");
+
+        for (_, edit) in edits {
+            assert!(edit.new_text.contains("FILE_SCHEMA(('IFC4X3_ADD2'))"));
+            assert!(!edit.new_text.contains("${"));
+            assert!(!edit.new_text.contains("$0"));
+        }
+    }
+
+    #[test]
+    fn does_not_offer_code_actions_for_non_empty_documents() {
+        let document = document("ISO-10303-21;\nEND-ISO-10303-21;");
+
+        assert_eq!(code_actions(&document, &file_uri("model.ifc"), None), None);
+    }
+
+    #[test]
+    fn filters_code_actions_by_requested_kind() {
+        let document = document("");
+
+        assert!(
+            code_actions(
+                &document,
+                &file_uri("model.ifc"),
+                Some(&[CodeActionKind::SOURCE])
+            )
+            .is_some()
+        );
+        assert!(
+            code_actions(
+                &document,
+                &file_uri("model.ifc"),
+                Some(&[CodeActionKind::QUICKFIX])
+            )
+            .is_none()
+        );
     }
 
     #[test]

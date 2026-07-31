@@ -426,6 +426,13 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec!["!".to_string(), ":".to_string()]),
                     ..CompletionOptions::default()
                 }),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::SOURCE]),
+                        resolve_provider: Some(false),
+                        ..CodeActionOptions::default()
+                    },
+                )),
                 semantic_tokens_provider,
                 ..Default::default()
             },
@@ -505,6 +512,25 @@ impl LanguageServer for Backend {
         debug!(
             has_result = result.is_some(),
             "completion request completed"
+        );
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.text_document.uri))]
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let requested_kinds = params.context.only.as_deref();
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+
+        let result = scaffold_completions::code_actions(document, &uri, requested_kinds);
+        debug!(
+            result_count = result.as_ref().map_or(0, Vec::len),
+            "code action request completed"
         );
 
         Ok(result)
