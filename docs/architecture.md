@@ -11,6 +11,7 @@ The implemented architecture is built around:
 - full-text document sync
 - one lightweight text index per open IFC document
 - optional tree-sitter parse state for the active document
+- bounded background diagnostic processing
 - generated in-memory EXPRESS schema documentation
 
 The shipped LSP features are:
@@ -36,7 +37,7 @@ The runtime code revolves around three main concepts:
   In-memory lookup tables for EXPRESS entity and type documentation, keyed by normalized schema name.
 
 Feature modules in `src/features/` stay thin and operate on `&Document`.
-Diagnostics operate on `&Document` plus a selected `SchemaDoc`.
+Diagnostics operate on an immutable `DiagnosticSnapshot` plus a selected `SchemaDoc`.
 
 ## Data Flow
 
@@ -47,21 +48,22 @@ On open or full-text change:
 3. `Document::reload_parse_state` rebuilds the text index.
 4. If the file is within the configured AST size limit, the document is parsed with `tree-sitter-ifc` and entity instances are rebuilt from the syntax tree.
 5. If the file is above the AST size limit, the document is marked as `ast_skipped`.
-6. Diagnostics are collected only when the active document has an AST.
-7. Diagnostics are published to the LSP client.
+6. `Backend` creates a diagnostic snapshot containing only the AST-backed data used by diagnostics.
+7. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
+8. Diagnostics are collected off the async runtime and published only if the snapshot is still the newest generation for that URI.
 
 On hover, definition, or references requests:
 
 1. `Backend::ensure_document_loaded` reloads the requested document if its AST-backed state was previously unloaded.
 2. Reloading one document unloads AST-backed state from the other open documents.
 3. The feature handler reads the stored `Document`.
-4. If request-time reloading produced diagnostics, they are published after the request.
+4. If request-time reloading produced a diagnostic snapshot, it is submitted to the same background scheduler after the feature result is computed.
 
 On document-highlight, signature-help, or semantic-token range requests, the backend reads the
 stored document text and text index only. These requests do not reload tree-sitter parse state or
 publish diagnostics.
 
-There is still no incremental parsing, background indexing, or cross-document indexing.
+There is still no incremental parsing, background indexing, diagnostic caching, or cross-document indexing.
 
 ## Backend
 
@@ -71,6 +73,7 @@ There is still no incremental parsing, background indexing, or cross-document in
 - `schema_docs: Arc<RwLock<SchemaDocCollection>>`
 - `config: Arc<RwLock<ConfigState>>`
 - `ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>`
+- `diagnostic_scheduler: DiagnosticScheduler`
 
 The backend creates a fresh tree-sitter parser through `new_parser()` when AST state must be rebuilt. It does not keep one long-lived parser.
 
@@ -86,7 +89,9 @@ The server advertises:
 - `textDocument/inlayHint`
 - `textDocument/semanticTokens/range`
 
-Diagnostics are published with `textDocument/publishDiagnostics` on open, change, and request-time reloads.
+Diagnostics are published with `textDocument/publishDiagnostics` after background processing on
+open, change, and request-time reloads. The scheduler runs one diagnostic computation at a time,
+keeps only the newest pending snapshot per URI, and discards stale results by generation.
 
 ## Logging
 
@@ -154,6 +159,11 @@ It keeps:
 `Document::reload_parse_state(parser, ast_file_size_limit_bytes)` always rebuilds the text index first. It then parses the document only if `text.len()` is within the AST limit. Files above the limit keep text-index-backed features available and set `ast_skipped = true` so the server does not repeatedly attempt to parse them.
 
 The backend intentionally keeps AST-backed state for at most one active document at a time. Other open documents remain in memory as text plus the lightweight index.
+
+Background diagnostics may temporarily retain a reference-counted tree-sitter tree and cloned
+entity-instance data after the live document unloads its parse state. This retention is bounded to
+one running job plus the newest pending snapshot for each URI; document text and navigation indexes
+are not copied into diagnostic snapshots.
 
 ## AST Size Limit
 
@@ -259,7 +269,12 @@ Semantic tokens do not use tree-sitter or schema docs.
 
 ### Diagnostics
 
-`src/diagnostics/datatype.rs` validates parsed IFC entity instances against runtime schema documentation. Diagnostics currently require AST-backed `Document::instances`.
+`src/diagnostics/datatype.rs` validates snapshot entity instances against runtime schema
+documentation. Diagnostics currently require AST-backed instance data.
+
+`src/diagnostics/scheduler.rs` owns the bounded background queue. Repeated edits replace pending
+work for the same URI, while monotonically increasing generations prevent results from older edits
+or closed documents from being published.
 
 The provider supports:
 
@@ -301,7 +316,7 @@ Avoid these unless explicitly requested:
 
 - cross-file indexing
 - incremental parsing infrastructure
-- background worker systems
+- general-purpose background worker systems beyond the diagnostics scheduler
 - retaining ASTs for every open document
 - large abstraction layers or service registries
 - premature support for unimplemented LSP features

@@ -5,33 +5,34 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::{Document, EntityInstanceInfo, ParameterValue};
+use crate::diagnostics::DiagnosticSnapshot;
+use crate::document::{EntityInstanceInfo, ParameterValue};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
 
 pub fn collect_with_schema_name(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     schema_name: Option<&str>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for instance in &document.instances {
+    for instance in &snapshot.instances {
         let Some(entity) = schema.entity(&instance.entity_name) else {
             diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
             continue;
         };
 
-        validate_instance(document, schema, entity, instance, &mut diagnostics);
+        validate_instance(snapshot, schema, entity, instance, &mut diagnostics);
     }
 
     diagnostics
 }
 
 fn validate_instance(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
@@ -54,7 +55,7 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Some(message) = validate_value(document, schema, value, attribute) {
+        if let Some(message) = validate_value(snapshot, schema, value, attribute) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -85,7 +86,7 @@ fn unknown_entity_diagnostic(
 }
 
 fn validate_value(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     value: &ParameterValue,
     attribute: &EntityAttributeDoc,
@@ -105,33 +106,33 @@ fn validate_value(
                 Some("`*` is not supported for this attribute".to_string())
             }
         }
-        _ => validate_non_null_value(document, schema, value, &attribute.ty),
+        _ => validate_non_null_value(snapshot, schema, value, &attribute.ty),
     }
 }
 
 fn validate_non_null_value(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected: &TypeRef,
 ) -> Option<String> {
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
-        TypeRef::Aggregate(aggregate) => validate_aggregate(document, schema, value, aggregate),
+        TypeRef::Aggregate(aggregate) => validate_aggregate(snapshot, schema, value, aggregate),
         TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => None,
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
-                validate_entity_reference(document, schema, value, &named.name)
+                validate_entity_reference(snapshot, schema, value, &named.name)
             }
             NamedTypeKind::Type | NamedTypeKind::Unresolved => {
-                validate_named_type(document, schema, value, &named.name)
+                validate_named_type(snapshot, schema, value, &named.name)
             }
         },
     }
 }
 
 fn validate_named_type(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     value: &ParameterValue,
     type_name: &str,
@@ -158,10 +159,10 @@ fn validate_named_type(
                         type_name
                     ))
                 } else {
-                    validate_non_null_value(document, schema, &inner[0], &alias.target)
+                    validate_non_null_value(snapshot, schema, &inner[0], &alias.target)
                 }
             } else {
-                validate_non_null_value(document, schema, value, &alias.target)
+                validate_non_null_value(snapshot, schema, value, &alias.target)
             }
         }
         TypeDoc::Enumeration(enum_def) => {
@@ -190,12 +191,12 @@ fn validate_named_type(
                 validate_enum_value(value, &enum_def.items)
             }
         }
-        TypeDoc::Select(select) => validate_select(document, schema, value, select),
+        TypeDoc::Select(select) => validate_select(snapshot, schema, value, select),
     }
 }
 
 fn validate_select(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     value: &ParameterValue,
     select: &SelectTypeDef,
@@ -203,7 +204,7 @@ fn validate_select(
     if select
         .options
         .iter()
-        .any(|option| validate_non_null_value(document, schema, value, option).is_none())
+        .any(|option| validate_non_null_value(snapshot, schema, value, option).is_none())
     {
         None
     } else {
@@ -234,7 +235,7 @@ fn validate_enum_value(value: &ParameterValue, items: &[String]) -> Option<Strin
 }
 
 fn validate_aggregate(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     value: &ParameterValue,
     aggregate: &AggregateTypeRef,
@@ -269,7 +270,7 @@ fn validate_aggregate(
     }
 
     for item in items {
-        if let Some(message) = validate_non_null_value(document, schema, item, &aggregate.item) {
+        if let Some(message) = validate_non_null_value(snapshot, schema, item, &aggregate.item) {
             return Some(message);
         }
     }
@@ -278,7 +279,7 @@ fn validate_aggregate(
 }
 
 fn validate_entity_reference(
-    document: &Document,
+    snapshot: &DiagnosticSnapshot,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected_entity: &str,
@@ -291,7 +292,7 @@ fn validate_entity_reference(
         ));
     };
 
-    let Some(instance) = document.instance_by_id(*id) else {
+    let Some(instance) = snapshot.instance_by_id(*id) else {
         return Some(format!(
             "reference `#{}` does not resolve to a local entity",
             id
@@ -420,7 +421,8 @@ mod tests {
     #[test]
     fn datatype_validator_reports_mismatched_attribute_type() {
         let doc = parse_document("#1=IFCWALL(123,.MOVABLE.);");
-        let diagnostics = collect_with_schema_name(&doc, &test_schema(), None);
+        let snapshot = DiagnosticSnapshot::from_document(&doc);
+        let diagnostics = collect_with_schema_name(&snapshot, &test_schema(), None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
@@ -431,7 +433,8 @@ mod tests {
     #[test]
     fn datatype_validator_accepts_valid_values() {
         let doc = parse_document("#1=IFCWALL('gid',.MOVABLE.);");
-        let diagnostics = collect_with_schema_name(&doc, &test_schema(), None);
+        let snapshot = DiagnosticSnapshot::from_document(&doc);
+        let diagnostics = collect_with_schema_name(&snapshot, &test_schema(), None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -491,7 +494,8 @@ mod tests {
             "#,
         );
 
-        let diagnostics = collect_with_schema_name(&document, &schema, None);
+        let snapshot = DiagnosticSnapshot::from_document(&document);
+        let diagnostics = collect_with_schema_name(&snapshot, &schema, None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("does not resolve"));
@@ -528,7 +532,8 @@ mod tests {
         );
 
         let doc = parse_document("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
-        let diagnostics = collect_with_schema_name(&doc, &schema, None);
+        let snapshot = DiagnosticSnapshot::from_document(&doc);
+        let diagnostics = collect_with_schema_name(&snapshot, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -560,7 +565,8 @@ mod tests {
         let doc = parse_document(
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));\n#2=IFCPROPERTYSINGLEVALUE('Offset',$,IFCLENGTHMEASURE(2.6));",
         );
-        let diagnostics = collect_with_schema_name(&doc, &schema, None);
+        let snapshot = DiagnosticSnapshot::from_document(&doc);
+        let diagnostics = collect_with_schema_name(&snapshot, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }

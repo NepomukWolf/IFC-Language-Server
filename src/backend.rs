@@ -13,7 +13,8 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
-use crate::diagnostics;
+use crate::diagnostics::DiagnosticSnapshot;
+use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
     definition, document_highlight, document_symbols, hover, inlay_hints, references,
@@ -50,16 +51,19 @@ pub struct Backend {
     schema_docs: Arc<RwLock<SchemaDocCollection>>,
     config: Arc<RwLock<ConfigState>>,
     ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>,
+    diagnostic_scheduler: DiagnosticScheduler,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
+        let diagnostic_scheduler = DiagnosticScheduler::new(client.clone());
         Self {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             schema_docs: Arc::new(RwLock::new(SchemaDocCollection::new())),
             config: Arc::new(RwLock::new(ConfigState::default())),
             ast_skip_warning_shown: Arc::new(RwLock::new(HashSet::new())),
+            diagnostic_scheduler,
         }
     }
 
@@ -92,12 +96,12 @@ impl Backend {
         false
     }
 
-    #[instrument(skip(self, document), fields(schema_name = document.schema_name.as_deref().unwrap_or("<none>")))]
-    async fn check_schema_support(&self, document: &Document) {
+    #[instrument(skip(self), fields(schema_name = schema_name.unwrap_or("<none>")))]
+    async fn check_schema_support(&self, schema_name: Option<&str>) {
         let forced_schema_name = self.config.read().await.forced_schema_name.clone();
 
         if let Some(forced_schema_name) = forced_schema_name.as_deref()
-            && let Some(document_schema_name) = document.schema_name.as_deref()
+            && let Some(document_schema_name) = schema_name
         {
             let normalized_document_schema_name = normalize_name(document_schema_name);
             if normalized_document_schema_name != forced_schema_name {
@@ -114,7 +118,7 @@ impl Backend {
             }
         }
 
-        if self.selected_schema_name(document).await.is_none() {
+        if self.selected_schema_name(schema_name).await.is_none() {
             warn!("document schema is unknown or unsupported");
             self.client
                 .show_message(
@@ -125,42 +129,8 @@ impl Backend {
         }
     }
 
-    #[instrument(skip(self, document), fields(has_ast = document.has_ast(), schema_name = document.schema_name.as_deref().unwrap_or("<none>")))]
-    async fn collect_diagnostics(&self, document: &Document) -> Vec<Diagnostic> {
-        if !document.has_ast() {
-            debug!("skipping diagnostics because AST is not loaded");
-            return Vec::new();
-        }
-
-        let selected_schema_name = self.selected_schema_name(document).await;
-        if let Some(schema_name) = selected_schema_name.as_deref() {
-            let schema_docs = self.schema_docs.read().await;
-            let diagnostics = schema_docs
-                .get(schema_name)
-                .map(|schema| {
-                    diagnostics::collect_with_schema_name(document, schema, Some(schema_name))
-                })
-                .unwrap_or_default();
-            debug!(
-                diagnostic_count = diagnostics.len(),
-                "collected diagnostics"
-            );
-            diagnostics
-        } else {
-            debug!("skipping diagnostics because no schema was selected");
-            Vec::new()
-        }
-    }
-
-    #[instrument(skip(self, diagnostics), fields(uri = %uri, diagnostic_count = diagnostics.len()))]
-    async fn publish_document_diagnostics(&self, uri: &Url, diagnostics: Vec<Diagnostic>) {
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
-            .await;
-    }
-
     #[instrument(skip(self, text), fields(uri = %uri, text_len = text.len()))]
-    async fn load_text_as_active_document(&self, uri: &Url, text: String) -> Vec<Diagnostic> {
+    async fn load_text_as_active_document(&self, uri: &Url, text: String) -> DiagnosticSnapshot {
         let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
         if self
             .check_ast_support(uri, text.len(), ast_file_size_limit_bytes)
@@ -196,8 +166,11 @@ impl Backend {
             instance_count = document.instances.len(),
             "reloaded active document"
         );
-        self.check_schema_support(document).await;
-        self.collect_diagnostics(document).await
+        let snapshot = DiagnosticSnapshot::from_document(document);
+        drop(documents);
+
+        self.check_schema_support(snapshot.schema_name()).await;
+        snapshot
     }
 
     #[instrument(skip(self, documents), fields(uri = %uri))]
@@ -205,7 +178,7 @@ impl Backend {
         &self,
         documents: &mut HashMap<Url, Document>,
         uri: &Url,
-    ) -> Option<Option<Vec<Diagnostic>>> {
+    ) -> Option<Option<DiagnosticSnapshot>> {
         if documents.get(uri)?.is_parse_state_loaded() {
             return Some(None);
         }
@@ -223,7 +196,7 @@ impl Backend {
                 .reload_parse_state(&mut parser, self.ast_file_size_limit_bytes().await);
         }
 
-        let diagnostics = {
+        let snapshot = {
             let document = documents.get(uri)?;
             info!(
                 schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
@@ -234,25 +207,44 @@ impl Backend {
                 instance_count = document.instances.len(),
                 "reloaded document parse state on demand"
             );
-            self.collect_diagnostics(document).await
+            DiagnosticSnapshot::from_document(document)
         };
 
-        Some(Some(diagnostics))
+        Some(Some(snapshot))
     }
 
-    #[instrument(skip(self, diagnostics), fields(uri = %uri))]
-    async fn request_time_diagnostics(&self, diagnostics: Option<Vec<Diagnostic>>, uri: &Url) {
-        if let Some(diagnostics) = diagnostics {
-            self.publish_document_diagnostics(uri, diagnostics).await;
+    #[instrument(skip(self, ticket, snapshot))]
+    async fn schedule_diagnostics(&self, ticket: DiagnosticTicket, snapshot: DiagnosticSnapshot) {
+        let selected_schema_name = self.selected_schema_name(snapshot.schema_name()).await;
+        let schema = if let Some(schema_name) = selected_schema_name {
+            self.schema_docs
+                .read()
+                .await
+                .get_shared(&schema_name)
+                .map(|schema| (schema_name, schema))
+        } else {
+            None
+        };
+
+        self.diagnostic_scheduler
+            .schedule(ticket, snapshot, schema)
+            .await;
+    }
+
+    #[instrument(skip(self, snapshot), fields(uri = %uri))]
+    async fn request_time_diagnostics(&self, snapshot: Option<DiagnosticSnapshot>, uri: &Url) {
+        if let Some(snapshot) = snapshot {
+            let ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
+            self.schedule_diagnostics(ticket, snapshot).await;
         }
     }
 
-    #[instrument(skip(self, document), fields(schema_name = document.schema_name.as_deref().unwrap_or("<none>")))]
-    async fn selected_schema_name(&self, document: &Document) -> Option<String> {
+    #[instrument(skip(self), fields(schema_name = schema_name.unwrap_or("<none>")))]
+    async fn selected_schema_name(&self, schema_name: Option<&str>) -> Option<String> {
         let (forced_schema_name, additional_path) = {
             let config = self.config.read().await;
             let forced_schema_name = config.forced_schema_name.clone();
-            let additional_path = document.schema_name.as_ref().and_then(|schema_name| {
+            let additional_path = schema_name.and_then(|schema_name| {
                 config
                     .additional_schema_paths
                     .get(&normalize_name(schema_name))
@@ -265,7 +257,7 @@ impl Backend {
             return Some(schema_name);
         }
 
-        let schema_name = document.schema_name.as_ref()?;
+        let schema_name = schema_name?;
         let normalized = normalize_name(schema_name);
 
         {
@@ -443,8 +435,9 @@ impl LanguageServer for Backend {
 
         info!(text_len = text.len(), "document opened");
 
-        let diagnostics = self.load_text_as_active_document(&uri, text).await;
-        self.publish_document_diagnostics(&uri, diagnostics).await;
+        let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
+        let snapshot = self.load_text_as_active_document(&uri, text).await;
+        self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
     }
 
     #[instrument(skip(self, params), fields(uri = %params.text_document.uri))]
@@ -452,8 +445,9 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         if let Some(change) = params.content_changes.into_iter().next() {
             debug!(text_len = change.text.len(), "document changed");
-            let diagnostics = self.load_text_as_active_document(&uri, change.text).await;
-            self.publish_document_diagnostics(&uri, diagnostics).await;
+            let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
+            let snapshot = self.load_text_as_active_document(&uri, change.text).await;
+            self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
         }
     }
 
@@ -466,6 +460,7 @@ impl LanguageServer for Backend {
         drop(documents);
 
         self.ast_skip_warning_shown.write().await.remove(&uri);
+        self.diagnostic_scheduler.invalidate(&uri).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
         info!("document closed");
     }
@@ -477,8 +472,8 @@ impl LanguageServer for Backend {
         let forced_schema_name = self.config.read().await.forced_schema_name.clone();
 
         let mut documents = self.documents.write().await;
-        let diagnostics = match self.ensure_document_loaded(&mut documents, &uri).await {
-            Some(diagnostics) => diagnostics,
+        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(snapshot) => snapshot,
             None => return Ok(None),
         };
         let document = match documents.get(&uri) {
@@ -504,7 +499,8 @@ impl LanguageServer for Backend {
         drop(schema_docs);
         drop(documents);
 
-        self.request_time_diagnostics(diagnostics, &uri).await;
+        self.request_time_diagnostics(diagnostic_snapshot, &uri)
+            .await;
         debug!(has_result = result.is_some(), "hover request completed");
 
         Ok(result)
@@ -519,8 +515,8 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         let mut documents = self.documents.write().await;
-        let diagnostics = match self.ensure_document_loaded(&mut documents, &uri).await {
-            Some(diagnostics) => diagnostics,
+        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(snapshot) => snapshot,
             None => return Ok(None),
         };
         let document = match documents.get(&uri) {
@@ -531,7 +527,8 @@ impl LanguageServer for Backend {
         let result = definition::goto_definition(&uri, document, position);
         drop(documents);
 
-        self.request_time_diagnostics(diagnostics, &uri).await;
+        self.request_time_diagnostics(diagnostic_snapshot, &uri)
+            .await;
         if result.is_some() {
             debug!("go to definition resolved target");
         } else {
@@ -550,8 +547,8 @@ impl LanguageServer for Backend {
         let forced_schema_name = self.config.read().await.forced_schema_name.clone();
 
         let mut documents = self.documents.write().await;
-        let diagnostics = match self.ensure_document_loaded(&mut documents, &uri).await {
-            Some(diagnostics) => diagnostics,
+        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(snapshot) => snapshot,
             None => return Ok(None),
         };
         let document = match documents.get(&uri) {
@@ -572,7 +569,8 @@ impl LanguageServer for Backend {
         drop(schema_docs);
         drop(documents);
 
-        self.request_time_diagnostics(diagnostics, &uri).await;
+        self.request_time_diagnostics(diagnostic_snapshot, &uri)
+            .await;
         debug!(
             has_result = result.is_some(),
             "document symbols request completed"
@@ -587,8 +585,8 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
 
         let mut documents = self.documents.write().await;
-        let diagnostics = match self.ensure_document_loaded(&mut documents, &uri).await {
-            Some(diagnostics) => diagnostics,
+        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(snapshot) => snapshot,
             None => return Ok(None),
         };
         let document = match documents.get(&uri) {
@@ -599,7 +597,8 @@ impl LanguageServer for Backend {
         let result = references::find_references(&uri, document, position);
         drop(documents);
 
-        self.request_time_diagnostics(diagnostics, &uri).await;
+        self.request_time_diagnostics(diagnostic_snapshot, &uri)
+            .await;
         debug!(
             result_count = result.as_ref().map_or(0, Vec::len),
             "find references request completed"
