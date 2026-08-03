@@ -21,6 +21,7 @@ The shipped LSP features are:
 - document highlight
 - signature help
 - inlay hints
+- IFC boilerplate completions and code actions
 - range-based semantic tokens
 - schema-aware diagnostics
 
@@ -84,6 +85,8 @@ The server advertises:
 - `textDocument/documentHighlight`
 - `textDocument/signatureHelp`
 - `textDocument/inlayHint`
+- `textDocument/completion`
+- `textDocument/codeAction`
 - `textDocument/semanticTokens/range`
 
 Diagnostics are published with `textDocument/publishDiagnostics` on open, change, and request-time reloads.
@@ -247,6 +250,15 @@ not use tree-sitter AST state.
 
 `src/features/inlay_hints.rs` labels positional STEP arguments with schema attribute names using a
 range-scoped text scanner. It includes inherited attributes and does not use tree-sitter AST state.
+
+### IFC Boilerplate
+
+`src/features/scaffold_completions.rs` provides minimal IFC STEP boilerplate without tree-sitter AST
+state. It is surfaced as snippet-aware completions for `!ifc`, `!!ifc`, and `!!!ifc`, and as plain
+text code actions for empty or whitespace-only documents.
+
+Boilerplate generation targets the current default schema. Older schema versions are not generated
+directly.
 
 ### Semantic Tokens
 

@@ -13,7 +13,7 @@
 - Document highlight for local STEP ids such as `#123`
 - Signature help for IFC entity parameter lists
 - Document symbols for editor Outline, breadcrumbs, and go-to-symbol navigation
-- Scaffold completions for minimal IFC STEP boilerplate
+- IFC STEP boilerplate via `!ifc` / `!!ifc` / `!!!ifc` completions and empty-document code actions
 - Range-based semantic tokens for syntax highlighting
 - Schema-aware diagnostics for:
   - invalid local reference targets
@@ -35,7 +35,8 @@ Bundled entity documentation is currently included for:
 - Single-document navigation only
 - Full-document reparsing on open and change
 - Diagnostics currently focus on entity-instance argument validation, not full EXPRESS rule evaluation
-- No general completion, rename, code actions, or formatting support
+- No general completion, rename, or formatting support
+- Code actions are currently limited to IFC boilerplate insertion for empty documents
 - The LSP server provides range-based semantic tokens, but does not provide full-document semantic-token or TextMate grammar support
 
 ## Installation
