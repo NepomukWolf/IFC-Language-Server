@@ -150,7 +150,7 @@ impl Backend {
             .entry(uri.clone())
             .or_insert_with(|| Document::new_unloaded(String::new()));
         document.unload_parse_state();
-        document.text = text;
+        document.text = Arc::new(text);
 
         {
             let mut parser = new_parser();
@@ -163,7 +163,6 @@ impl Backend {
             ast_skipped = document.ast_skipped,
             definition_count = document.definitions.len(),
             reference_id_count = document.references.len(),
-            instance_count = document.instances.len(),
             "reloaded active document"
         );
         let snapshot = DiagnosticSnapshot::from_document(document);
@@ -202,7 +201,6 @@ impl Backend {
             ast_skipped = document.ast_skipped,
             definition_count = document.definitions.len(),
             reference_id_count = document.references.len(),
-            instance_count = document.instances.len(),
             "updated active document"
         );
         let text_len = document.text.len();
@@ -246,7 +244,6 @@ impl Backend {
                 ast_skipped = document.ast_skipped,
                 definition_count = document.definitions.len(),
                 reference_id_count = document.references.len(),
-                instance_count = document.instances.len(),
                 "reloaded document parse state on demand"
             );
             DiagnosticSnapshot::from_document(document)
@@ -560,11 +557,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let mut documents = self.documents.write().await;
-        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
-            Some(snapshot) => snapshot,
-            None => return Ok(None),
-        };
+        let documents = self.documents.read().await;
         let document = match documents.get(&uri) {
             Some(document) => document,
             None => return Ok(None),
@@ -572,9 +565,6 @@ impl LanguageServer for Backend {
 
         let result = definition::goto_definition(&uri, document, position);
         drop(documents);
-
-        self.request_time_diagnostics(diagnostic_snapshot, &uri)
-            .await;
         if result.is_some() {
             debug!("go to definition resolved target");
         } else {
@@ -607,13 +597,35 @@ impl LanguageServer for Backend {
                 .as_deref()
                 .map(crate::schema::normalize_name)
         });
-        let schema_docs = self.schema_docs.read().await;
-        let schema = schema_name
-            .as_deref()
-            .and_then(|schema_name| schema_docs.get(schema_name));
-        let result = document_symbols::document_symbols(document, schema);
-        drop(schema_docs);
+        let text = Arc::clone(&document.text);
+        let tree = document.tree.clone();
+        let ast_skipped = document.ast_skipped;
         drop(documents);
+
+        let schema = if let Some(schema_name) = schema_name.as_deref() {
+            self.schema_docs.read().await.get_shared(schema_name)
+        } else {
+            None
+        };
+        let Ok(permit) = self
+            .diagnostic_scheduler
+            .semantic_work()
+            .acquire_owned()
+            .await
+        else {
+            warn!("semantic work limiter closed");
+            return Ok(None);
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let instances = crate::document::build_entity_instances(tree.as_ref(), &text);
+            document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
+        })
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "document symbols task failed");
+            None
+        });
 
         self.request_time_diagnostics(diagnostic_snapshot, &uri)
             .await;
@@ -630,11 +642,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let mut documents = self.documents.write().await;
-        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
-            Some(snapshot) => snapshot,
-            None => return Ok(None),
-        };
+        let documents = self.documents.read().await;
         let document = match documents.get(&uri) {
             Some(document) => document,
             None => return Ok(None),
@@ -642,9 +650,6 @@ impl LanguageServer for Backend {
 
         let result = references::find_references(&uri, document, position);
         drop(documents);
-
-        self.request_time_diagnostics(diagnostic_snapshot, &uri)
-            .await;
         debug!(
             result_count = result.as_ref().map_or(0, Vec::len),
             "find references request completed"

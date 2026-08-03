@@ -5,34 +5,33 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::diagnostics::DiagnosticSnapshot;
-use crate::document::{EntityInstanceInfo, ParameterValue};
+use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
 
 pub fn collect_with_schema_name(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     schema_name: Option<&str>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for instance in &snapshot.instances {
+    for instance in &instances.instances {
         let Some(entity) = schema.entity(&instance.entity_name) else {
             diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
             continue;
         };
 
-        validate_instance(snapshot, schema, entity, instance, &mut diagnostics);
+        validate_instance(instances, schema, entity, instance, &mut diagnostics);
     }
 
     diagnostics
 }
 
 fn validate_instance(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
@@ -55,7 +54,7 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Some(message) = validate_value(snapshot, schema, value, attribute) {
+        if let Some(message) = validate_value(instances, schema, value, attribute) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -86,7 +85,7 @@ fn unknown_entity_diagnostic(
 }
 
 fn validate_value(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     value: &ParameterValue,
     attribute: &EntityAttributeDoc,
@@ -106,33 +105,33 @@ fn validate_value(
                 Some("`*` is not supported for this attribute".to_string())
             }
         }
-        _ => validate_non_null_value(snapshot, schema, value, &attribute.ty),
+        _ => validate_non_null_value(instances, schema, value, &attribute.ty),
     }
 }
 
 fn validate_non_null_value(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected: &TypeRef,
 ) -> Option<String> {
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
-        TypeRef::Aggregate(aggregate) => validate_aggregate(snapshot, schema, value, aggregate),
+        TypeRef::Aggregate(aggregate) => validate_aggregate(instances, schema, value, aggregate),
         TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => None,
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
-                validate_entity_reference(snapshot, schema, value, &named.name)
+                validate_entity_reference(instances, schema, value, &named.name)
             }
             NamedTypeKind::Type | NamedTypeKind::Unresolved => {
-                validate_named_type(snapshot, schema, value, &named.name)
+                validate_named_type(instances, schema, value, &named.name)
             }
         },
     }
 }
 
 fn validate_named_type(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     value: &ParameterValue,
     type_name: &str,
@@ -159,10 +158,10 @@ fn validate_named_type(
                         type_name
                     ))
                 } else {
-                    validate_non_null_value(snapshot, schema, &inner[0], &alias.target)
+                    validate_non_null_value(instances, schema, &inner[0], &alias.target)
                 }
             } else {
-                validate_non_null_value(snapshot, schema, value, &alias.target)
+                validate_non_null_value(instances, schema, value, &alias.target)
             }
         }
         TypeDoc::Enumeration(enum_def) => {
@@ -191,12 +190,12 @@ fn validate_named_type(
                 validate_enum_value(value, &enum_def.items)
             }
         }
-        TypeDoc::Select(select) => validate_select(snapshot, schema, value, select),
+        TypeDoc::Select(select) => validate_select(instances, schema, value, select),
     }
 }
 
 fn validate_select(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     value: &ParameterValue,
     select: &SelectTypeDef,
@@ -204,7 +203,7 @@ fn validate_select(
     if select
         .options
         .iter()
-        .any(|option| validate_non_null_value(snapshot, schema, value, option).is_none())
+        .any(|option| validate_non_null_value(instances, schema, value, option).is_none())
     {
         None
     } else {
@@ -235,7 +234,7 @@ fn validate_enum_value(value: &ParameterValue, items: &[String]) -> Option<Strin
 }
 
 fn validate_aggregate(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     value: &ParameterValue,
     aggregate: &AggregateTypeRef,
@@ -270,7 +269,7 @@ fn validate_aggregate(
     }
 
     for item in items {
-        if let Some(message) = validate_non_null_value(snapshot, schema, item, &aggregate.item) {
+        if let Some(message) = validate_non_null_value(instances, schema, item, &aggregate.item) {
             return Some(message);
         }
     }
@@ -279,7 +278,7 @@ fn validate_aggregate(
 }
 
 fn validate_entity_reference(
-    snapshot: &DiagnosticSnapshot,
+    instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected_entity: &str,
@@ -292,7 +291,7 @@ fn validate_entity_reference(
         ));
     };
 
-    let Some(instance) = snapshot.instance_by_id(*id) else {
+    let Some(instance) = instances.instance_by_id(*id) else {
         return Some(format!(
             "reference `#{}` does not resolve to a local entity",
             id
@@ -373,8 +372,6 @@ impl AggregateKindDisplay for AggregateKind {
 //*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use tower_lsp::lsp_types::{Position, Range};
     use tree_sitter::Parser;
 
@@ -389,6 +386,10 @@ mod tests {
             .set_language(&tree_sitter_ifc::LANGUAGE.into())
             .expect("Error loading IFC parser");
         Document::parse(&mut parser, text.to_string())
+    }
+
+    fn instances(document: &Document) -> EntityInstanceCollection {
+        crate::document::build_entity_instances(document.tree.as_ref(), &document.text)
     }
 
     /// Helper function to load a schema from a fixture source string.
@@ -421,8 +422,8 @@ mod tests {
     #[test]
     fn datatype_validator_reports_mismatched_attribute_type() {
         let doc = parse_document("#1=IFCWALL(123,.MOVABLE.);");
-        let snapshot = DiagnosticSnapshot::from_document(&doc);
-        let diagnostics = collect_with_schema_name(&snapshot, &test_schema(), None);
+        let instances = instances(&doc);
+        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
@@ -433,8 +434,8 @@ mod tests {
     #[test]
     fn datatype_validator_accepts_valid_values() {
         let doc = parse_document("#1=IFCWALL('gid',.MOVABLE.);");
-        let snapshot = DiagnosticSnapshot::from_document(&doc);
-        let diagnostics = collect_with_schema_name(&snapshot, &test_schema(), None);
+        let instances = instances(&doc);
+        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -442,8 +443,7 @@ mod tests {
     /// Test that the datatype validator reports unresolved references.
     #[test]
     fn datatype_validator_reports_unresolved_reference() {
-        let mut document = Document::new_unloaded("#1=IFCWALL('gid',.MOVABLE.);".to_string());
-        document.instances = vec![crate::document::EntityInstanceInfo {
+        let instances = EntityInstanceCollection::new(vec![crate::document::EntityInstanceInfo {
             id: Some(1),
             id_range: Some(Range {
                 start: Position::new(0, 0),
@@ -477,8 +477,7 @@ mod tests {
                     },
                 },
             ],
-        }];
-        document.instance_indexes_by_id = HashMap::from([(1, 0)]);
+        }]);
 
         let schema = schema_from(
             r#"
@@ -494,8 +493,7 @@ mod tests {
             "#,
         );
 
-        let snapshot = DiagnosticSnapshot::from_document(&document);
-        let diagnostics = collect_with_schema_name(&snapshot, &schema, None);
+        let diagnostics = collect_with_schema_name(&instances, &schema, None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("does not resolve"));
@@ -532,8 +530,8 @@ mod tests {
         );
 
         let doc = parse_document("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
-        let snapshot = DiagnosticSnapshot::from_document(&doc);
-        let diagnostics = collect_with_schema_name(&snapshot, &schema, None);
+        let instances = instances(&doc);
+        let diagnostics = collect_with_schema_name(&instances, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -565,8 +563,8 @@ mod tests {
         let doc = parse_document(
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));\n#2=IFCPROPERTYSINGLEVALUE('Offset',$,IFCLENGTHMEASURE(2.6));",
         );
-        let snapshot = DiagnosticSnapshot::from_document(&doc);
-        let diagnostics = collect_with_schema_name(&snapshot, &schema, None);
+        let instances = instances(&doc);
+        let diagnostics = collect_with_schema_name(&instances, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }

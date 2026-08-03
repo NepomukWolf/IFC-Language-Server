@@ -213,7 +213,7 @@ fn enum_value_at_position<'a>(
 ) -> Option<(Range, &'a EntityAttributeDoc, &'a EnumerationTypeDef)> {
     let node = document.node_at_position(position)?;
     let context = ast::parameter_context(node, &document.text)?;
-    let instance = document.instance_by_id(context.instance_id)?;
+    let instance = document.entity_instance_by_id(context.instance_id)?;
     let parameter = instance.parameters.get(context.parameter_index)?;
     let attribute = schema
         .entity(&context.entity_name)?
@@ -444,8 +444,9 @@ fn derived_value_hover(document: &Document, context: &ast::ParameterContext) -> 
 }
 
 fn ifc_si_unit_dimensions_hover(document: &Document, instance_id: u32) -> String {
-    let dimensions = document
-        .instance_by_id(instance_id)
+    let instance = document.entity_instance_by_id(instance_id);
+    let dimensions = instance
+        .as_ref()
         .and_then(|instance| instance.parameters.get(3))
         .and_then(|value| match value {
             ParameterValue::Enumeration { value, .. } => ifc_dimensions_for_si_unit(value),
@@ -482,15 +483,19 @@ fn subcontext_inherited_attribute_hover(
     };
     let unresolved = || format!("{attribute_name}: derived value");
 
-    let Some(parent_value) = document
-        .instance_by_id(instance_id)
-        .and_then(|instance| instance.parameters.get(6))
-        .and_then(|value| match value {
-            ParameterValue::Reference { id, .. } => document.instance_by_id(*id),
-            _ => None,
-        })
-        .and_then(|parent| parent.parameters.get(parameter_index))
-    else {
+    let Some(instance) = document.entity_instance_by_id(instance_id) else {
+        return unresolved();
+    };
+    let Some(parent_id) = instance.parameters.get(6).and_then(|value| match value {
+        ParameterValue::Reference { id, .. } => Some(*id),
+        _ => None,
+    }) else {
+        return unresolved();
+    };
+    let Some(parent) = document.entity_instance_by_id(parent_id) else {
+        return unresolved();
+    };
+    let Some(parent_value) = parent.parameters.get(parameter_index) else {
         return unresolved();
     };
 
