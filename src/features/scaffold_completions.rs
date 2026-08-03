@@ -27,22 +27,21 @@ enum ScaffoldLevel {
     Spatial,
 }
 
+const SCAFFOLD_LEVELS: [ScaffoldLevel; 3] = [
+    ScaffoldLevel::Metadata,
+    ScaffoldLevel::Project,
+    ScaffoldLevel::Spatial,
+];
+
 struct ScaffoldCompletionRequest {
     text: String,
     range: Range,
-}
-
-#[derive(Clone, Copy)]
-struct ScaffoldCompletionCandidate {
-    trigger: &'static str,
-    level: ScaffoldLevel,
 }
 
 struct RenderContext {
     file_name: String,
     snippet: bool,
     timestamp: OffsetDateTime,
-    guid_seed: Option<u128>,
 }
 
 impl RenderContext {
@@ -51,7 +50,6 @@ impl RenderContext {
             file_name: step_string(&file_name_from_uri(uri)),
             snippet,
             timestamp: OffsetDateTime::now_utc(),
-            guid_seed: None,
         }
     }
 
@@ -62,7 +60,6 @@ impl RenderContext {
             snippet,
             timestamp: OffsetDateTime::from_unix_timestamp(1_731_578_976)
                 .expect("test timestamp should be valid"),
-            guid_seed: Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
         }
     }
 
@@ -79,12 +76,6 @@ impl RenderContext {
     }
 
     fn next_guid(&mut self) -> String {
-        if let Some(seed) = self.guid_seed.as_mut() {
-            let value = *seed;
-            *seed = seed.wrapping_add(1);
-            return compress_uuid(value);
-        }
-
         compress_uuid(Uuid::new_v4().as_u128())
     }
 }
@@ -99,16 +90,16 @@ pub fn completions(
     let items = completion_candidates(&request.text)
         .into_iter()
         .enumerate()
-        .map(|(index, candidate)| {
+        .map(|(index, level)| {
             let mut context = RenderContext::from_uri(uri, snippet_supported);
-            let new_text = render_scaffold(candidate.level, &mut context);
+            let new_text = render_scaffold(level, &mut context);
             let mut item = CompletionItem::new_simple(
-                candidate.level.detail().to_string(),
+                level.detail().to_string(),
                 "Insert IFC STEP boilerplate".to_string(),
             );
 
             item.kind = Some(CompletionItemKind::SNIPPET);
-            item.filter_text = Some(candidate.trigger.to_string());
+            item.filter_text = Some(level.trigger().to_string());
             item.sort_text = Some(format!("{index:03}_ifc_scaffold"));
             item.insert_text_format = Some(if snippet_supported {
                 InsertTextFormat::SNIPPET
@@ -136,28 +127,21 @@ pub fn code_actions(
     }
 
     let replace_document_range = document.range_for_offsets(0, document.text.len())?;
-    let actions = [
-        (ScaffoldLevel::Metadata, "Insert IFC metadata scaffold"),
-        (ScaffoldLevel::Project, "Insert IFC project scaffold"),
-        (ScaffoldLevel::Spatial, "Insert IFC spatial scaffold"),
-    ]
-    .into_iter()
-    .map(|(level, title)| {
+    let actions = SCAFFOLD_LEVELS.into_iter().map(|level| {
         let mut context = RenderContext::from_uri(uri, false);
         let new_text = render_scaffold(level, &mut context);
         CodeActionOrCommand::CodeAction(CodeAction {
-            title: title.to_string(),
+            title: format!("Insert {}", level.detail()),
             kind: Some(CodeActionKind::SOURCE),
-            edit: Some(workspace_edit(
+            edit: Some(WorkspaceEdit::new(HashMap::from([(
                 uri.clone(),
-                TextEdit::new(replace_document_range, new_text),
-            )),
+                vec![TextEdit::new(replace_document_range, new_text)],
+            )]))),
             ..CodeAction::default()
         })
-    })
-    .collect();
+    });
 
-    Some(actions)
+    Some(actions.collect())
 }
 
 fn code_action_kind_requested(requested_kinds: Option<&[CodeActionKind]>) -> bool {
@@ -167,14 +151,6 @@ fn code_action_kind_requested(requested_kinds: Option<&[CodeActionKind]>) -> boo
             requested.is_empty() || CodeActionKind::SOURCE.as_str().starts_with(requested)
         })
     })
-}
-
-fn workspace_edit(uri: Url, edit: TextEdit) -> WorkspaceEdit {
-    WorkspaceEdit {
-        changes: Some(HashMap::from([(uri, vec![edit])])),
-        document_changes: None,
-        change_annotations: None,
-    }
 }
 
 fn completion_request_at_position(
@@ -202,32 +178,15 @@ fn completion_request_at_position(
 }
 
 fn is_abbreviation_character(character: char) -> bool {
-    character == '!' || character == ':' || character.is_ascii_alphanumeric()
+    character == '!' || character.is_ascii_alphanumeric()
 }
 
-fn completion_candidates(token: &str) -> Vec<ScaffoldCompletionCandidate> {
-    all_completion_candidates()
+fn completion_candidates(token: &str) -> Vec<ScaffoldLevel> {
+    SCAFFOLD_LEVELS
         .iter()
         .copied()
-        .filter(|candidate| starts_with_ignore_ascii_case(candidate.trigger, token))
+        .filter(|level| starts_with_ignore_ascii_case(level.trigger(), token))
         .collect()
-}
-
-fn all_completion_candidates() -> &'static [ScaffoldCompletionCandidate] {
-    &[
-        ScaffoldCompletionCandidate {
-            trigger: "!ifc",
-            level: ScaffoldLevel::Metadata,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!ifc",
-            level: ScaffoldLevel::Project,
-        },
-        ScaffoldCompletionCandidate {
-            trigger: "!!!ifc",
-            level: ScaffoldLevel::Spatial,
-        },
-    ]
 }
 
 fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
@@ -237,6 +196,14 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
 }
 
 impl ScaffoldLevel {
+    fn trigger(self) -> &'static str {
+        match self {
+            Self::Metadata => "!ifc",
+            Self::Project => "!!ifc",
+            Self::Spatial => "!!!ifc",
+        }
+    }
+
     fn detail(self) -> &'static str {
         match self {
             Self::Metadata => "IFC metadata scaffold",

@@ -422,14 +422,12 @@ impl LanguageServer for Backend {
                 }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
-                    trigger_characters: Some(vec!["!".to_string(), ":".to_string()]),
+                    trigger_characters: Some(vec!["!".to_string()]),
                     ..CompletionOptions::default()
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![CodeActionKind::SOURCE]),
-                        resolve_provider: Some(false),
                         ..CodeActionOptions::default()
                     },
                 )),
