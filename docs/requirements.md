@@ -91,6 +91,18 @@ The language server should label positional STEP entity arguments with schema at
 Hints should be range-scoped, include inherited attributes, and remain available without tree-sitter
 AST state.
 
+### IFC Boilerplate
+
+The language server should provide minimal IFC STEP boilerplate for new documents.
+
+Boilerplate should be available through:
+
+- completions for `!ifc`, `!!ifc`, and `!!!ifc`
+- code actions on empty or whitespace-only documents
+
+Generated boilerplate should target the current default schema. Direct generation for older schema
+versions is out of scope.
+
 ### Semantic Tokens
 
 The language server should provide range-based semantic tokens for IFC STEP syntax highlighting.

@@ -8,5 +8,6 @@ pub mod document_symbols;
 pub mod hover;
 pub mod inlay_hints;
 pub mod references;
+pub mod scaffold_completions;
 pub mod semantic_tokens;
 pub mod signature_help;

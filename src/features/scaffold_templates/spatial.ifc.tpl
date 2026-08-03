@@ -1,0 +1,36 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('{{file_name}}','{{timestamp_iso}}',('{{author}}'),('{{organization}}'),'{{originating_system}}','{{preprocessor_version}}','');
+FILE_SCHEMA(('{{schema_name}}'));
+ENDSEC;
+
+DATA;
+#1=IFCPROJECT('{{project_guid}}',#8,'{{project_name}}',$,$,$,$,(#18),#22);
+#2=IFCSITE('{{site_guid}}',#8,'{{site_name}}',$,$,#23,$,$,.ELEMENT.,$,$,$,$,$);
+#3=IFCBUILDING('{{building_guid}}',#8,'{{building_name}}',$,$,#24,$,$,.ELEMENT.,$,$,$);
+#4=IFCBUILDINGSTOREY('{{storey_guid}}',#8,'{{storey_name}}',$,$,#25,$,$,.ELEMENT.,$);
+#5=IFCRELAGGREGATES('{{rel_project_site_guid}}',#8,'Project aggregation',$,#1,(#2));
+#6=IFCRELAGGREGATES('{{rel_site_building_guid}}',#8,'Site aggregation',$,#2,(#3));
+#7=IFCRELAGGREGATES('{{rel_building_storey_guid}}',#8,'Building aggregation',$,#3,(#4));
+#8=IFCOWNERHISTORY(#9,#12,$,.ADDED.,{{timestamp_unix}},#9,#12,{{timestamp_unix}});
+#9=IFCPERSONANDORGANIZATION(#10,#11,$);
+#10=IFCPERSON($,'{{author}}',$,$,$,$,$,$);
+#11=IFCORGANIZATION($,'{{organization}}',$,$,$);
+#12=IFCAPPLICATION(#13,'{{application_version}}','ifc-language-server','ifc-language-server');
+#13=IFCORGANIZATION($,'ifc-language-server',$,$,$);
+#14=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCDIRECTION((0.,0.,1.));
+#16=IFCDIRECTION((1.,0.,0.));
+#17=IFCAXIS2PLACEMENT3D(#14,#15,#16);
+#18=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#17,$);
+#19=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#20=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#21=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);
+#22=IFCUNITASSIGNMENT((#19,#20,#21));
+#23=IFCLOCALPLACEMENT($,#17);
+#24=IFCLOCALPLACEMENT(#23,#17);
+#25=IFCLOCALPLACEMENT(#24,#17);
+{{final_tabstop}}
+ENDSEC;
+END-ISO-10303-21;
