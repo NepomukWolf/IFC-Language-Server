@@ -2,6 +2,7 @@
 //! Each module operates on an already-parsed `Document` and returns plain LSP types.
 //! This keeps protocol wiring in `backend.rs` and syntax/schema behavior close to each feature.
 
+pub mod code_lens;
 pub mod definition;
 pub mod document_highlight;
 pub mod document_symbols;
