@@ -8,7 +8,7 @@ This project stays small and focused.
 
 The implemented architecture is built around:
 
-- full-text document sync
+- incremental document sync
 - one lightweight text index per open IFC document
 - optional tree-sitter parse state for the active document
 - bounded background diagnostic processing
@@ -41,16 +41,17 @@ Diagnostics operate on an immutable `DiagnosticSnapshot` plus a selected `Schema
 
 ## Data Flow
 
-On open or full-text change:
+On open or document change:
 
 1. `Backend` unloads AST-backed parse state from other open documents.
-2. The active document stores the new full text.
-3. `Document::reload_parse_state` rebuilds the text index.
-4. If the file is within the configured AST size limit, the document is parsed with `tree-sitter-ifc` and entity instances are rebuilt from the syntax tree.
-5. If the file is above the AST size limit, the document is marked as `ast_skipped`.
-6. `Backend` creates a diagnostic snapshot containing only the AST-backed data used by diagnostics.
-7. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
-8. Diagnostics are collected off the async runtime and published only if the snapshot is still the newest generation for that URI.
+2. On open, the active document stores the full text and receives a full tree-sitter parse.
+3. On change, the active document applies every LSP content change in order. Ranged changes edit both the source text and the existing tree-sitter tree before one incremental reparse; full-text changes fall back to a full parse.
+4. The lightweight text index is rebuilt from the final document text.
+5. If the file is within the configured AST size limit, entity instances are rebuilt from the resulting syntax tree.
+6. If the file is above the AST size limit, the document is marked as `ast_skipped`.
+7. `Backend` creates a diagnostic snapshot containing only the AST-backed data used by diagnostics.
+8. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
+9. Diagnostics are collected off the async runtime and published only if the snapshot is still the newest generation for that URI.
 
 On hover, definition, or references requests:
 
@@ -63,7 +64,8 @@ On document-highlight, signature-help, or semantic-token range requests, the bac
 stored document text and text index only. These requests do not reload tree-sitter parse state or
 publish diagnostics.
 
-There is still no incremental parsing, background indexing, diagnostic caching, or cross-document indexing.
+There is still no incremental text indexing, incremental entity-instance rebuilding, background
+indexing, diagnostic caching, or cross-document indexing.
 
 ## Backend
 
@@ -80,7 +82,7 @@ The backend creates a fresh tree-sitter parser through `new_parser()` when AST s
 The server advertises:
 
 - `textDocument/hover`
-- full text document sync
+- incremental text document sync
 - `textDocument/definition`
 - `textDocument/documentSymbol`
 - `textDocument/references`
@@ -156,7 +158,7 @@ It keeps:
 - `definitions`
 - `references`
 
-`Document::reload_parse_state(parser, ast_file_size_limit_bytes)` always rebuilds the text index first. It then parses the document only if `text.len()` is within the AST limit. Files above the limit keep text-index-backed features available and set `ast_skipped = true` so the server does not repeatedly attempt to parse them.
+`Document::reload_parse_state(parser, ast_file_size_limit_bytes)` always rebuilds the text index first and performs a full parse when AST state must be loaded from scratch. `Document::apply_content_changes` converts LSP UTF-16 ranges to byte offsets, applies matching tree-sitter `InputEdit` values, and reparses with the edited previous tree. It rebuilds the full text index and entity-instance data after the change batch. Files above the limit keep text-index-backed features available and set `ast_skipped = true` so the server does not repeatedly attempt to parse them.
 
 The backend intentionally keeps AST-backed state for at most one active document at a time. Other open documents remain in memory as text plus the lightweight index.
 

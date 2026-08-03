@@ -173,6 +173,48 @@ impl Backend {
         snapshot
     }
 
+    #[instrument(skip(self, changes), fields(uri = %uri, change_count = changes.len()))]
+    async fn apply_changes_to_active_document(
+        &self,
+        uri: &Url,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> Option<DiagnosticSnapshot> {
+        let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
+        let mut documents = self.documents.write().await;
+        for (document_uri, document) in documents.iter_mut() {
+            if document_uri != uri {
+                document.unload_parse_state();
+            }
+        }
+
+        let document = documents.get_mut(uri)?;
+        let mut parser = new_parser();
+        if let Err(error) =
+            document.apply_content_changes(&mut parser, &changes, ast_file_size_limit_bytes)
+        {
+            warn!(?error, "received invalid incremental document change");
+        }
+
+        info!(
+            text_len = document.text.len(),
+            schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
+            has_ast = document.has_ast(),
+            ast_skipped = document.ast_skipped,
+            definition_count = document.definitions.len(),
+            reference_id_count = document.references.len(),
+            instance_count = document.instances.len(),
+            "updated active document"
+        );
+        let text_len = document.text.len();
+        let snapshot = DiagnosticSnapshot::from_document(document);
+        drop(documents);
+
+        self.check_ast_support(uri, text_len, ast_file_size_limit_bytes)
+            .await;
+        self.check_schema_support(snapshot.schema_name()).await;
+        Some(snapshot)
+    }
+
     #[instrument(skip(self, documents), fields(uri = %uri))]
     async fn ensure_document_loaded(
         &self,
@@ -386,7 +428,7 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -443,11 +485,15 @@ impl LanguageServer for Backend {
     #[instrument(skip(self, params), fields(uri = %params.text_document.uri))]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        if let Some(change) = params.content_changes.into_iter().next() {
-            debug!(text_len = change.text.len(), "document changed");
+        let changes = params.content_changes;
+        if !changes.is_empty() {
+            debug!(change_count = changes.len(), "document changed");
             let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
-            let snapshot = self.load_text_as_active_document(&uri, change.text).await;
-            self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
+            if let Some(snapshot) = self.apply_changes_to_active_document(&uri, changes).await {
+                self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
+            } else {
+                warn!("received document change for an unopened document");
+            }
         }
     }
 
