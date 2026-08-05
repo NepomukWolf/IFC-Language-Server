@@ -1,4 +1,5 @@
 use super::*;
+use crate::document::{Document, build_entity_instances};
 use crate::schema::{EntityAttributeDoc, EntityDoc, TypeRef};
 use std::collections::HashMap;
 use tree_sitter::Parser;
@@ -125,11 +126,16 @@ fn structure(symbols: &[DocumentSymbol]) -> Vec<String> {
     out
 }
 fn nested_symbols(doc: &Document) -> Vec<DocumentSymbol> {
-    let DocumentSymbolResponse::Nested(symbols) = document_symbols(doc, Some(&schema())).unwrap()
-    else {
+    let schema = schema();
+    let DocumentSymbolResponse::Nested(symbols) = symbols(doc, Some(&schema)).unwrap() else {
         panic!("expected nested document symbols")
     };
     symbols
+}
+
+fn symbols(doc: &Document, schema: Option<&SchemaDoc>) -> Option<DocumentSymbolResponse> {
+    let instances = build_entity_instances(doc.tree.as_ref(), &doc.text);
+    document_symbols(&doc.text, &instances, doc.ast_skipped, schema)
 }
 
 #[test]
@@ -137,8 +143,7 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#3=IFCBUILDING('g',$,'B',$,$,$,$,$,$);\n#4=IFCBUILDINGSTOREY('g',$,'L',$,$,$,$,$,$);\n#5=IFCSPACE('g',$,'R',$,$,$,$,$,$);\n#6=IFCELEMENTASSEMBLY('g',$,'A',$,$,$,$,$,$);\n#7=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELAGGREGATES('g',$,$,$,#2,(#3));\n#12=IFCRELAGGREGATES('g',$,$,$,#3,(#4));\n#13=IFCRELAGGREGATES('g',$,$,$,#4,(#5));\n#14=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#6),#5);\n#15=IFCRELNESTS('g',$,$,$,#6,(#7));\nENDSEC;",
     );
-    let DocumentSymbolResponse::Nested(out) = document_symbols(&doc, Some(&schema())).unwrap()
-    else {
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, Some(&schema())).unwrap() else {
         panic!()
     };
     let all = names(&out[0]);
@@ -149,7 +154,9 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
         out[0].range,
         lsp_range(
             &doc.text.lines().collect::<Vec<_>>(),
-            doc.instances[0].entity_range
+            doc.entity_instance_by_id(1)
+                .expect("project instance should exist")
+                .entity_range
         )
     );
 }
@@ -158,8 +165,7 @@ fn handles_duplicates_cycles_missing_refs_and_multiple_roots() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'A',$,$,$,$,$,$);\n#2=IFCPROJECT('g',$,'B',$,$,$,$,$,$);\n#3=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#4=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#3,#99,#3));\n#11=IFCRELAGGREGATES('g',$,$,$,#3,(#1));\nENDSEC;",
     );
-    let DocumentSymbolResponse::Nested(out) = document_symbols(&doc, Some(&schema())).unwrap()
-    else {
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, Some(&schema())).unwrap() else {
         panic!()
     };
     assert_eq!(out.iter().filter(|s| s.name.starts_with("IFC")).count(), 2);
@@ -174,8 +180,7 @@ fn emits_all_products_and_preserves_utf16_ranges() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'😀',$,$,$,$,$,$);\n#2=IFCSPACE('g',$,'S',$,$,$,$,$,$);\n#3=IFCWALL('g',$,'😀',$,$,$,$,$,$);\n#4=IFCWALL('g',$,'B',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#3,#4),#2);\nENDSEC;",
     );
-    let DocumentSymbolResponse::Nested(out) = document_symbols(&doc, Some(&schema())).unwrap()
-    else {
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, Some(&schema())).unwrap() else {
         panic!()
     };
     let all = names(&out[0]);
@@ -195,7 +200,7 @@ fn emits_all_products_and_preserves_utf16_ranges() {
 fn explains_ast_skip() {
     let mut doc = Document::new_unloaded("x".into());
     doc.ast_skipped = true;
-    let DocumentSymbolResponse::Nested(out) = document_symbols(&doc, None).unwrap() else {
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, None).unwrap() else {
         panic!()
     };
     assert!(out[0].name.contains("AST was skipped"));
@@ -210,7 +215,7 @@ fn schema_less_outline_keeps_core_backbone_and_excludes_unknown_endpoints() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#3=IFCTASK('g',$,'Parent',$,$,$,$,$,$);\n#4=IFCTASK('g',$,'Child',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELNESTS('g',$,$,$,#3,(#4));\nENDSEC;",
     );
-    let DocumentSymbolResponse::Nested(out) = document_symbols(&doc, None).unwrap() else {
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, None).unwrap() else {
         panic!()
     };
     assert_eq!(out.len(), 1);
@@ -222,8 +227,7 @@ fn product_whole_part_precedes_spatial_containment() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCSPACE('g',$,'S',$,$,$,$,$,$);\n#3=IFCELEMENTASSEMBLY('g',$,'A',$,$,$,$,$,$);\n#4=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#3,#4),#2);\n#12=IFCRELAGGREGATES('g',$,$,$,#3,(#4));\nENDSEC;",
     );
-    let DocumentSymbolResponse::Nested(out) = document_symbols(&doc, Some(&schema())).unwrap()
-    else {
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, Some(&schema())).unwrap() else {
         panic!()
     };
     let space = &out[0].children.as_ref().unwrap()[0];
@@ -408,7 +412,7 @@ fn schema_less_contained_core_site_is_contextually_a_product() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'Project',$,$,$,$,$,$);\n#2=IFCBUILDINGSTOREY('g',$,'Storey',$,$,$,$,$,$);\n#3=IFCSITE('g',$,'Bench',$,$,$,$,$,$);\n#4=IFCVENDORUNKNOWN($);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#11=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#3,#4),#2);\nENDSEC;",
     );
-    let DocumentSymbolResponse::Nested(symbols) = document_symbols(&doc, None).unwrap() else {
+    let DocumentSymbolResponse::Nested(symbols) = symbols(&doc, None).unwrap() else {
         panic!()
     };
     assert_eq!(

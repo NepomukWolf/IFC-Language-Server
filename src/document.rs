@@ -3,25 +3,35 @@
 //! state for schema-aware diagnostics and derived-value hover.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use tower_lsp::lsp_types::{Position, Range};
-use tree_sitter::{Node, Parser, Point, Tree, TreeCursor};
+use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree, TreeCursor};
 
 use crate::document_index::{TextIndex, scan_text};
 
 pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyChangeError {
+    InvalidRange(Range),
+}
+
 #[derive(Debug)]
 pub struct Document {
-    pub text: String,
+    pub text: Arc<String>,
     pub tree: Option<Tree>,
     pub ast_skipped: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
     pub references: HashMap<u32, Vec<usize>>,
+}
+
+#[derive(Debug)]
+pub struct EntityInstanceCollection {
     pub instances: Vec<EntityInstanceInfo>,
-    pub(crate) instance_indexes_by_id: HashMap<u32, usize>,
+    instance_indexes_by_id: HashMap<u32, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,15 +122,13 @@ impl Document {
         } = scan_text(&text);
 
         Self {
-            text,
+            text: Arc::new(text),
             tree: None,
             ast_skipped: false,
             schema_name: None,
             line_offsets,
             definitions,
             references,
-            instances: Vec::new(),
-            instance_indexes_by_id: HashMap::new(),
         }
         .with_schema_name(schema_name)
     }
@@ -147,27 +155,115 @@ impl Document {
     pub fn unload_parse_state(&mut self) {
         self.tree = None;
         self.ast_skipped = false;
-        self.instances = Vec::new();
-        self.instance_indexes_by_id = HashMap::new();
     }
 
     pub fn reload_parse_state(&mut self, parser: &mut Parser, ast_file_size_limit_bytes: usize) {
         self.reload_text_index();
         self.unload_parse_state();
 
+        self.parse_current_text(parser, None, ast_file_size_limit_bytes);
+    }
+
+    pub fn apply_content_changes(
+        &mut self,
+        parser: &mut Parser,
+        changes: &[TextDocumentContentChangeEvent],
+        ast_file_size_limit_bytes: usize,
+    ) -> Result<(), ApplyChangeError> {
+        for (index, change) in changes.iter().enumerate() {
+            if let Some(range) = change.range {
+                if let Err(error) = self.apply_ranged_change(range, &change.text) {
+                    self.reload_text_index();
+                    let old_tree = self.tree.take();
+                    self.parse_current_text(parser, old_tree.as_ref(), ast_file_size_limit_bytes);
+                    return Err(error);
+                }
+            } else {
+                self.text = Arc::new(change.text.clone());
+                self.tree = None;
+            }
+
+            if index + 1 < changes.len() {
+                self.reload_line_offsets();
+            }
+        }
+
+        self.reload_text_index();
+        let old_tree = self.tree.take();
+        self.parse_current_text(parser, old_tree.as_ref(), ast_file_size_limit_bytes);
+        Ok(())
+    }
+
+    fn apply_ranged_change(
+        &mut self,
+        range: Range,
+        replacement: &str,
+    ) -> Result<(), ApplyChangeError> {
+        let start_byte = self
+            .position_to_offset(range.start)
+            .ok_or(ApplyChangeError::InvalidRange(range))?;
+        let old_end_byte = self
+            .position_to_offset(range.end)
+            .ok_or(ApplyChangeError::InvalidRange(range))?;
+        if start_byte > old_end_byte {
+            return Err(ApplyChangeError::InvalidRange(range));
+        }
+
+        let start_position = self
+            .point_at_offset(range.start.line as usize, start_byte)
+            .ok_or(ApplyChangeError::InvalidRange(range))?;
+        let old_end_position = self
+            .point_at_offset(range.end.line as usize, old_end_byte)
+            .ok_or(ApplyChangeError::InvalidRange(range))?;
+        let new_end_position = point_after_text(start_position, replacement);
+        let edit = InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte: start_byte + replacement.len(),
+            start_position,
+            old_end_position,
+            new_end_position,
+        };
+
+        if let Some(tree) = self.tree.as_mut() {
+            tree.edit(&edit);
+        }
+        Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
+        Ok(())
+    }
+
+    fn reload_line_offsets(&mut self) {
+        self.line_offsets.clear();
+        self.line_offsets.push(0);
+        self.line_offsets.extend(
+            self.text
+                .bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        );
+    }
+
+    fn point_at_offset(&self, line: usize, offset: usize) -> Option<Point> {
+        let line_start = *self.line_offsets.get(line)?;
+        Some(Point {
+            row: line,
+            column: offset.checked_sub(line_start)?,
+        })
+    }
+
+    fn parse_current_text(
+        &mut self,
+        parser: &mut Parser,
+        old_tree: Option<&Tree>,
+        ast_file_size_limit_bytes: usize,
+    ) {
+        self.ast_skipped = false;
         if self.text.len() > ast_file_size_limit_bytes {
             self.ast_skipped = true;
             return;
         }
 
-        self.tree = parser.parse(&self.text, None);
-        self.instances = build_instances(&self.tree, &self.text);
-        self.instance_indexes_by_id = self
-            .instances
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
-            .collect();
+        self.tree = parser.parse(self.text.as_bytes(), old_tree);
     }
 
     #[cfg(test)]
@@ -197,10 +293,16 @@ impl Document {
         tree.root_node().descendant_for_point_range(point, point)
     }
 
-    pub fn instance_by_id(&self, id: u32) -> Option<&EntityInstanceInfo> {
-        self.instance_indexes_by_id
-            .get(&id)
-            .and_then(|index| self.instances.get(*index))
+    pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
+        let definition_offset = *self.definitions.get(&id)?;
+        let tree = self.tree.as_ref()?;
+        let mut node = tree
+            .root_node()
+            .descendant_for_byte_range(definition_offset, definition_offset)?;
+        while node.kind() != "entity_instance" {
+            node = node.parent()?;
+        }
+        parse_entity_instance(node, &self.text)
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -414,18 +516,35 @@ fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn build_instances(tree: &Option<Tree>, text: &str) -> Vec<EntityInstanceInfo> {
+pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
 
-    let tree = match tree {
-        Some(t) => t,
-        None => return instances,
-    };
+    if let Some(tree) = tree {
+        let mut cursor = tree.root_node().walk();
+        traverse(&mut cursor, text, &mut instances);
+    }
 
-    let mut cursor = tree.root_node().walk();
-    traverse(&mut cursor, text, &mut instances);
+    EntityInstanceCollection::new(instances)
+}
 
-    instances
+impl EntityInstanceCollection {
+    pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
+        let instance_indexes_by_id = instances
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
+            .collect();
+        Self {
+            instances,
+            instance_indexes_by_id,
+        }
+    }
+
+    pub fn instance_by_id(&self, id: u32) -> Option<&EntityInstanceInfo> {
+        self.instance_indexes_by_id
+            .get(&id)
+            .and_then(|index| self.instances.get(*index))
+    }
 }
 
 fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInstanceInfo>) {
@@ -613,10 +732,37 @@ fn node_range(node: &Node<'_>) -> Range {
     }
 }
 
+fn point_after_text(start: Point, text: &str) -> Point {
+    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    if newline_count == 0 {
+        return Point {
+            row: start.row,
+            column: start.column + text.len(),
+        };
+    }
+
+    Point {
+        row: start.row + newline_count,
+        column: text
+            .as_bytes()
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(text.len(), |offset| text.len() - offset - 1),
+    }
+}
+
 //*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range,
+            range_length: None,
+            text: text.to_string(),
+        }
+    }
 
     fn parse_document(text: &str) -> Document {
         let mut parser = Parser::new();
@@ -625,6 +771,10 @@ mod tests {
             .expect("Error loading IFC parser");
 
         Document::parse(&mut parser, text.to_string())
+    }
+
+    fn instances(document: &Document) -> EntityInstanceCollection {
+        build_entity_instances(document.tree.as_ref(), &document.text)
     }
 
     fn position_at(text: &str, needle: &str) -> Position {
@@ -640,7 +790,7 @@ mod tests {
         let text = "#1=IFCWALL($);";
         let document = parse_document(text);
 
-        assert_eq!(document.text, text);
+        assert_eq!(document.text.as_str(), text);
         assert!(document.tree.is_some());
         assert_eq!(document.schema_name, None);
         assert_eq!(document.definitions.get(&1), Some(&0));
@@ -709,7 +859,9 @@ mod tests {
         let text = "#1=IFCWALL($);\n#2=IFCDOOR($);";
         let document = parse_document(text);
 
-        let instance = document.instance_by_id(2).expect("instance should exist");
+        let instance = document
+            .entity_instance_by_id(2)
+            .expect("instance should exist");
 
         assert_eq!(instance.entity_name, "IFCDOOR");
     }
@@ -721,13 +873,11 @@ mod tests {
 
         document.unload_parse_state();
 
-        assert_eq!(document.text, text);
+        assert_eq!(document.text.as_str(), text);
         assert!(!document.is_parse_state_loaded());
         assert_eq!(document.schema_name, None);
         assert_eq!(document.definitions.get(&1), Some(&0));
         assert_eq!(document.references.get(&2), Some(&vec![11]));
-        assert!(document.instances.is_empty());
-        assert!(document.instance_indexes_by_id.is_empty());
     }
 
     #[test]
@@ -742,17 +892,138 @@ mod tests {
             .expect("Error loading IFC parser");
         document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
 
-        assert_eq!(document.text, text);
+        assert_eq!(document.text.as_str(), text);
         assert!(document.is_parse_state_loaded());
         assert!(document.definitions.contains_key(&1));
         assert!(document.definitions.contains_key(&2));
         assert_eq!(document.references[&2], vec![11, 16]);
         assert_eq!(
             document
-                .instance_by_id(2)
+                .entity_instance_by_id(2)
                 .expect("instance should be indexed")
                 .entity_name,
             "IFCDOOR"
         );
+    }
+
+    #[test]
+    fn incremental_changes_are_applied_sequentially() {
+        let mut document = parse_document("#1=IFCWALL($);");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+        let changes = [
+            change(
+                Some(Range::new(Position::new(0, 6), Position::new(0, 10))),
+                "SLAB",
+            ),
+            change(
+                Some(Range::new(Position::new(0, 11), Position::new(0, 11))),
+                "#2,",
+            ),
+        ];
+
+        document
+            .apply_content_changes(&mut parser, &changes, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES)
+            .expect("changes should be valid");
+
+        assert_eq!(document.text.as_str(), "#1=IFCSLAB(#2,$);");
+        assert_eq!(document.references.get(&2), Some(&vec![11]));
+        assert_eq!(instances(&document).instances[0].entity_name, "IFCSLAB");
+        assert!(document.has_ast());
+    }
+
+    #[test]
+    fn incremental_change_ranges_use_utf16_columns() {
+        let mut document = parse_document("#1=IFCWALL('😀');");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+        let changes = [change(
+            Some(Range::new(Position::new(0, 12), Position::new(0, 14))),
+            "door",
+        )];
+
+        document
+            .apply_content_changes(&mut parser, &changes, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES)
+            .expect("change should be valid");
+
+        assert_eq!(document.text.as_str(), "#1=IFCWALL('door');");
+        assert!(document.has_ast());
+    }
+
+    #[test]
+    fn full_text_change_falls_back_to_full_parse() {
+        let mut document = parse_document("#1=IFCWALL($);");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+
+        document
+            .apply_content_changes(
+                &mut parser,
+                &[change(None, "#2=IFCDOOR($);")],
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .expect("change should be valid");
+
+        assert_eq!(document.text.as_str(), "#2=IFCDOOR($);");
+        assert!(document.definitions.contains_key(&2));
+        assert_eq!(instances(&document).instances[0].entity_name, "IFCDOOR");
+    }
+
+    #[test]
+    fn incremental_change_respects_ast_size_limit_transitions() {
+        let mut document = parse_document("#1=IFCWALL($);");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+
+        document
+            .apply_content_changes(&mut parser, &[change(None, "large")], 4)
+            .expect("change should be valid");
+        assert!(document.ast_skipped);
+        assert!(!document.has_ast());
+
+        document
+            .apply_content_changes(&mut parser, &[change(None, "#1=IFCWALL($);")], 1024)
+            .expect("change should be valid");
+        assert!(!document.ast_skipped);
+        assert!(document.has_ast());
+    }
+
+    #[test]
+    fn invalid_incremental_range_keeps_derived_state_consistent() {
+        let mut document = parse_document("#1=IFCWALL($);");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+        let invalid_range = Range::new(Position::new(2, 0), Position::new(2, 1));
+
+        let result = document.apply_content_changes(
+            &mut parser,
+            &[change(Some(invalid_range), "x")],
+            DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+        );
+
+        assert_eq!(result, Err(ApplyChangeError::InvalidRange(invalid_range)));
+        assert_eq!(document.text.as_str(), "#1=IFCWALL($);");
+        assert!(document.definitions.contains_key(&1));
+        assert_eq!(instances(&document).instances[0].entity_name, "IFCWALL");
+        assert!(document.has_ast());
+    }
+
+    #[test]
+    fn point_after_multiline_text_uses_byte_columns() {
+        assert_eq!(
+            point_after_text(Point::new(3, 7), "😀\nabc"),
+            Point::new(4, 3)
+        );
+        assert_eq!(point_after_text(Point::new(3, 7), "😀"), Point::new(3, 11));
     }
 }

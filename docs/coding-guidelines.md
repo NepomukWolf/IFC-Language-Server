@@ -19,7 +19,9 @@ Prefer the simplest implementation that matches the documented current scope in 
 - Keep changes aligned with the current `Backend` / `Document` / `document_index` / `SchemaDocCollection` split.
 - Prefer feature logic that operates on `&Document` instead of pushing more logic into the LSP trait implementation.
 - Preserve the current single-document model unless the work explicitly requires widening scope.
-- Prefer full-document reparsing over incremental parsing complexity unless there is a demonstrated need.
+- Preserve incremental tree-sitter parsing for document changes; use full parsing when loading AST state from scratch or receiving a full-text replacement.
+- Keep text indexing full-document unless measurements demonstrate that further incremental complexity is needed.
+- Materialize complete entity-instance collections only in bounded background or explicit on-demand work; use targeted AST extraction for local feature requests.
 - Keep per-document text indexes small and independent from tree-sitter.
 - Prefer the lightweight text index for navigation and simple token lookup.
 - Use tree-sitter only when syntax structure or parsed parameter values are required.

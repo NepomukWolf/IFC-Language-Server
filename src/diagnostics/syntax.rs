@@ -3,10 +3,10 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-use crate::document::Document;
+use crate::diagnostics::DiagnosticSnapshot;
 
-pub fn collect(document: &Document) -> Vec<Diagnostic> {
-    let Some(tree) = &document.tree else {
+pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
+    let Some(tree) = &snapshot.tree else {
         return Vec::new();
     };
 
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn reports_invalid_step_syntax() {
         let doc = parse_document(r#"#14=IFCUNITASSIGNMENT((#15,#16,#17, "test"));"#);
-        let diagnostics = collect(&doc);
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));
 
         assert!(
             diagnostics
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn reports_missing_step_semicolon() {
         let doc = parse_document("#1=IFCWALL('gid')\n#2=IFCWALL('next');");
-        let diagnostics = collect(&doc);
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));
 
         let diagnostic = diagnostics
             .iter()

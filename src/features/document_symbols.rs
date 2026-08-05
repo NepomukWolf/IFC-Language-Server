@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::document::{Document, EntityInstanceInfo, ParameterValue};
+use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
 
@@ -38,25 +38,27 @@ enum ProductRenderMode {
 }
 
 pub fn document_symbols(
-    document: &Document,
+    text: &str,
+    instances: &EntityInstanceCollection,
+    ast_skipped: bool,
     schema: Option<&SchemaDoc>,
 ) -> Option<DocumentSymbolResponse> {
-    if document.ast_skipped && document.instances.is_empty() {
+    if ast_skipped && instances.instances.is_empty() {
         return Some(DocumentSymbolResponse::Nested(vec![message_symbol(
             "Outline unavailable: IFC AST was skipped because the file exceeds the configured AST size limit",
             "Increase `ifc.analysis.astFileSizeLimitMb` to enable the spatial outline",
         )]));
     }
 
-    let lines: Vec<&str> = document.text.lines().collect();
-    let by_id: HashMap<u32, usize> = document
+    let lines: Vec<&str> = text.lines().collect();
+    let by_id: HashMap<u32, usize> = instances
         .instances
         .iter()
         .enumerate()
         .filter_map(|(index, item)| item.id.map(|id| (id, index)))
         .collect();
     let mut edges = Vec::new();
-    for (order, relationship) in document.instances.iter().enumerate() {
+    for (order, relationship) in instances.instances.iter().enumerate() {
         let Some((parent_parameter, children_parameter, kind)) =
             relationship_parameters(relationship, schema)
         else {
@@ -82,7 +84,7 @@ pub fn document_symbols(
         }
     }
 
-    let declared_classes: Vec<Option<Class>> = document
+    let declared_classes: Vec<Option<Class>> = instances
         .instances
         .iter()
         .map(|item| classify(item, schema))
@@ -104,7 +106,7 @@ pub fn document_symbols(
         }
     }
     let mut parent = HashMap::new();
-    for child in 0..document.instances.len() {
+    for child in 0..instances.instances.len() {
         let Some(class) = classes.get(child).copied().flatten() else {
             continue;
         };
@@ -143,7 +145,7 @@ pub fn document_symbols(
     for root in roots {
         symbols.push(render_real(
             root,
-            document,
+            instances,
             schema,
             &lines,
             &classes,
@@ -166,7 +168,7 @@ pub fn document_symbols(
         let grouped = render_product_groups(
             &uncontained,
             ProductRenderMode::GroupMultiOnly,
-            document,
+            instances,
             schema,
             &lines,
             &classes,
@@ -370,7 +372,7 @@ fn would_cycle(child: usize, mut candidate: usize, parent: &HashMap<usize, usize
 #[allow(clippy::too_many_arguments)]
 fn render_real(
     index: usize,
-    document: &Document,
+    instances: &EntityInstanceCollection,
     schema: Option<&SchemaDoc>,
     lines: &[&str],
     classes: &[Option<Class>],
@@ -378,7 +380,7 @@ fn render_real(
     emitted: &mut HashSet<usize>,
 ) -> DocumentSymbol {
     emitted.insert(index);
-    let item = &document.instances[index];
+    let item = &instances.instances[index];
     let all_children = children.get(&index).cloned().unwrap_or_default();
     let mut nested = Vec::new();
     for child in all_children
@@ -388,7 +390,7 @@ fn render_real(
     {
         if !emitted.contains(&child) {
             nested.push(render_real(
-                child, document, schema, lines, classes, children, emitted,
+                child, instances, schema, lines, classes, children, emitted,
             ));
         }
     }
@@ -399,7 +401,7 @@ fn render_real(
     nested.extend(render_product_groups(
         &products,
         product_render_mode(classes[index]),
-        document,
+        instances,
         schema,
         lines,
         classes,
@@ -420,7 +422,7 @@ fn product_render_mode(parent_class: Option<Class>) -> ProductRenderMode {
 fn render_product_groups(
     indices: &[usize],
     mode: ProductRenderMode,
-    document: &Document,
+    instances: &EntityInstanceCollection,
     schema: Option<&SchemaDoc>,
     lines: &[&str],
     classes: &[Option<Class>],
@@ -432,7 +434,7 @@ fn render_product_groups(
         for &index in indices {
             if !emitted.contains(&index) {
                 result.push(render_real(
-                    index, document, schema, lines, classes, children, emitted,
+                    index, instances, schema, lines, classes, children, emitted,
                 ));
             }
         }
@@ -443,7 +445,7 @@ fn render_product_groups(
     for &index in indices {
         if !emitted.contains(&index) {
             groups
-                .entry(&document.instances[index].entity_name)
+                .entry(&instances.instances[index].entity_name)
                 .or_default()
                 .push(index);
         }
@@ -454,7 +456,7 @@ fn render_product_groups(
         let mut items = Vec::new();
         for index in group {
             items.push(render_real(
-                index, document, schema, lines, classes, children, emitted,
+                index, instances, schema, lines, classes, children, emitted,
             ));
         }
         if items.len() == 1 {
