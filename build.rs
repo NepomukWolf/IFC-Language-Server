@@ -52,17 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&express_dir)?;
 
     for schema in SCHEMAS {
-        let source = fetch_from_sources(schema.urls)?;
-        let actual_sha256 = format!("{:x}", Sha256::digest(&source));
-
-        if actual_sha256 != schema.expected_sha256 {
-            return Err(format!(
-                "checksum mismatch for {}: expected {}, got {}",
-                schema.file_name, schema.expected_sha256, actual_sha256
-            )
-            .into());
-        }
-
+        let source = fetch_schema(schema)?;
         fs::write(express_dir.join(schema.file_name), source)?;
     }
 
@@ -86,17 +76,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn fetch_from_sources(urls: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
+fn fetch_schema(schema: &SchemaSource) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut errors = Vec::new();
 
-    for url in urls {
+    for url in schema.urls {
         match fetch_url(url) {
-            Ok(source) => return Ok(source),
+            Ok(source) => {
+                let actual_sha256 = format!("{:x}", Sha256::digest(&source));
+
+                if actual_sha256 == schema.expected_sha256 {
+                    return Ok(source);
+                }
+
+                errors.push(format!(
+                    "{url}: checksum mismatch: expected {}, got {actual_sha256}",
+                    schema.expected_sha256
+                ));
+            }
             Err(error) => errors.push(format!("{url}: {error}")),
         }
     }
 
-    Err(format!("failed to fetch any source:\n{}", errors.join("\n")).into())
+    Err(format!(
+        "failed to fetch a valid {}:\n{}",
+        schema.file_name,
+        errors.join("\n")
+    )
+    .into())
 }
 
 fn fetch_url(url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
