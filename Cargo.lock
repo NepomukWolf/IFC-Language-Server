@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-language-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "espr",
  "sha2",
