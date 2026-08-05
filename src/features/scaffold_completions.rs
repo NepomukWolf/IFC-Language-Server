@@ -341,7 +341,7 @@ mod tests {
     }
 
     fn file_uri(name: &str) -> Url {
-        Url::from_file_path(format!("/tmp/{name}")).expect("file URI should be valid")
+        Url::parse(&format!("file:///C:/tmp/{name}")).expect("file URI should be valid")
     }
 
     fn completion_text(
