@@ -116,5 +116,6 @@ flake.lock
 # Before adding new lines, see the comment at the top.
 AGENTS.md
 .claude/
+CLAUDE.md
 logs/
 samples/Gebaeude_1-rvt2019.ifc
