@@ -57,6 +57,20 @@ When a user invokes Go to Definition, for example through an editor context menu
 - resolve that reference to its corresponding entity definition within the same document
 - return the precise target location, including URI and range
 
+### Related Entity Navigation
+
+The language server should provide code actions to jump between an entity and the entities it is
+connected to through a relationship, for the entity at the cursor position:
+
+- containing spatial structure and contained elements (`IfcRelContainedInSpatialStructure`)
+- aggregation parent and parts (`IfcRelAggregates`)
+- host element and opening (`IfcRelVoidsElement`)
+- opening and filling element (`IfcRelFillsElement`)
+
+Resolution should be scoped to the entity under the cursor so cost does not grow with file size.
+The jump is delivered through `workspace/executeCommand` and `window/showDocument`; clients that do
+not support `window/showDocument` will show the actions without the jump taking effect.
+
 ### Find References
 
 The language server should implement find references functionality for IFC symbols.

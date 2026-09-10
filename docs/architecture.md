@@ -23,6 +23,7 @@ The shipped LSP features are:
 - signature help
 - inlay hints
 - IFC boilerplate completions and code actions
+- related-entity navigation code actions
 - range-based semantic tokens
 - schema-aware diagnostics
 
@@ -92,6 +93,7 @@ The server advertises:
 - `textDocument/inlayHint`
 - `textDocument/completion`
 - `textDocument/codeAction`
+- `workspace/executeCommand`
 - `textDocument/semanticTokens/range`
 
 Diagnostics are published with `textDocument/publishDiagnostics` after background processing on
@@ -202,6 +204,7 @@ These features do not require an AST:
 - signature help for IFC entity parameter lists, when schema docs are available
 - schema-backed inlay hints for STEP entity arguments
 - schema name detection from `FILE_SCHEMA(...)`
+- related-entity navigation code actions, when schema docs are available
 - range-based semantic tokens
 
 These features require an AST:
@@ -271,6 +274,24 @@ text code actions for empty or whitespace-only documents.
 
 Boilerplate generation targets the current default schema. Older schema versions are not generated
 directly.
+
+### Related Entity Navigation
+
+`src/features/related_entities.rs` offers code actions that jump between an entity and the small,
+fixed set of IFC relationship entities that reference it: `IfcRelContainedInSpatialStructure`,
+`IfcRelAggregates`, `IfcRelVoidsElement`, and `IfcRelFillsElement`. Resolution starts from the
+entity under the cursor and only walks the relationship instances already indexed against it via
+`Document::references`, so cost does not grow with file size. Relationship attribute positions are
+resolved from the selected `SchemaDoc` rather than hardcoded, so it stays correct across schema
+versions.
+
+`src/features/step_scan.rs` is a small shared STEP argument-list scanner (entity name, positional
+argument boundaries) used by both this feature and inlay hints, without tree-sitter.
+
+Each action carries a `Command` executed via `workspace/executeCommand`, which calls back into the
+client with `window/showDocument` to move the cursor. This depends on the client declaring
+`window.showDocument.support`; clients that do not implement it (e.g. Zed before its
+`window/showDocument` support landed) will show the actions but the jump will not occur.
 
 ### Semantic Tokens
 
