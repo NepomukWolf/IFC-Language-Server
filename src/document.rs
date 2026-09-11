@@ -125,17 +125,11 @@ impl Document {
             text: Arc::new(text),
             tree: None,
             ast_skipped: false,
-            schema_name: None,
+            schema_name,
             line_offsets,
             definitions,
             references,
         }
-        .with_schema_name(schema_name)
-    }
-
-    fn with_schema_name(mut self, schema_name: Option<String>) -> Self {
-        self.schema_name = schema_name;
-        self
     }
 
     pub fn reload_text_index(&mut self) {
@@ -402,7 +396,8 @@ impl Document {
         self.text.get(start..end)
     }
 
-    fn line_end_offset(&self, line_index: usize) -> Option<usize> {
+    /// Byte offset of the end of `line_index`, excluding a trailing `\n`.
+    pub(crate) fn line_end_offset(&self, line_index: usize) -> Option<usize> {
         let line_start = *self.line_offsets.get(line_index)?;
         let next_line_start = self
             .line_offsets
@@ -462,7 +457,8 @@ impl Document {
         (has_digit && offset <= end).then_some((start, end, id))
     }
 
-    fn identifier_at_offset(&self, offset: usize) -> Option<(usize, usize)> {
+    /// Byte span of the identifier token covering (or ending at) `offset`.
+    pub(crate) fn identifier_at_offset(&self, offset: usize) -> Option<(usize, usize)> {
         let bytes = self.text.as_bytes();
         if bytes.is_empty() {
             return None;

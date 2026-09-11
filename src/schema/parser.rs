@@ -7,15 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use espr::ast::{
     AttributeDecl, Bound, BuiltInConstant, Entity, EntityAttribute, Expression, Extensibility,
-    Literal, SimpleType, SyntaxTree, Type, TypeDecl, WhereClause,
+    Literal, SimpleType, SyntaxTree, Type, TypeDecl,
 };
 
 use crate::schema::LoadExpressError;
 use crate::schema::types::{AttributeDef, DerivedAttributeDef, EntityDef, RawSchema};
 use crate::schema::{
     AggregateBounds, AggregateKind, AggregateTypeRef, AliasTypeDef, BoundValue, EnumerationTypeDef,
-    NamedTypeKind, NamedTypeRef, PrimitiveType, SelectTypeDef, TypeDoc, TypeRef, WhereRuleDef,
-    normalize_name,
+    NamedTypeKind, NamedTypeRef, PrimitiveType, SelectTypeDef, TypeDoc, TypeRef, normalize_name,
 };
 
 pub(crate) fn parse_express_source(source: &str) -> Result<RawSchema, LoadExpressError> {
@@ -118,7 +117,6 @@ fn normalize_entity(
                     .collect()
             })
             .unwrap_or_default(),
-        where_rules: where_rules(&entity.where_clause),
     }
 }
 
@@ -181,7 +179,6 @@ fn normalize_type_decl(
             name: type_decl.type_id.clone(),
             items: items.iter().map(|item| normalize_name(item)).collect(),
             extensible: !matches!(extensibility, Extensibility::None),
-            where_rules: where_rules(&type_decl.where_clause),
         }),
         Type::Select {
             extensibility,
@@ -195,12 +192,10 @@ fn normalize_type_decl(
                 .collect(),
             extensible: !matches!(extensibility, Extensibility::None),
             generic_entity: matches!(extensibility, Extensibility::GenericEntity),
-            where_rules: where_rules(&type_decl.where_clause),
         }),
         ty => TypeDoc::Alias(AliasTypeDef {
             name: type_decl.type_id.clone(),
             target: normalize_type_ref(ty, entity_names, type_names),
-            where_rules: where_rules(&type_decl.where_clause),
         }),
     }
 }
@@ -449,19 +444,4 @@ fn format_generic_type(name: &str, label: &Option<String>) -> String {
         .as_ref()
         .map(|label| format!("{name}:{label}"))
         .unwrap_or_else(|| name.to_string())
-}
-
-fn where_rules(where_clause: &Option<WhereClause>) -> Vec<WhereRuleDef> {
-    where_clause
-        .as_ref()
-        .map(|where_clause| {
-            where_clause
-                .rules
-                .iter()
-                .map(|rule| WhereRuleDef {
-                    label: rule.label.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }

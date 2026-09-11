@@ -22,11 +22,8 @@ pub fn parameter_context(node: tree_sitter::Node<'_>, text: &str) -> Option<Para
     })
 }
 
-pub fn omitted_value_context(node: tree_sitter::Node<'_>, text: &str) -> Option<ParameterContext> {
-    parameter_context(node, text)
-}
-
-fn ancestor_with_kind<'tree>(
+/// Walks up from `node` to the nearest ancestor (or `node` itself) with `expected_kind`.
+pub(crate) fn ancestor_with_kind<'tree>(
     mut node: tree_sitter::Node<'tree>,
     expected_kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
@@ -38,18 +35,24 @@ fn ancestor_with_kind<'tree>(
     }
 }
 
-fn parse_instance_id(node: tree_sitter::Node<'_>, text: &str) -> Option<u32> {
+/// First direct child of `node` with `expected_kind`.
+pub(crate) fn child_with_kind<'tree>(
+    node: tree_sitter::Node<'tree>,
+    expected_kind: &str,
+) -> Option<tree_sitter::Node<'tree>> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .find(|child| child.kind() == "instance_id")
+        .find(|child| child.kind() == expected_kind)
+}
+
+fn parse_instance_id(node: tree_sitter::Node<'_>, text: &str) -> Option<u32> {
+    child_with_kind(node, "instance_id")
         .and_then(|child| child.utf8_text(text.as_bytes()).ok())
         .and_then(|value| value.trim_start_matches('#').parse::<u32>().ok())
 }
 
 fn parse_entity_name(node: tree_sitter::Node<'_>, text: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .find(|child| child.kind() == "entity_name")
+    child_with_kind(node, "entity_name")
         .and_then(|child| child.utf8_text(text.as_bytes()).ok())
         .map(|value| value.to_ascii_uppercase())
 }
