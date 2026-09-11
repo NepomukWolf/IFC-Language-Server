@@ -26,36 +26,24 @@ pub fn hover(
     if let Some((id, offset)) = document.id_token_at_position(position)
         && document.definitions.get(&id) != Some(&offset)
     {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: render_reference_hover(document, id)?,
-            }),
-            range: Some(document.id_range_at_offset(offset)?),
-        });
+        return Some(markdown_hover(
+            render_reference_hover(document, id)?,
+            document.id_range_at_offset(offset)?,
+        ));
     }
 
     if let Some((keyword, range)) = header_keyword_at_position(document, position) {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: render_header_keyword_hover(keyword)?.to_string(),
-            }),
-            range: Some(range),
-        });
+        return Some(markdown_hover(
+            render_header_keyword_hover(keyword)?.to_string(),
+            range,
+        ));
     }
 
     if let Some((entity_text, range)) = document.entity_name_at_position(position)
         && let Some(schema_name) = selected_schema_name.or(document.schema_name.as_deref())
         && let Some(entity_doc) = schema_docs.get_entity_doc(schema_name, &entity_text)
     {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: render_entity_hover(entity_doc),
-            }),
-            range: Some(range),
-        });
+        return Some(markdown_hover(render_entity_hover(entity_doc), range));
     }
 
     if let Some((type_text, range)) = typed_value_name_at_position(document, position)
@@ -63,13 +51,7 @@ pub fn hover(
         && let Some(schema) = schema_docs.get(schema_name)
         && let Some(type_doc) = schema.type_decl(&type_text)
     {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: render_type_hover(type_doc),
-            }),
-            range: Some(range),
-        });
+        return Some(markdown_hover(render_type_hover(type_doc), range));
     }
 
     if let Some(schema_name) = selected_schema_name.or(document.schema_name.as_deref())
@@ -77,29 +59,34 @@ pub fn hover(
         && let Some((range, attribute, enum_def)) =
             enum_value_at_position(document, schema, position)
     {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: render_enum_hover(attribute, enum_def),
-            }),
-            range: Some(range),
-        });
+        return Some(markdown_hover(
+            render_enum_hover(attribute, enum_def),
+            range,
+        ));
     }
 
     if let Some(node) = document.node_at_position(position)
         && node.kind() == "omitted_value"
     {
-        let context = ast::omitted_value_context(node, &document.text)?;
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: derived_value_hover(document, &context)?,
-            }),
-            range: Some(document.range_for_offsets(node.start_byte(), node.end_byte())?),
-        });
+        let context = ast::parameter_context(node, &document.text)?;
+        return Some(markdown_hover(
+            derived_value_hover(document, &context)?,
+            document.range_for_offsets(node.start_byte(), node.end_byte())?,
+        ));
     }
 
     None
+}
+
+/// Wraps rendered markdown into the LSP hover shape used by every branch above.
+fn markdown_hover(value: String, range: Range) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(range),
+    }
 }
 
 fn render_entity_hover(entity_doc: &EntityDoc) -> String {
@@ -161,27 +148,7 @@ fn header_keyword_at_position(
     position: Position,
 ) -> Option<(&'static str, Range)> {
     let offset = document.position_to_offset(position)?;
-    let bytes = document.text.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-
-    let candidate = if offset < bytes.len() && is_header_identifier_part(bytes[offset]) {
-        offset
-    } else if offset > 0 && is_header_identifier_part(bytes[offset - 1]) {
-        offset - 1
-    } else {
-        return None;
-    };
-
-    let mut start = candidate;
-    while start > 0 && is_header_identifier_part(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut end = candidate + 1;
-    while end < bytes.len() && is_header_identifier_part(bytes[end]) {
-        end += 1;
-    }
+    let (start, end) = document.identifier_at_offset(offset)?;
 
     let keyword = match document.text.get(start..end)?.to_ascii_uppercase().as_str() {
         "FILE_DESCRIPTION" => "FILE_DESCRIPTION",
@@ -191,10 +158,6 @@ fn header_keyword_at_position(
     };
 
     Some((keyword, document.range_for_offsets(start, end)?))
-}
-
-fn is_header_identifier_part(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn render_header_keyword_hover(keyword: &str) -> Option<&'static str> {
@@ -351,8 +314,8 @@ fn typed_value_name_at_position(
 ) -> Option<(String, tower_lsp::lsp_types::Range)> {
     let offset = document.position_to_offset(position)?;
     let node = document.node_at_position(position)?;
-    let typed_parameter = ancestor_with_kind(node, "typed_parameter")?;
-    let entity_name = child_with_kind(typed_parameter, "entity_name")?;
+    let typed_parameter = ast::ancestor_with_kind(node, "typed_parameter")?;
+    let entity_name = ast::child_with_kind(typed_parameter, "entity_name")?;
     if offset < entity_name.start_byte() || offset >= entity_name.end_byte() {
         return None;
     }
@@ -362,27 +325,6 @@ fn typed_value_name_at_position(
         text.to_ascii_uppercase(),
         document.range_for_offsets(entity_name.start_byte(), entity_name.end_byte())?,
     ))
-}
-
-fn ancestor_with_kind<'tree>(
-    mut node: tree_sitter::Node<'tree>,
-    expected_kind: &str,
-) -> Option<tree_sitter::Node<'tree>> {
-    loop {
-        if node.kind() == expected_kind {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
-
-fn child_with_kind<'tree>(
-    node: tree_sitter::Node<'tree>,
-    expected_kind: &str,
-) -> Option<tree_sitter::Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .find(|child| child.kind() == expected_kind)
 }
 
 fn render_type_hover(type_doc: &TypeDoc) -> String {
@@ -818,7 +760,7 @@ mod tests {
             .node_at_position(position_at(text, "*"))
             .expect("omitted value node should exist");
 
-        let context = crate::step::ast::omitted_value_context(node, &document.text)
+        let context = crate::step::ast::parameter_context(node, &document.text)
             .expect("context should resolve from AST");
 
         assert_eq!(context.instance_id, 15);
@@ -1076,7 +1018,6 @@ mod tests {
                 width: Some(255),
                 fixed: false,
             }),
-            where_rules: Vec::new(),
         }));
 
         assert!(markdown.contains("# IfcLabel"));

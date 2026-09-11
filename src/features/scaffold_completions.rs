@@ -74,10 +74,6 @@ impl RenderContext {
     fn final_tabstop(&self) -> &'static str {
         if self.snippet { "$0" } else { "" }
     }
-
-    fn next_guid(&mut self) -> String {
-        compress_uuid(Uuid::new_v4().as_u128())
-    }
 }
 
 pub fn completions(
@@ -91,8 +87,8 @@ pub fn completions(
         .into_iter()
         .enumerate()
         .map(|(index, level)| {
-            let mut context = RenderContext::from_uri(uri, snippet_supported);
-            let new_text = render_scaffold(level, &mut context);
+            let context = RenderContext::from_uri(uri, snippet_supported);
+            let new_text = render_scaffold(level, &context);
             let mut item = CompletionItem::new_simple(
                 level.detail().to_string(),
                 "Insert IFC STEP boilerplate".to_string(),
@@ -128,8 +124,8 @@ pub fn code_actions(
 
     let replace_document_range = document.range_for_offsets(0, document.text.len())?;
     let actions = SCAFFOLD_LEVELS.into_iter().map(|level| {
-        let mut context = RenderContext::from_uri(uri, false);
-        let new_text = render_scaffold(level, &mut context);
+        let context = RenderContext::from_uri(uri, false);
+        let new_text = render_scaffold(level, &context);
         CodeActionOrCommand::CodeAction(CodeAction {
             title: format!("Insert {}", level.detail()),
             kind: Some(CodeActionKind::SOURCE),
@@ -213,7 +209,7 @@ impl ScaffoldLevel {
     }
 }
 
-fn render_scaffold(level: ScaffoldLevel, context: &mut RenderContext) -> String {
+fn render_scaffold(level: ScaffoldLevel, context: &RenderContext) -> String {
     match level {
         ScaffoldLevel::Metadata => render_metadata_scaffold(context),
         ScaffoldLevel::Project => render_project_scaffold(context),
@@ -228,8 +224,8 @@ fn render_metadata_scaffold(context: &RenderContext) -> String {
     )
 }
 
-fn render_project_scaffold(context: &mut RenderContext) -> String {
-    let project_guid = context.next_guid();
+fn render_project_scaffold(context: &RenderContext) -> String {
+    let project_guid = new_guid();
 
     let mut bindings = common_bindings(context, context.final_tabstop());
     bindings.push(("project_guid", project_guid));
@@ -238,14 +234,14 @@ fn render_project_scaffold(context: &mut RenderContext) -> String {
     render_template(PROJECT_TEMPLATE, &bindings)
 }
 
-fn render_spatial_scaffold(context: &mut RenderContext) -> String {
-    let project_guid = context.next_guid();
-    let site_guid = context.next_guid();
-    let building_guid = context.next_guid();
-    let storey_guid = context.next_guid();
-    let rel_project_site_guid = context.next_guid();
-    let rel_site_building_guid = context.next_guid();
-    let rel_building_storey_guid = context.next_guid();
+fn render_spatial_scaffold(context: &RenderContext) -> String {
+    let project_guid = new_guid();
+    let site_guid = new_guid();
+    let building_guid = new_guid();
+    let storey_guid = new_guid();
+    let rel_project_site_guid = new_guid();
+    let rel_site_building_guid = new_guid();
+    let rel_building_storey_guid = new_guid();
 
     let mut bindings = common_bindings(context, context.final_tabstop());
     bindings.push(("project_guid", project_guid));
@@ -319,6 +315,11 @@ fn file_name_from_uri(uri: &Url) -> String {
 
 fn step_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// Freshly generated IFC GlobalId, base64-style compressed per the IFC GUID encoding.
+fn new_guid() -> String {
+    compress_uuid(Uuid::new_v4().as_u128())
 }
 
 fn compress_uuid(mut value: u128) -> String {
@@ -487,16 +488,16 @@ mod tests {
 
     #[test]
     fn escapes_file_name_for_step_strings() {
-        let mut context = RenderContext::for_test("owner's.ifc", true);
-        let output = render_scaffold(ScaffoldLevel::Metadata, &mut context);
+        let context = RenderContext::for_test("owner's.ifc", true);
+        let output = render_scaffold(ScaffoldLevel::Metadata, &context);
 
         assert!(output.contains("FILE_NAME('owner''s.ifc'"));
     }
 
     #[test]
     fn renders_lsp_tool_metadata_in_header() {
-        let mut context = RenderContext::for_test("test.ifc", true);
-        let output = render_scaffold(ScaffoldLevel::Metadata, &mut context);
+        let context = RenderContext::for_test("test.ifc", true);
+        let output = render_scaffold(ScaffoldLevel::Metadata, &context);
 
         assert!(output.contains("'2024-11-14T10:09:36'"));
         assert!(output.contains(&format!(
@@ -570,7 +571,9 @@ mod tests {
         for (_, edit) in edits {
             assert!(edit.new_text.contains("FILE_SCHEMA(('IFC4X3_ADD2'))"));
             assert!(!edit.new_text.contains("${"));
-            assert!(!edit.new_text.contains("$0"));
+            // The final tabstop always occupies its own line. Matching bare `$0` is flaky:
+            // a randomly generated IFC GUID can contain those two characters.
+            assert!(!edit.new_text.contains("\n$0\n"));
         }
     }
 

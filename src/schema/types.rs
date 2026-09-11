@@ -60,7 +60,6 @@ pub enum TypeDoc {
 pub struct AliasTypeDef {
     pub name: String,
     pub target: TypeRef,
-    pub where_rules: Vec<WhereRuleDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +67,6 @@ pub struct EnumerationTypeDef {
     pub name: String,
     pub items: Vec<String>,
     pub extensible: bool,
-    pub where_rules: Vec<WhereRuleDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +75,6 @@ pub struct SelectTypeDef {
     pub options: Vec<TypeRef>,
     pub extensible: bool,
     pub generic_entity: bool,
-    pub where_rules: Vec<WhereRuleDef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WhereRuleDef {
-    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +152,6 @@ pub(crate) struct EntityDef {
     pub attributes: Vec<AttributeDef>,
     pub derived_attributes: Vec<DerivedAttributeDef>,
     pub supertypes: Vec<String>,
-    pub where_rules: Vec<WhereRuleDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

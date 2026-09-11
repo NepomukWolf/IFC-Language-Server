@@ -50,7 +50,7 @@ pub fn scan_text(text: &str) -> TextIndex {
                     offset += 1;
                 }
                 if index.schema_name.is_none()
-                    && eq_ignore_ascii_case(&bytes[ident_start..offset], b"FILE_SCHEMA")
+                    && bytes[ident_start..offset].eq_ignore_ascii_case(b"FILE_SCHEMA")
                 {
                     index.schema_name = parse_file_schema_name(bytes, offset);
                 }
@@ -192,14 +192,6 @@ fn is_identifier_start(byte: u8) -> bool {
 
 fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 #[cfg(test)]

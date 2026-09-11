@@ -10,14 +10,16 @@ mod types;
 mod version;
 
 pub use collection::SchemaDocCollection;
-#[allow(unused_imports)]
-pub use loader::{
-    LoadExpressError, LocalSchemaError, inspect_local_schema_name, load_express, load_local_schema,
-};
+
+pub use loader::{LoadExpressError, inspect_local_schema_name, load_local_schema};
+// `load_express` is only reached directly from tests; production code goes through
+// `load_official_schema`/`load_local_schema`.
+#[cfg(test)]
+pub use loader::load_express;
 pub use types::{
     AggregateBounds, AggregateKind, AggregateTypeRef, AliasTypeDef, BoundValue, EntityAttributeDoc,
     EntityDoc, EnumerationTypeDef, NamedTypeKind, NamedTypeRef, PrimitiveType, SchemaDoc,
-    SelectTypeDef, TypeDoc, TypeRef, WhereRuleDef, normalize_name,
+    SelectTypeDef, TypeDoc, TypeRef, normalize_name,
 };
 pub use version::IfcVersion;
 

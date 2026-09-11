@@ -47,7 +47,7 @@ pub fn load_express(version: IfcVersion, source: &str) -> Result<SchemaDoc, Load
     load_express_for_schema_name(version.schema_name(), source)
 }
 
-pub fn load_express_for_schema_name(
+fn load_express_for_schema_name(
     schema_name: &str,
     source: &str,
 ) -> Result<SchemaDoc, LoadExpressError> {
