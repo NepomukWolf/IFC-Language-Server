@@ -18,7 +18,7 @@ use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
     definition, document_highlight, document_symbols, hover, inlay_hints, references,
-    scaffold_completions, semantic_tokens, signature_help,
+    related_entities, scaffold_completions, semantic_tokens, signature_help,
 };
 use crate::schema::{
     SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -458,10 +458,17 @@ impl LanguageServer for Backend {
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
-                        code_action_kinds: Some(vec![CodeActionKind::SOURCE]),
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::SOURCE,
+                            CodeActionKind::new(related_entities::NAVIGATION_KIND),
+                        ]),
                         ..CodeActionOptions::default()
                     },
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![related_entities::GO_TO_RELATED_ENTITY_COMMAND.to_string()],
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
                 semantic_tokens_provider,
                 ..Default::default()
             },
@@ -556,20 +563,65 @@ impl LanguageServer for Backend {
     #[instrument(skip(self, params), fields(uri = %params.text_document.uri))]
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
+        let position = params.range.start;
         let requested_kinds = params.context.only.as_deref();
+        let forced_schema_name = self.config.read().await.forced_schema_name.clone();
 
         let documents = self.documents.read().await;
         let Some(document) = documents.get(&uri) else {
             return Ok(None);
         };
+        let schema_docs = self.schema_docs.read().await;
+        let schema_name = forced_schema_name
+            .as_deref()
+            .or(document.schema_name.as_deref());
+        let schema = schema_name.and_then(|schema_name| schema_docs.get(schema_name));
 
-        let result = scaffold_completions::code_actions(document, &uri, requested_kinds);
+        let mut actions =
+            scaffold_completions::code_actions(document, &uri, requested_kinds).unwrap_or_default();
+        if let Some(related) =
+            related_entities::code_actions(document, &uri, position, requested_kinds, schema)
+        {
+            actions.extend(related);
+        }
+        let result = (!actions.is_empty()).then_some(actions);
+
         debug!(
             result_count = result.as_ref().map_or(0, Vec::len),
             "code action request completed"
         );
 
         Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(command = %params.command))]
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if params.command != related_entities::GO_TO_RELATED_ENTITY_COMMAND {
+            return Ok(None);
+        }
+
+        let Some((uri, range)) = related_entities::parse_go_to_target(&params.arguments) else {
+            warn!("received goToRelatedEntity command with unparseable arguments");
+            return Ok(None);
+        };
+
+        if let Err(error) = self
+            .client
+            .show_document(ShowDocumentParams {
+                uri,
+                external: Some(false),
+                take_focus: Some(true),
+                selection: Some(range),
+            })
+            .await
+        {
+            warn!(error = ?error, "failed to show related entity document");
+        }
+
+        Ok(None)
     }
 
     #[instrument(skip(self, params), fields(uri = %params.text_document_position_params.text_document.uri))]

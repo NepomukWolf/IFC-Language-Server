@@ -7,6 +7,8 @@ use tower_lsp::lsp_types::{InlayHint, InlayHintKind, Range};
 use crate::document::Document;
 use crate::schema::SchemaDocCollection;
 
+use super::step_scan::{ScannedInstance, scan_instance, scan_instance_id};
+
 pub fn inlay_hints(
     document: &Document,
     range: Range,
@@ -63,12 +65,6 @@ pub fn inlay_hints(
     Some(hints)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ScannedInstance {
-    entity_name: String,
-    argument_starts: Vec<usize>,
-}
-
 fn scan_instances(document: &Document, scan_start: usize, scan_end: usize) -> Vec<ScannedInstance> {
     let bytes = document.text.as_bytes();
     let mut instances = Vec::new();
@@ -88,147 +84,6 @@ fn scan_instances(document: &Document, scan_start: usize, scan_end: usize) -> Ve
     }
 
     instances
-}
-
-fn scan_instance(text: &str, start: usize, scan_end: usize) -> Option<(ScannedInstance, usize)> {
-    let bytes = text.as_bytes();
-    let (_, mut offset) = scan_instance_id(bytes, start, scan_end)?;
-    offset = skip_trivia(bytes, offset, scan_end);
-    if bytes.get(offset) != Some(&b'=') {
-        return None;
-    }
-
-    offset = skip_trivia(bytes, offset + 1, scan_end);
-    let entity_start = offset;
-    offset = scan_identifier(bytes, offset, scan_end)?;
-    let entity_name = text.get(entity_start..offset)?.to_ascii_uppercase();
-    offset = skip_trivia(bytes, offset, scan_end);
-    if bytes.get(offset) != Some(&b'(') {
-        return None;
-    }
-
-    let (argument_starts, end) = scan_arguments(bytes, offset + 1, scan_end);
-    Some((
-        ScannedInstance {
-            entity_name,
-            argument_starts,
-        },
-        end,
-    ))
-}
-
-fn scan_arguments(bytes: &[u8], mut offset: usize, scan_end: usize) -> (Vec<usize>, usize) {
-    let mut argument_starts = Vec::new();
-    let mut expecting_argument = true;
-    let mut depth = 0usize;
-
-    while offset < scan_end {
-        if expecting_argument {
-            offset = skip_trivia(bytes, offset, scan_end);
-            match bytes.get(offset) {
-                Some(b')') if depth == 0 => return (argument_starts, offset + 1),
-                Some(b',') if depth == 0 => {
-                    offset += 1;
-                    continue;
-                }
-                None => break,
-                _ => {
-                    argument_starts.push(offset);
-                    expecting_argument = false;
-                }
-            }
-        }
-
-        match bytes[offset] {
-            b'\'' => offset = scan_string(bytes, offset, scan_end),
-            b'/' if bytes.get(offset + 1) == Some(&b'*') => {
-                offset = scan_block_comment(bytes, offset, scan_end);
-            }
-            b'(' => {
-                depth += 1;
-                offset += 1;
-            }
-            b')' if depth == 0 => return (argument_starts, offset + 1),
-            b')' => {
-                depth -= 1;
-                offset += 1;
-            }
-            b',' if depth == 0 => {
-                expecting_argument = true;
-                offset += 1;
-            }
-            _ => offset += 1,
-        }
-    }
-
-    (argument_starts, scan_end)
-}
-
-fn skip_trivia(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
-    loop {
-        while offset < scan_end && bytes[offset].is_ascii_whitespace() {
-            offset += 1;
-        }
-
-        if bytes.get(offset) == Some(&b'/') && bytes.get(offset + 1) == Some(&b'*') {
-            offset = scan_block_comment(bytes, offset, scan_end);
-            continue;
-        }
-
-        return offset;
-    }
-}
-
-fn scan_instance_id(bytes: &[u8], mut offset: usize, scan_end: usize) -> Option<(u32, usize)> {
-    offset += 1;
-    let digit_start = offset;
-    while offset < scan_end && bytes[offset].is_ascii_digit() {
-        offset += 1;
-    }
-    let id = std::str::from_utf8(bytes.get(digit_start..offset)?)
-        .ok()?
-        .parse()
-        .ok()?;
-    Some((id, offset))
-}
-
-fn scan_identifier(bytes: &[u8], mut offset: usize, scan_end: usize) -> Option<usize> {
-    if offset >= scan_end || !(bytes[offset].is_ascii_alphabetic() || bytes[offset] == b'_') {
-        return None;
-    }
-
-    offset += 1;
-    while offset < scan_end && (bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_') {
-        offset += 1;
-    }
-    Some(offset)
-}
-
-fn scan_string(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
-    offset += 1;
-    while offset < scan_end {
-        if bytes[offset] == b'\'' {
-            if bytes.get(offset + 1) == Some(&b'\'') && offset + 1 < scan_end {
-                offset += 2;
-            } else {
-                return offset + 1;
-            }
-        } else {
-            offset += 1;
-        }
-    }
-    scan_end
-}
-
-fn scan_block_comment(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
-    offset += 2;
-    while offset + 1 < scan_end {
-        if bytes[offset] == b'*' && bytes[offset + 1] == b'/' {
-            return offset + 2;
-        }
-        offset += 1;
-    }
-    scan_end
 }
 
 #[cfg(test)]
