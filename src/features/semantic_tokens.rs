@@ -111,7 +111,7 @@ fn split_token(
 
     for line in start_line..=end_line {
         let line_start = document.line_offsets[line];
-        let line_end = line_end_offset(&document.text, &document.line_offsets, line);
+        let line_end = document.line_end_offset(line)?;
         let segment_start = start.max(line_start);
         let segment_end = end.min(line_end);
         if segment_start < segment_end {
@@ -126,24 +126,6 @@ fn line_index_for_offset(line_offsets: &[usize], offset: usize) -> Option<usize>
     match line_offsets.binary_search(&offset) {
         Ok(line) => Some(line),
         Err(next_line) => next_line.checked_sub(1),
-    }
-}
-
-fn line_end_offset(text: &str, line_offsets: &[usize], line_index: usize) -> usize {
-    let line_start = line_offsets[line_index];
-    let next_line_start = line_offsets
-        .get(line_index + 1)
-        .copied()
-        .unwrap_or(text.len());
-    if next_line_start > line_start
-        && text
-            .as_bytes()
-            .get(next_line_start - 1)
-            .is_some_and(|byte| *byte == b'\n')
-    {
-        next_line_start - 1
-    } else {
-        next_line_start
     }
 }
 

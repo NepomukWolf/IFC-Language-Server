@@ -138,59 +138,47 @@ fn validate_named_type(
 ) -> Option<String> {
     let type_def = schema.type_decl(type_name)?;
     match type_def {
-        TypeDoc::Alias(alias) => {
-            if let ParameterValue::Typed {
-                type_name: inline_name,
-                inner,
-                ..
-            } = value
-            {
-                if inline_name != type_name {
-                    return Some(format!(
-                        "expected typed value `{}` but found `{}`",
-                        type_name, inline_name
-                    ));
-                }
-
-                if inner.len() != 1 {
-                    Some(format!(
-                        "typed value `{}` should contain exactly one argument",
-                        type_name
-                    ))
-                } else {
-                    validate_non_null_value(instances, schema, &inner[0], &alias.target)
-                }
-            } else {
-                validate_non_null_value(instances, schema, value, &alias.target)
-            }
-        }
-        TypeDoc::Enumeration(enum_def) => {
-            if let ParameterValue::Typed {
-                type_name: inline_name,
-                inner,
-                ..
-            } = value
-            {
-                if inline_name != type_name {
-                    return Some(format!(
-                        "expected typed value `{}` but found `{}`",
-                        type_name, inline_name
-                    ));
-                }
-
-                if inner.len() != 1 {
-                    Some(format!(
-                        "typed value `{}` should contain exactly one argument",
-                        type_name
-                    ))
-                } else {
-                    validate_enum_value(&inner[0], &enum_def.items)
-                }
-            } else {
-                validate_enum_value(value, &enum_def.items)
-            }
-        }
+        TypeDoc::Alias(alias) => match unwrap_inline_typed_value(value, type_name) {
+            Ok(value) => validate_non_null_value(instances, schema, value, &alias.target),
+            Err(message) => Some(message),
+        },
+        TypeDoc::Enumeration(enum_def) => match unwrap_inline_typed_value(value, type_name) {
+            Ok(value) => validate_enum_value(value, &enum_def.items),
+            Err(message) => Some(message),
+        },
         TypeDoc::Select(select) => validate_select(instances, schema, value, select),
+    }
+}
+
+/// Reduces an inline typed value such as `IFCLABEL('Name')` to the single payload that has to be
+/// checked against `type_name`'s underlying definition. Values that are not inline typed pass
+/// through unchanged; a wrong inline name or argument count yields the diagnostic message.
+fn unwrap_inline_typed_value<'a>(
+    value: &'a ParameterValue,
+    type_name: &str,
+) -> Result<&'a ParameterValue, String> {
+    let ParameterValue::Typed {
+        type_name: inline_name,
+        inner,
+        ..
+    } = value
+    else {
+        return Ok(value);
+    };
+
+    if inline_name != type_name {
+        return Err(format!(
+            "expected typed value `{}` but found `{}`",
+            type_name, inline_name
+        ));
+    }
+
+    match inner.as_slice() {
+        [single] => Ok(single),
+        _ => Err(format!(
+            "typed value `{}` should contain exactly one argument",
+            type_name
+        )),
     }
 }
 

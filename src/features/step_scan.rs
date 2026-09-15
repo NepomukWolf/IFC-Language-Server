@@ -166,7 +166,7 @@ pub(crate) fn scan_identifier(bytes: &[u8], mut offset: usize, scan_end: usize) 
     Some(offset)
 }
 
-fn scan_string(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
+pub(crate) fn scan_string(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
     offset += 1;
     while offset < scan_end {
         if bytes[offset] == b'\'' {
@@ -182,7 +182,7 @@ fn scan_string(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
     scan_end
 }
 
-fn scan_block_comment(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
+pub(crate) fn scan_block_comment(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
     offset += 2;
     while offset + 1 < scan_end {
         if bytes[offset] == b'*' && bytes[offset + 1] == b'/' {

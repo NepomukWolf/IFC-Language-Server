@@ -142,11 +142,7 @@ impl Backend {
         }
 
         let mut documents = self.documents.write().await;
-        for (document_uri, document) in documents.iter_mut() {
-            if document_uri != uri {
-                document.unload_parse_state();
-            }
-        }
+        unload_other_documents(&mut documents, uri);
 
         let document = documents
             .entry(uri.clone())
@@ -182,11 +178,7 @@ impl Backend {
     ) -> Option<DiagnosticSnapshot> {
         let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
         let mut documents = self.documents.write().await;
-        for (document_uri, document) in documents.iter_mut() {
-            if document_uri != uri {
-                document.unload_parse_state();
-            }
-        }
+        unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
         let mut parser = new_parser();
@@ -225,11 +217,7 @@ impl Backend {
             return Some(None);
         }
 
-        for (document_uri, document) in documents.iter_mut() {
-            if document_uri != uri {
-                document.unload_parse_state();
-            }
-        }
+        unload_other_documents(documents, uri);
 
         {
             let mut parser = new_parser();
@@ -388,6 +376,16 @@ impl Backend {
         );
         *self.schema_docs.write().await = schema_docs;
         *self.config.write().await = next_state;
+    }
+}
+
+/// Drops AST-backed parse state from every open document except `active_uri`.
+/// The backend keeps tree-sitter state for at most one document at a time.
+fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &Url) {
+    for (document_uri, document) in documents.iter_mut() {
+        if document_uri != active_uri {
+            document.unload_parse_state();
+        }
     }
 }
 

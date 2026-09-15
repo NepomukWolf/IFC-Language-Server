@@ -2,6 +2,8 @@
 //! It scans borrowed document text and emits absolute byte ranges so callers can decide how to
 //! convert tokens into protocol-specific positions.
 
+use crate::features::step_scan::{scan_block_comment, scan_string};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     Keyword,
@@ -94,33 +96,6 @@ fn push_if_intersects(
     }
 }
 
-fn scan_block_comment(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
-    offset += 2;
-    while offset + 1 < scan_end {
-        if bytes[offset] == b'*' && bytes[offset + 1] == b'/' {
-            return offset + 2;
-        }
-        offset += 1;
-    }
-    scan_end
-}
-
-fn scan_string(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
-    offset += 1;
-    while offset < scan_end {
-        if bytes[offset] == b'\'' {
-            if bytes.get(offset + 1) == Some(&b'\'') && offset + 1 < scan_end {
-                offset += 2;
-            } else {
-                return offset + 1;
-            }
-        } else {
-            offset += 1;
-        }
-    }
-    scan_end
-}
-
 fn scan_instance_id(bytes: &[u8], mut offset: usize, scan_end: usize) -> Option<usize> {
     offset += 1;
     let start = offset;
@@ -192,18 +167,22 @@ fn scan_identifier(bytes: &[u8], mut offset: usize, scan_end: usize) -> usize {
     offset
 }
 
+/// STEP P21 structural keywords highlighted as keywords rather than entity names.
+const STEP_KEYWORDS: [&[u8]; 8] = [
+    b"ISO",
+    b"HEADER",
+    b"ENDSEC",
+    b"DATA",
+    b"END",
+    b"FILE_DESCRIPTION",
+    b"FILE_NAME",
+    b"FILE_SCHEMA",
+];
+
 fn is_keyword(text: &[u8]) -> bool {
-    matches!(
-        text,
-        keyword if eq_ignore_ascii_case(keyword, b"ISO")
-            || eq_ignore_ascii_case(keyword, b"HEADER")
-            || eq_ignore_ascii_case(keyword, b"ENDSEC")
-            || eq_ignore_ascii_case(keyword, b"DATA")
-            || eq_ignore_ascii_case(keyword, b"END")
-            || eq_ignore_ascii_case(keyword, b"FILE_DESCRIPTION")
-            || eq_ignore_ascii_case(keyword, b"FILE_NAME")
-            || eq_ignore_ascii_case(keyword, b"FILE_SCHEMA")
-    )
+    STEP_KEYWORDS
+        .iter()
+        .any(|keyword| text.eq_ignore_ascii_case(keyword))
 }
 
 fn is_identifier_start(byte: u8) -> bool {
@@ -212,14 +191,6 @@ fn is_identifier_start(byte: u8) -> bool {
 
 fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 #[cfg(test)]

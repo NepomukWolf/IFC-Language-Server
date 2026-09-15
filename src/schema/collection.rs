@@ -10,7 +10,7 @@ use crate::schema::{EntityDoc, IfcVersion, SchemaDoc, normalize_name};
 
 #[derive(Debug, Default)]
 pub struct SchemaDocCollection {
-    pub docs: HashMap<String, Arc<SchemaDoc>>,
+    docs: HashMap<String, Arc<SchemaDoc>>,
     load_errors: Vec<String>,
 }
 

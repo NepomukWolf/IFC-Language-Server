@@ -121,8 +121,11 @@ fn related_targets(
     schema: &SchemaDoc,
 ) -> Vec<RelatedTarget> {
     let mut targets = Vec::new();
+    // Built at most once per request, and only when a cursor offset actually has to be mapped
+    // back to its enclosing `#id=` definition.
+    let mut sorted_defs = None;
 
-    let Some(self_id) = self_entity_id(document, position) else {
+    let Some(self_id) = self_entity_id(document, position, &mut sorted_defs) else {
         return targets;
     };
     let Some(reference_offsets) = document.references.get(&self_id) else {
@@ -136,7 +139,7 @@ fn related_targets(
         return targets;
     }
 
-    let sorted_defs = sorted_definitions(document);
+    let sorted_defs = sorted_defs.unwrap_or_else(|| sorted_definitions(document));
     let statement_scan_end = document.text.len();
     let mut seen = HashSet::new();
 
@@ -229,14 +232,18 @@ fn argument_span(
     Some((start, end))
 }
 
-fn self_entity_id(document: &Document, position: Position) -> Option<u32> {
+fn self_entity_id(
+    document: &Document,
+    position: Position,
+    sorted_defs: &mut Option<Vec<(usize, u32)>>,
+) -> Option<u32> {
     if let Some((id, _)) = document.id_token_at_position(position) {
         return Some(id);
     }
 
     let offset = document.position_to_offset(position)?;
-    let sorted_defs = sorted_definitions(document);
-    enclosing_definition_id(&sorted_defs, offset)
+    let sorted_defs = sorted_defs.get_or_insert_with(|| sorted_definitions(document));
+    enclosing_definition_id(sorted_defs, offset)
 }
 
 fn sorted_definitions(document: &Document) -> Vec<(usize, u32)> {
