@@ -26,24 +26,39 @@ pub fn hover(
     if let Some((id, offset)) = document.id_token_at_position(position)
         && document.definitions.get(&id) != Some(&offset)
     {
-        return Some(markdown_hover(
-            render_reference_hover(document, id)?,
-            document.id_range_at_offset(offset)?,
-        ));
+        let value = render_reference_hover(document, id)?;
+        let range = document.id_range_at_offset(offset)?;
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(range),
+        });
     }
 
     if let Some((keyword, range)) = header_keyword_at_position(document, position) {
-        return Some(markdown_hover(
-            render_header_keyword_hover(keyword)?.to_string(),
-            range,
-        ));
+        let value = render_header_keyword_hover(keyword)?.to_string();
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(range),
+        });
     }
 
     if let Some((entity_text, range)) = document.entity_name_at_position(position)
         && let Some(schema_name) = selected_schema_name.or(document.schema_name.as_deref())
         && let Some(entity_doc) = schema_docs.get_entity_doc(schema_name, &entity_text)
     {
-        return Some(markdown_hover(render_entity_hover(entity_doc), range));
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: render_entity_hover(entity_doc),
+            }),
+            range: Some(range),
+        });
     }
 
     if let Some((type_text, range)) = typed_value_name_at_position(document, position)
@@ -51,7 +66,13 @@ pub fn hover(
         && let Some(schema) = schema_docs.get(schema_name)
         && let Some(type_doc) = schema.type_decl(&type_text)
     {
-        return Some(markdown_hover(render_type_hover(type_doc), range));
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: render_type_hover(type_doc),
+            }),
+            range: Some(range),
+        });
     }
 
     if let Some(schema_name) = selected_schema_name.or(document.schema_name.as_deref())
@@ -59,34 +80,31 @@ pub fn hover(
         && let Some((range, attribute, enum_def)) =
             enum_value_at_position(document, schema, position)
     {
-        return Some(markdown_hover(
-            render_enum_hover(attribute, enum_def),
-            range,
-        ));
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: render_enum_hover(attribute, enum_def),
+            }),
+            range: Some(range),
+        });
     }
 
     if let Some(node) = document.node_at_position(position)
         && node.kind() == "omitted_value"
     {
         let context = ast::parameter_context(node, &document.text)?;
-        return Some(markdown_hover(
-            derived_value_hover(document, &context)?,
-            document.range_for_offsets(node.start_byte(), node.end_byte())?,
-        ));
+        let value = derived_value_hover(document, &context)?;
+        let range = document.range_for_offsets(node.start_byte(), node.end_byte())?;
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(range),
+        });
     }
 
     None
-}
-
-/// Wraps rendered markdown into the LSP hover shape used by every branch above.
-fn markdown_hover(value: String, range: Range) -> Hover {
-    Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value,
-        }),
-        range: Some(range),
-    }
 }
 
 fn render_entity_hover(entity_doc: &EntityDoc) -> String {
