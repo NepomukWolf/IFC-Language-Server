@@ -1,5 +1,6 @@
 // Smoke test for the wasm package: runs the server in-process over two web streams, opens a
-// sample model with one broken instance and expects a diagnostic for it plus a hover.
+// sample model with one broken instance and expects a diagnostic for it plus a hover, then checks
+// that `serve` resolves on a closed input and rejects when either stream fails.
 // Usage: bun wasm/smoke-test.mjs [pkg-dir]   (the `wasm-pack build --target web` output)
 
 import { readFile } from "node:fs/promises";
@@ -86,6 +87,17 @@ function check(condition, message) {
   console.log(`ok: ${message}`);
 }
 
+/** Settles `promise` within five seconds, as `{ resolved }`, `{ error }` or `{ timedOut }`. */
+function settled(promise) {
+  return Promise.race([
+    promise.then(
+      () => ({ resolved: true }),
+      (error) => ({ error }),
+    ),
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 5_000)),
+  ]);
+}
+
 setTimeout(() => {
   console.error("FAIL: timed out");
   process.exit(1);
@@ -127,5 +139,27 @@ check(JSON.stringify(hover.result ?? "").includes("IfcWall"), "hover documents I
 await request("shutdown", null);
 send({ method: "exit" });
 await writer.close();
-await served;
+check((await settled(served)).resolved, "serve resolves once input closes");
+
+const outputFailure = new Error("output failed");
+const { writable: hostInput, readable: serverInput } = new TransformStream();
+const failingOutput = new WritableStream({
+  write() {
+    throw outputFailure;
+  },
+});
+const hostWriter = hostInput.getWriter();
+const failedOutput = settled(serve(serverInput, failingOutput));
+const body = encoder.encode(
+  JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {} } }),
+);
+hostWriter.write(encoder.encode(`Content-Length: ${body.length}\r\n\r\n`));
+hostWriter.write(body);
+check((await failedOutput).error === outputFailure, "serve rejects when writing output fails");
+
+const inputFailure = new Error("input failed");
+const erroredInput = new ReadableStream({ start: (controller) => controller.error(inputFailure) });
+const failedInput = await settled(serve(erroredInput, new WritableStream()));
+check(failedInput.error === inputFailure, "serve rejects when input errors");
+
 process.exit(0);
