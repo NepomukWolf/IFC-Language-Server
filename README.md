@@ -75,9 +75,7 @@ cargo build --release
 
 ### WebAssembly
 
-The server also builds for `wasm32-unknown-unknown`, to run in a browser (for example in a Web Worker behind an in-browser editor). Releases include the package as `ifc-language-server-<version>-wasm32.tar.gz`.
-
-To build it yourself you need [`wasm-pack`](https://github.com/drager/wasm-pack) and an LLVM `clang` and `llvm-ar` with the wasm32 backend for tree-sitter's C code. On Linux, install your distribution's `clang` and `llvm` packages (for example `apt-get install clang llvm`):
+The server also builds for `wasm32-unknown-unknown`, to run in a browser. Releases include it as `ifc-language-server-<version>-wasm32.tar.gz`. To build it yourself you need [`wasm-pack`](https://github.com/drager/wasm-pack) and an LLVM `clang`/`llvm-ar` with the wasm32 backend (Linux: the `clang` and `llvm` packages; macOS: `brew install llvm`, then use `$(brew --prefix llvm)/bin/clang` and `.../llvm-ar`, since Apple's clang lacks the backend):
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -86,30 +84,7 @@ export CFLAGS_wasm32_unknown_unknown="-Wno-error=incompatible-pointer-types -Wno
 wasm-pack build --profile wasm-release --target web --no-pack
 ```
 
-On macOS, Apple's clang lacks the wasm32 backend, and Homebrew's LLVM is not on `PATH`, so point at it explicitly:
-
-```bash
-brew install llvm
-rustup target add wasm32-unknown-unknown
-export CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang"
-export AR_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/llvm-ar"
-export CFLAGS_wasm32_unknown_unknown="-Wno-error=incompatible-pointer-types -Wno-unused-parameter"
-wasm-pack build --profile wasm-release --target web --no-pack
-```
-
-The package in `pkg/` exports `serve(input, output)`. It takes a `ReadableStream` the client writes to and a `WritableStream` the server writes to, both carrying `Uint8Array` chunks of LSP base-protocol messages (`Content-Length` header, blank line, JSON-RPC body), exactly as on stdio. The returned promise resolves once `input` closes and the server has finished. If either stream fails (`input` errors, or a write to `output` fails or `output` is aborted), the server stops and the promise rejects with that stream's error.
-
-```js
-import init, { serve } from "./pkg/ifc_language_server.js";
-
-await init();
-const toServer = new TransformStream();
-const fromServer = new TransformStream();
-serve(toServer.readable, fromServer.writable).catch((error) => console.error("LSP transport failed", error));
-// Write framed requests to toServer.writable; read framed responses from fromServer.readable.
-```
-
-The server runs on the thread that calls `serve`, so run it in a worker to keep the page responsive. Options that point at local `.exp` files do not apply, since there is no file system. [`wasm/smoke-test.mjs`](./wasm/smoke-test.mjs) is a complete client that runs under Bun or Node.
+The package exports `serve(input, output)`: a `ReadableStream` and a `WritableStream` of `Uint8Array` chunks carrying LSP messages framed as on stdio. Its promise resolves when `input` closes and rejects with the stream's error if either stream fails. Run it in a Web Worker; options pointing at local `.exp` files don't apply. [`wasm/smoke-test.mjs`](./wasm/smoke-test.mjs) is a complete client.
 
 ### Configuration
 
