@@ -177,7 +177,7 @@ impl Backend {
             .check_ast_support(uri, text.len(), ast_file_size_limit_bytes)
             .await
         {
-            tokio::task::yield_now().await;
+            crate::rt::yield_now().await;
         }
 
         let mut documents = self.documents.write().await;
@@ -901,7 +901,7 @@ impl LanguageServer for Backend {
             warn!("semantic work limiter closed");
             return Ok(None);
         };
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::rt::spawn_blocking(move || {
             let _permit = permit;
             let instances = crate::document::build_entity_instances(tree.as_ref(), &text);
             document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())

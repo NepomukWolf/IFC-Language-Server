@@ -351,7 +351,9 @@ It does not evaluate general EXPRESS `WHERE` rules.
 ```text
 build.rs
 src/
+  lib.rs
   main.rs
+  rt.rs
   backend.rs
   config.rs
   document.rs

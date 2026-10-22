@@ -30,7 +30,7 @@ impl DiagnosticScheduler {
         let notify = Arc::new(Notify::new());
         let semantic_work = Arc::new(Semaphore::new(1));
 
-        tokio::spawn(run_worker(
+        crate::rt::spawn(run_worker(
             client,
             Arc::clone(&state),
             Arc::clone(&notify),
@@ -177,7 +177,7 @@ async fn run_worker(
             debug!(uri = %uri, generation, "skipping stale diagnostics job");
             continue;
         }
-        let diagnostics = match tokio::task::spawn_blocking(move || collect(job)).await {
+        let diagnostics = match crate::rt::spawn_blocking(move || collect(job)).await {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
                 warn!(uri = %uri, generation, %error, "diagnostics job failed");

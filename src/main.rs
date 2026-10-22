@@ -1,17 +1,8 @@
 //! Binary entrypoint for the IFC language server.
-//! It assembles the runtime modules, binds stdin/stdout to `tower-lsp`, and starts the single
-//! backend instance that serves all editor requests for the process lifetime.
+//! It binds stdin/stdout to `tower-lsp` and starts the single backend instance that serves all
+//! editor requests for the process lifetime.
 
-mod backend;
-mod config;
-mod diagnostics;
-mod document;
-mod document_index;
-mod features;
-mod schema;
-mod step;
-
-use backend::Backend;
+use ifc_language_server::Backend;
 use tower_lsp::{LspService, Server};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
