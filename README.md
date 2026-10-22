@@ -77,7 +77,7 @@ cargo build --release
 
 The server also builds for `wasm32-unknown-unknown`, to run in a browser (for example in a Web Worker behind an in-browser editor). Releases include the package as `ifc-language-server-<version>-wasm32.tar.gz`.
 
-To build it yourself you need [`wasm-pack`](https://github.com/drager/wasm-pack) and an LLVM `clang` with the wasm32 backend for tree-sitter's C code (Apple's clang lacks it; use `brew install llvm` on macOS):
+To build it yourself you need [`wasm-pack`](https://github.com/drager/wasm-pack) and an LLVM `clang` and `llvm-ar` with the wasm32 backend for tree-sitter's C code. On Linux, install your distribution's `clang` and `llvm` packages (for example `apt-get install clang llvm`):
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -86,7 +86,18 @@ export CFLAGS_wasm32_unknown_unknown="-Wno-error=incompatible-pointer-types -Wno
 wasm-pack build --profile wasm-release --target web --no-pack
 ```
 
-The package in `pkg/` exports `serve(input, output)`. It takes a `ReadableStream` the client writes to and a `WritableStream` the server writes to, both carrying `Uint8Array` chunks of LSP base-protocol messages (`Content-Length` header, blank line, JSON-RPC body), exactly as on stdio. The promise resolves once `input` closes.
+On macOS, Apple's clang lacks the wasm32 backend, and Homebrew's LLVM is not on `PATH`, so point at it explicitly:
+
+```bash
+brew install llvm
+rustup target add wasm32-unknown-unknown
+export CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang"
+export AR_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/llvm-ar"
+export CFLAGS_wasm32_unknown_unknown="-Wno-error=incompatible-pointer-types -Wno-unused-parameter"
+wasm-pack build --profile wasm-release --target web --no-pack
+```
+
+The package in `pkg/` exports `serve(input, output)`. It takes a `ReadableStream` the client writes to and a `WritableStream` the server writes to, both carrying `Uint8Array` chunks of LSP base-protocol messages (`Content-Length` header, blank line, JSON-RPC body), exactly as on stdio. The returned promise resolves once `input` closes and the server has finished. If either stream fails (`input` errors, or a write to `output` fails or `output` is aborted), the server stops and the promise rejects with that stream's error.
 
 ```js
 import init, { serve } from "./pkg/ifc_language_server.js";
@@ -94,7 +105,7 @@ import init, { serve } from "./pkg/ifc_language_server.js";
 await init();
 const toServer = new TransformStream();
 const fromServer = new TransformStream();
-serve(toServer.readable, fromServer.writable);
+serve(toServer.readable, fromServer.writable).catch((error) => console.error("LSP transport failed", error));
 // Write framed requests to toServer.writable; read framed responses from fromServer.readable.
 ```
 
