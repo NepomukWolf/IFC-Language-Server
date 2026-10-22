@@ -73,6 +73,33 @@ Build a release binary with:
 cargo build --release
 ```
 
+### WebAssembly
+
+The server also builds for `wasm32-unknown-unknown`, to run in a browser (for example in a Web Worker behind an in-browser editor). Releases include the package as `ifc-language-server-<version>-wasm32.tar.gz`.
+
+To build it yourself you need [`wasm-pack`](https://github.com/drager/wasm-pack) and an LLVM `clang` with the wasm32 backend for tree-sitter's C code (Apple's clang lacks it; use `brew install llvm` on macOS):
+
+```bash
+rustup target add wasm32-unknown-unknown
+export CC_wasm32_unknown_unknown=clang AR_wasm32_unknown_unknown=llvm-ar
+export CFLAGS_wasm32_unknown_unknown="-Wno-error=incompatible-pointer-types -Wno-unused-parameter"
+wasm-pack build --profile wasm-release --target web --no-pack
+```
+
+The package in `pkg/` exports `serve(input, output)`. It takes a `ReadableStream` the client writes to and a `WritableStream` the server writes to, both carrying `Uint8Array` chunks of LSP base-protocol messages (`Content-Length` header, blank line, JSON-RPC body), exactly as on stdio. The promise resolves once `input` closes.
+
+```js
+import init, { serve } from "./pkg/ifc_language_server.js";
+
+await init();
+const toServer = new TransformStream();
+const fromServer = new TransformStream();
+serve(toServer.readable, fromServer.writable);
+// Write framed requests to toServer.writable; read framed responses from fromServer.readable.
+```
+
+The server runs on the thread that calls `serve`, so run it in a worker to keep the page responsive. Options that point at local `.exp` files do not apply, since there is no file system. [`wasm/smoke-test.mjs`](./wasm/smoke-test.mjs) is a complete client that runs under Bun or Node.
+
 ### Configuration
 
 The server accepts configuration through LSP `initializationOptions`.
