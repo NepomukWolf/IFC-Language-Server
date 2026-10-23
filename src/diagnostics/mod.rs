@@ -38,6 +38,10 @@ impl DiagnosticSnapshot {
         self.tree.as_ref()
     }
 
+    pub fn shared_text(&self) -> &Arc<String> {
+        &self.text
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }

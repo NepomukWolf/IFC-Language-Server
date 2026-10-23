@@ -3,7 +3,7 @@
 //! each URI so rapid edits do not create an unbounded task or memory backlog.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tower_lsp::Client;
@@ -67,6 +67,29 @@ impl DiagnosticScheduler {
         }
     }
 
+    /// Schedules diagnostics for a snapshot produced outside an edit, such as a request-time
+    /// reload, unless the document's current generation was already scheduled with the same text
+    /// and schema.
+    #[instrument(skip(self, snapshot, schema), fields(uri = %uri))]
+    pub async fn schedule_if_inputs_changed(
+        &self,
+        uri: Url,
+        snapshot: DiagnosticSnapshot,
+        schema: Option<(String, Arc<SchemaDoc>)>,
+    ) {
+        let scheduled = self
+            .state
+            .lock()
+            .await
+            .schedule_if_inputs_changed(uri, snapshot, schema);
+        if scheduled {
+            self.notify.notify_one();
+            debug!("scheduled document diagnostics for changed inputs");
+        } else {
+            debug!("current diagnostics generation already covers these inputs");
+        }
+    }
+
     #[instrument(skip(self), fields(uri = %uri))]
     pub async fn invalidate(&self, uri: &Url) {
         self.state.lock().await.invalidate(uri);
@@ -76,6 +99,16 @@ impl DiagnosticScheduler {
     pub fn semantic_work(&self) -> Arc<Semaphore> {
         Arc::clone(&self.semantic_work)
     }
+
+    #[cfg(test)]
+    pub async fn current_generation(&self, uri: &Url) -> Option<u64> {
+        self.state
+            .lock()
+            .await
+            .current_generations
+            .get(uri)
+            .copied()
+    }
 }
 
 #[derive(Default)]
@@ -84,6 +117,37 @@ struct SchedulerState {
     current_generations: HashMap<Url, u64>,
     pending_jobs: HashMap<Url, DiagnosticJob>,
     pending_order: VecDeque<Url>,
+    scheduled_inputs: HashMap<Url, DiagnosticInputs>,
+}
+
+/// Identifies the text and schema a generation was scheduled with, without keeping either alive.
+struct DiagnosticInputs {
+    text: Weak<String>,
+    schema: Option<(String, Weak<SchemaDoc>)>,
+}
+
+impl DiagnosticInputs {
+    fn new(snapshot: &DiagnosticSnapshot, schema: Option<&(String, Arc<SchemaDoc>)>) -> Self {
+        Self {
+            text: Arc::downgrade(snapshot.shared_text()),
+            schema: schema.map(|(name, schema)| (name.clone(), Arc::downgrade(schema))),
+        }
+    }
+
+    fn matches(
+        &self,
+        snapshot: &DiagnosticSnapshot,
+        schema: Option<&(String, Arc<SchemaDoc>)>,
+    ) -> bool {
+        let same_schema = match (&self.schema, schema) {
+            (None, None) => true,
+            (Some((name, previous)), Some((next_name, next))) => {
+                name == next_name && std::ptr::eq(previous.as_ptr(), Arc::as_ptr(next))
+            }
+            _ => false,
+        };
+        same_schema && std::ptr::eq(self.text.as_ptr(), Arc::as_ptr(snapshot.shared_text()))
+    }
 }
 
 impl SchedulerState {
@@ -91,6 +155,7 @@ impl SchedulerState {
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         self.current_generations.insert(uri.clone(), generation);
+        self.scheduled_inputs.remove(&uri);
         self.pending_jobs.remove(&uri);
         self.pending_order.retain(|pending_uri| pending_uri != &uri);
         generation
@@ -106,6 +171,10 @@ impl SchedulerState {
             return false;
         }
 
+        self.scheduled_inputs.insert(
+            ticket.uri.clone(),
+            DiagnosticInputs::new(&snapshot, schema.as_ref()),
+        );
         let job = DiagnosticJob {
             uri: ticket.uri.clone(),
             generation: ticket.generation,
@@ -117,6 +186,24 @@ impl SchedulerState {
         }
 
         true
+    }
+
+    fn schedule_if_inputs_changed(
+        &mut self,
+        uri: Url,
+        snapshot: DiagnosticSnapshot,
+        schema: Option<(String, Arc<SchemaDoc>)>,
+    ) -> bool {
+        if self
+            .scheduled_inputs
+            .get(&uri)
+            .is_some_and(|inputs| inputs.matches(&snapshot, schema.as_ref()))
+        {
+            return false;
+        }
+
+        let generation = self.begin(uri.clone());
+        self.schedule(&DiagnosticTicket { uri, generation }, snapshot, schema)
     }
 
     fn take_next_job(&mut self) -> Option<DiagnosticJob> {
@@ -134,6 +221,7 @@ impl SchedulerState {
 
     fn invalidate(&mut self, uri: &Url) {
         self.current_generations.remove(uri);
+        self.scheduled_inputs.remove(uri);
         self.pending_jobs.remove(uri);
         self.pending_order.retain(|pending_uri| pending_uri != uri);
     }
@@ -308,6 +396,78 @@ mod tests {
             state.take_next_job().map(|job| job.generation),
             Some(reopened.generation)
         );
+    }
+
+    fn snapshot_of(text: &Arc<String>) -> DiagnosticSnapshot {
+        let mut document = Document::new_unloaded(String::new());
+        document.text = Arc::clone(text);
+        DiagnosticSnapshot::from_document(&document)
+    }
+
+    fn schema_doc() -> Arc<SchemaDoc> {
+        Arc::new(SchemaDoc {
+            entities: HashMap::new(),
+            types: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn skips_rescheduling_unchanged_text_and_schema() {
+        let mut state = SchedulerState::default();
+        let uri = uri("model");
+        let text = Arc::new("#1=IFCWALL($);".to_string());
+        let schema = schema_doc();
+        let ticket = begin(&mut state, uri.clone());
+        assert!(state.schedule(
+            &ticket,
+            snapshot_of(&text),
+            Some(("IFC4".to_string(), Arc::clone(&schema)))
+        ));
+        state.take_next_job();
+
+        assert!(!state.schedule_if_inputs_changed(
+            uri.clone(),
+            snapshot_of(&text),
+            Some(("IFC4".to_string(), schema))
+        ));
+        assert!(state.is_current(&uri, ticket.generation));
+        assert!(state.take_next_job().is_none());
+    }
+
+    #[test]
+    fn reschedules_when_text_or_schema_changed() {
+        let mut state = SchedulerState::default();
+        let uri = uri("model");
+        let text = Arc::new("#1=IFCWALL($);".to_string());
+        let schema = schema_doc();
+        let ticket = begin(&mut state, uri.clone());
+        assert!(state.schedule(&ticket, snapshot_of(&text), None));
+
+        let replaced_text = Arc::new(text.as_str().to_string());
+        assert!(state.schedule_if_inputs_changed(uri.clone(), snapshot_of(&replaced_text), None));
+        assert!(state.schedule_if_inputs_changed(
+            uri.clone(),
+            snapshot_of(&replaced_text),
+            Some(("IFC4".to_string(), Arc::clone(&schema)))
+        ));
+        assert!(state.schedule_if_inputs_changed(
+            uri.clone(),
+            snapshot_of(&replaced_text),
+            Some(("IFC4".to_string(), schema_doc()))
+        ));
+        assert!(!state.is_current(&uri, ticket.generation));
+    }
+
+    #[test]
+    fn reschedules_while_a_newer_generation_has_not_been_scheduled() {
+        let mut state = SchedulerState::default();
+        let uri = uri("model");
+        let text = Arc::new("#1=IFCWALL($);".to_string());
+        let ticket = begin(&mut state, uri.clone());
+        assert!(state.schedule(&ticket, snapshot_of(&text), None));
+        begin(&mut state, uri.clone());
+
+        assert!(state.schedule_if_inputs_changed(uri, snapshot_of(&text), None));
     }
 
     #[test]

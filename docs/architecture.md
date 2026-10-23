@@ -60,7 +60,7 @@ On AST-backed hover or document-symbol requests:
 1. `Backend::ensure_document_loaded` reloads the requested document if its AST-backed state was previously unloaded.
 2. Reloading one document unloads AST-backed state from the other open documents.
 3. Hover parses only the entity instances needed for the requested value. Document symbols build a transient full instance collection in bounded blocking work.
-4. If request-time reloading produced a diagnostic snapshot, it is submitted to the same background scheduler after the feature result is computed.
+4. If request-time reloading produced a diagnostic snapshot, it is submitted to the same background scheduler after the feature result is computed, unless the document's current diagnostics generation was already scheduled with the same text and schema.
 
 Definition, references, document-highlight, signature-help, and semantic-token range requests read
 the stored document text and text index only. These requests do not reload tree-sitter parse state
@@ -100,7 +100,7 @@ The server advertises:
 - `textDocument/semanticTokens/range`
 
 Diagnostics are published with `textDocument/publishDiagnostics` after background processing on
-open, change, and request-time reloads. The scheduler runs one diagnostic computation at a time,
+open, change, and request-time reloads whose text or schema differs from the last scheduled run. The scheduler runs one diagnostic computation at a time,
 keeps only the newest pending snapshot per URI, and discards stale results by generation.
 
 ## Logging
