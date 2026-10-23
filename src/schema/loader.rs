@@ -1,6 +1,6 @@
 //! Loading boundary for official and custom EXPRESS schema text.
 //! `load_express` converts EXPRESS text into a resolved `SchemaDoc`; the official schemas are
-//! bundled into the binary at compile time and parsed from those embedded strings at startup.
+//! bundled into the binary at compile time and parsed from those embedded strings on first use.
 
 use std::error::Error;
 use std::fmt;

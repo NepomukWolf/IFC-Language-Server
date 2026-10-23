@@ -10,6 +10,8 @@ mod types;
 mod version;
 
 pub use collection::SchemaDocCollection;
+#[cfg(test)]
+pub(crate) use collection::recording_official_schemas;
 
 pub use loader::{LoadExpressError, inspect_local_schema_name, load_local_schema};
 // `load_express` is only reached directly from tests; production code goes through
@@ -166,12 +168,12 @@ mod tests {
     fn loads_bundled_official_schemas() {
         let collection = SchemaDocCollection::new();
 
-        assert!(
-            collection.load_errors().is_empty(),
-            "{:?}",
-            collection.load_errors()
-        );
         for version in IfcVersion::supported() {
+            assert_eq!(
+                collection.official_schema_error(version.schema_name()),
+                None,
+                "{version} failed to load"
+            );
             assert!(
                 collection
                     .get(version.schema_name())
