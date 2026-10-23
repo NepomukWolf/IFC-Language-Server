@@ -619,6 +619,7 @@ dependencies = [
  "futures",
  "js-sys",
  "percent-encoding",
+ "serde",
  "serde_json",
  "sha2",
  "time",

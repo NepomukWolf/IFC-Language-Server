@@ -11,6 +11,8 @@
 - Go-to-definition for local entity references
 - Find-references within the current document
 - Document highlight for local STEP ids such as `#123`
+- Call hierarchy over instance references, with relationship instances as intermediate nodes
+- Model-query custom requests `ifc/instances`, `ifc/entityCounts` and `ifc/findInstances` (see [docs/instance-navigation.md](docs/instance-navigation.md))
 - Signature help for IFC entity parameter lists
 - Document symbols for editor Outline, breadcrumbs, and go-to-symbol navigation
 - IFC STEP boilerplate via `!ifc` / `!!ifc` / `!!!ifc` completions and empty-document code actions

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp::{Client, ClientSocket, LanguageServer, LspService};
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
@@ -17,8 +17,9 @@ use crate::diagnostics::DiagnosticSnapshot;
 use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
-    completions, definition, document_highlight, document_symbols, hover, inlay_hints, references,
-    related_entities, scaffold_completions, semantic_tokens, signature_help,
+    call_hierarchy, completions, definition, document_highlight, document_symbols, hover,
+    inlay_hints, instance_queries, instances, references, related_entities, scaffold_completions,
+    semantic_tokens, signature_help,
 };
 use crate::schema::{
     SchemaDoc, SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -71,6 +72,19 @@ impl Backend {
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
         }
+    }
+
+    /// The LSP service for one client: the standard language features plus the custom `ifc/*`
+    /// requests.
+    pub fn service() -> (LspService<Self>, ClientSocket) {
+        LspService::build(Self::new)
+            .custom_method(instances::METHOD, Self::instances)
+            .custom_method(instance_queries::ENTITY_COUNTS_METHOD, Self::entity_counts)
+            .custom_method(
+                instance_queries::FIND_INSTANCES_METHOD,
+                Self::find_instances,
+            )
+            .finish()
     }
 
     async fn ast_file_size_limit_bytes(&self) -> usize {
@@ -375,6 +389,116 @@ impl Backend {
         }
     }
 
+    #[instrument(skip(self, params), fields(uri = %params.uri))]
+    async fn instances(
+        &self,
+        params: instances::InstancesParams,
+    ) -> Result<Option<instances::Instances>> {
+        let uri = params.uri;
+        let mut documents = self.documents.write().await;
+        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(snapshot) => snapshot,
+            None => return Ok(None),
+        };
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        if document.ast_skipped {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
+                "{} needs a syntax tree, which is not built for files above the AST parsing limit",
+                instances::METHOD
+            )));
+        }
+        let schema_name = document.schema_name.clone();
+        let text = Arc::clone(&document.text);
+        let line_offsets = document.line_offsets.clone();
+        let tree = document.tree.clone();
+        drop(documents);
+
+        let schema = self.resolve_schema(schema_name.as_deref()).await;
+        let Ok(permit) = self
+            .diagnostic_scheduler
+            .semantic_work()
+            .acquire_owned()
+            .await
+        else {
+            warn!("semantic work limiter closed");
+            return Ok(None);
+        };
+        let result = crate::rt::spawn_blocking(move || {
+            let _permit = permit;
+            let collection = crate::document::build_entity_instances(tree.as_ref(), &text);
+            instances::instances(
+                &text,
+                &line_offsets,
+                &collection,
+                schema
+                    .as_ref()
+                    .map(|(name, schema)| (name.as_str(), schema.as_ref())),
+                params.limit,
+            )
+        })
+        .await
+        .map_err(|error| {
+            warn!(%error, "instances task failed");
+            tower_lsp::jsonrpc::Error::internal_error()
+        })?;
+
+        self.request_time_diagnostics(diagnostic_snapshot, &uri)
+            .await;
+        debug!(
+            total = result.total,
+            listed = result.instances.len(),
+            "instances request completed"
+        );
+
+        Ok(Some(result))
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.uri))]
+    async fn entity_counts(
+        &self,
+        params: instance_queries::EntityCountsParams,
+    ) -> Result<Option<instance_queries::EntityCounts>> {
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&params.uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = instance_queries::entity_counts(
+            document,
+            schema.as_ref().map(|(name, _)| name.as_str()),
+        );
+        debug!(total = result.total, "entity counts request completed");
+
+        Ok(Some(result))
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.uri))]
+    async fn find_instances(
+        &self,
+        params: instance_queries::FindInstancesParams,
+    ) -> Result<Option<instance_queries::FoundInstances>> {
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&params.uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = instance_queries::find_instances(
+            document,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            &params,
+        );
+        debug!(
+            total = result.as_ref().map_or(0, |result| result.total),
+            "find instances request completed"
+        );
+
+        Ok(result)
+    }
+
     #[instrument(skip(self, config), fields(ast_file_size_limit_bytes = config.ast_file_size_limit_bytes))]
     async fn apply_config(&self, config: ServerConfig) {
         let mut schema_docs = SchemaDocCollection::new();
@@ -499,6 +623,15 @@ fn completion_documentation_resolve_support(params: &InitializeParams) -> bool {
         })
 }
 
+/// The instance id in a call hierarchy item's `data`, which every item this server returns has.
+fn call_hierarchy_item_id(item: &CallHierarchyItem) -> Result<u32> {
+    call_hierarchy::item_id(item).ok_or_else(|| {
+        tower_lsp::jsonrpc::Error::invalid_params(
+            "call hierarchy item data does not name an instance id",
+        )
+    })
+}
+
 fn completion_trigger_characters() -> Vec<String> {
     ["!", "(", ",", "#", "."]
         .into_iter()
@@ -544,6 +677,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
@@ -914,6 +1048,90 @@ impl LanguageServer for Backend {
         debug!(
             result_count = result.as_ref().map_or(0, Vec::len),
             "find references request completed"
+        );
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.text_document_position_params.text_document.uri))]
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = call_hierarchy::prepare(
+            document,
+            &uri,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            position,
+        );
+        debug!(
+            found = result.is_some(),
+            "prepare call hierarchy request completed"
+        );
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.item.uri, item = %params.item.name))]
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let id = call_hierarchy_item_id(&params.item)?;
+        let uri = params.item.uri;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = call_hierarchy::incoming_calls(
+            document,
+            &uri,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            id,
+        );
+        debug!(
+            result_count = result.len(),
+            "incoming calls request completed"
+        );
+
+        Ok(Some(result))
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.item.uri, item = %params.item.name))]
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let id = call_hierarchy_item_id(&params.item)?;
+        let uri = params.item.uri;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = call_hierarchy::outgoing_calls(
+            document,
+            &uri,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            id,
+        );
+        debug!(
+            result_count = result.as_ref().map_or(0, Vec::len),
+            "outgoing calls request completed"
         );
 
         Ok(result)

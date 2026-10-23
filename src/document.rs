@@ -350,6 +350,43 @@ impl Document {
         self.range_for_offsets(start, end)
     }
 
+    /// The ranges of the id tokens at `offsets`. Offsets in ascending order are converted from the
+    /// previous one, so many tokens on one line cost no more than the line's length.
+    pub fn id_ranges_at_offsets(&self, offsets: &[usize]) -> Vec<Range> {
+        let mut cursor: Option<(usize, Position)> = None;
+        let mut position_at = |offset: usize| {
+            let position = match cursor {
+                Some((from, at))
+                    if from <= offset
+                        && self.text.is_char_boundary(offset)
+                        && self
+                            .line_offsets
+                            .get(at.line as usize + 1)
+                            .is_none_or(|&next| offset < next) =>
+                {
+                    let units: u32 = self.text[from..offset]
+                        .chars()
+                        .map(|character| character.len_utf16() as u32)
+                        .sum();
+                    Position::new(at.line, at.character + units)
+                }
+                _ => self.offset_to_position(offset)?,
+            };
+            cursor = Some((offset, position));
+            Some(position)
+        };
+        offsets
+            .iter()
+            .filter_map(|&offset| {
+                let (start, end, _) = self.id_token_at_offset(offset)?;
+                Some(Range {
+                    start: position_at(start)?,
+                    end: position_at(end)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn definition_range(&self, id: u32) -> Option<Range> {
         self.id_range_at_offset(*self.definitions.get(&id)?)
     }
@@ -359,6 +396,39 @@ impl Document {
         let (start, _, id) = self.id_token_at_offset(offset)?;
         self.references.get(&id)?.contains(&start).then_some(())?;
         Some((id, start))
+    }
+
+    /// Definition offsets and their ids, in document order.
+    pub fn definitions_in_order(&self) -> Vec<(usize, u32)> {
+        let mut definitions: Vec<(usize, u32)> = self
+            .definitions
+            .iter()
+            .map(|(&id, &offset)| (offset, id))
+            .collect();
+        definitions.sort_unstable();
+        definitions
+    }
+
+    /// The last `#id=` definition at or before `offset`, as its offset and id. Walks back from
+    /// `offset` and accepts only the `#` tokens the text index records as definitions, so ids in
+    /// strings and comments are passed over; the cost is the distance to that definition.
+    pub fn enclosing_definition(&self, offset: usize) -> Option<(usize, u32)> {
+        let bytes = self.text.as_bytes();
+        let mut end = offset.min(bytes.len().checked_sub(1)?);
+        loop {
+            let start = bytes[..=end].iter().rposition(|&byte| byte == b'#')?;
+            let digits = bytes[start + 1..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let id = self.text[start + 1..start + 1 + digits].parse::<u32>().ok();
+            if let Some(id) = id
+                && self.definitions.get(&id) == Some(&start)
+            {
+                return Some((start, id));
+            }
+            end = start.checked_sub(1)?;
+        }
     }
 
     pub fn entity_name_at_position(&self, position: Position) -> Option<(String, Range)> {
@@ -791,6 +861,21 @@ mod tests {
         assert_eq!(document.schema_name, None);
         assert_eq!(document.definitions.get(&1), Some(&0));
         assert_eq!(document.references.get(&1), Some(&vec![0]));
+    }
+
+    #[test]
+    fn enclosing_definition_skips_ids_that_are_not_definitions() {
+        let text = "DATA;\n#1=IFCWALL('#7=',$);\n#12=IFCX(#1,'#1=');\nENDSEC;";
+        let document = Document::new_unloaded(text.to_string());
+        let offset = |needle: &str| text.find(needle).expect("needle should exist");
+
+        let first = Some((offset("#1="), 1));
+        let second = Some((offset("#12="), 12));
+        assert_eq!(document.enclosing_definition(offset("$);")), first);
+        assert_eq!(document.enclosing_definition(offset("'#1=')")), second);
+        assert_eq!(document.enclosing_definition(offset("12=")), second);
+        assert_eq!(document.enclosing_definition(offset("ENDSEC")), second);
+        assert_eq!(document.enclosing_definition(offset("DATA")), None);
     }
 
     #[test]
