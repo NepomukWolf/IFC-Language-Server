@@ -188,11 +188,13 @@ impl Backend {
         unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
-        let mut parser = new_parser();
-        if let Err(error) =
-            document.apply_content_changes(&mut parser, &changes, ast_file_size_limit_bytes)
         {
-            warn!(?error, "received invalid incremental document change");
+            let mut parser = new_parser();
+            if let Err(error) =
+                document.apply_content_changes(&mut parser, &changes, ast_file_size_limit_bytes)
+            {
+                warn!(?error, "received invalid incremental document change");
+            }
         }
 
         info!(
@@ -226,11 +228,12 @@ impl Backend {
 
         unload_other_documents(documents, uri);
 
+        let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
         {
             let mut parser = new_parser();
             documents
                 .get_mut(uri)?
-                .reload_parse_state(&mut parser, self.ast_file_size_limit_bytes().await);
+                .reload_parse_state(&mut parser, ast_file_size_limit_bytes);
         }
 
         let snapshot = {
