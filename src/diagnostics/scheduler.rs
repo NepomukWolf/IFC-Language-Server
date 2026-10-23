@@ -11,6 +11,7 @@ use tower_lsp::lsp_types::Url;
 use tracing::{debug, instrument, warn};
 
 use crate::diagnostics::{self, DiagnosticSnapshot};
+use crate::document::drop_on_blocking_thread;
 use crate::schema::SchemaDoc;
 
 pub struct DiagnosticScheduler {
@@ -77,16 +78,20 @@ impl DiagnosticScheduler {
         snapshot: DiagnosticSnapshot,
         schema: Option<(String, Arc<SchemaDoc>)>,
     ) {
-        let scheduled = self
+        let skipped = self
             .state
             .lock()
             .await
             .schedule_if_inputs_changed(uri, snapshot, schema);
-        if scheduled {
-            self.notify.notify_one();
-            debug!("scheduled document diagnostics for changed inputs");
-        } else {
-            debug!("current diagnostics generation already covers these inputs");
+        match skipped {
+            None => {
+                self.notify.notify_one();
+                debug!("scheduled document diagnostics for changed inputs");
+            }
+            Some(snapshot) => {
+                debug!("current diagnostics generation already covers these inputs");
+                drop_on_blocking_thread(snapshot);
+            }
         }
     }
 
@@ -188,22 +193,25 @@ impl SchedulerState {
         true
     }
 
+    /// Returns the snapshot unscheduled when the current generation already covers its inputs, so
+    /// the caller can free it after releasing the scheduler lock.
     fn schedule_if_inputs_changed(
         &mut self,
         uri: Url,
         snapshot: DiagnosticSnapshot,
         schema: Option<(String, Arc<SchemaDoc>)>,
-    ) -> bool {
+    ) -> Option<DiagnosticSnapshot> {
         if self
             .scheduled_inputs
             .get(&uri)
             .is_some_and(|inputs| inputs.matches(&snapshot, schema.as_ref()))
         {
-            return false;
+            return Some(snapshot);
         }
 
         let generation = self.begin(uri.clone());
-        self.schedule(&DiagnosticTicket { uri, generation }, snapshot, schema)
+        self.schedule(&DiagnosticTicket { uri, generation }, snapshot, schema);
+        None
     }
 
     fn take_next_job(&mut self) -> Option<DiagnosticJob> {
@@ -425,11 +433,15 @@ mod tests {
         ));
         state.take_next_job();
 
-        assert!(!state.schedule_if_inputs_changed(
-            uri.clone(),
-            snapshot_of(&text),
-            Some(("IFC4".to_string(), schema))
-        ));
+        assert!(
+            state
+                .schedule_if_inputs_changed(
+                    uri.clone(),
+                    snapshot_of(&text),
+                    Some(("IFC4".to_string(), schema))
+                )
+                .is_some()
+        );
         assert!(state.is_current(&uri, ticket.generation));
         assert!(state.take_next_job().is_none());
     }
@@ -444,17 +456,29 @@ mod tests {
         assert!(state.schedule(&ticket, snapshot_of(&text), None));
 
         let replaced_text = Arc::new(text.as_str().to_string());
-        assert!(state.schedule_if_inputs_changed(uri.clone(), snapshot_of(&replaced_text), None));
-        assert!(state.schedule_if_inputs_changed(
-            uri.clone(),
-            snapshot_of(&replaced_text),
-            Some(("IFC4".to_string(), Arc::clone(&schema)))
-        ));
-        assert!(state.schedule_if_inputs_changed(
-            uri.clone(),
-            snapshot_of(&replaced_text),
-            Some(("IFC4".to_string(), schema_doc()))
-        ));
+        assert!(
+            state
+                .schedule_if_inputs_changed(uri.clone(), snapshot_of(&replaced_text), None)
+                .is_none()
+        );
+        assert!(
+            state
+                .schedule_if_inputs_changed(
+                    uri.clone(),
+                    snapshot_of(&replaced_text),
+                    Some(("IFC4".to_string(), Arc::clone(&schema)))
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .schedule_if_inputs_changed(
+                    uri.clone(),
+                    snapshot_of(&replaced_text),
+                    Some(("IFC4".to_string(), schema_doc()))
+                )
+                .is_none()
+        );
         assert!(!state.is_current(&uri, ticket.generation));
     }
 
@@ -467,7 +491,59 @@ mod tests {
         assert!(state.schedule(&ticket, snapshot_of(&text), None));
         begin(&mut state, uri.clone());
 
-        assert!(state.schedule_if_inputs_changed(uri, snapshot_of(&text), None));
+        assert!(
+            state
+                .schedule_if_inputs_changed(uri, snapshot_of(&text), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn frees_a_skipped_snapshot_on_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .expect("test runtime builds");
+        runtime.block_on(async {
+            let scheduler = DiagnosticScheduler {
+                state: Arc::new(Mutex::new(SchedulerState::default())),
+                notify: Arc::new(Notify::new()),
+                semantic_work: Arc::new(Semaphore::new(1)),
+            };
+            let uri = uri("model");
+            let text = Arc::new("#1=IFCWALL($);".to_string());
+            let ticket = scheduler.begin(uri.clone()).await;
+            scheduler.schedule(ticket, snapshot_of(&text), None).await;
+            drop(scheduler.state.lock().await.take_next_job());
+            let skipped = snapshot_of(&text);
+            let text = {
+                let weak = Arc::downgrade(&text);
+                drop(text);
+                weak
+            };
+
+            let (release_blocking_thread, blocked) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || blocked.recv());
+            scheduler
+                .schedule_if_inputs_changed(uri, skipped, None)
+                .await;
+            assert!(
+                text.upgrade().is_some(),
+                "skipped snapshot was freed inside the async handler"
+            );
+
+            release_blocking_thread
+                .send(())
+                .expect("blocker is waiting");
+            blocker
+                .await
+                .expect("blocker finishes")
+                .expect("blocker is released");
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("blocking pool runs");
+            assert!(text.upgrade().is_none());
+        });
     }
 
     #[test]

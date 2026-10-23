@@ -454,9 +454,8 @@ fn config_state_with_client_capabilities(
 }
 
 /// Drops AST-backed parse state from every open document except `active_uri`.
-/// The backend keeps tree-sitter state for at most one document at a time. Freeing the tree of a
-/// large document takes hundreds of milliseconds, so unloaded trees are freed on a blocking thread
-/// instead of inside the handler that switched documents.
+/// The backend keeps tree-sitter state for at most one document at a time. Unloaded trees are
+/// freed on a blocking thread instead of inside the handler that switched documents.
 fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &Url) {
     let mut unloaded_trees = Vec::new();
     for (document_uri, document) in documents.iter_mut() {
@@ -466,7 +465,7 @@ fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &U
         }
     }
     if !unloaded_trees.is_empty() {
-        tokio::task::spawn_blocking(move || drop(unloaded_trees));
+        crate::document::drop_on_blocking_thread(unloaded_trees);
     }
 }
 
