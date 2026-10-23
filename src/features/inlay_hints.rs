@@ -15,8 +15,8 @@ pub fn inlay_hints(
     schema_docs: &SchemaDocCollection,
     selected_schema_name: Option<&str>,
 ) -> Option<Vec<InlayHint>> {
-    let emit_start = document.position_to_offset(range.start)?;
-    let emit_end = document.position_to_offset(range.end)?;
+    let emit_start = document.clamped_position_to_offset(range.start)?;
+    let emit_end = document.clamped_position_to_offset(range.end)?;
     if emit_end < emit_start {
         return None;
     }
@@ -204,6 +204,23 @@ mod tests {
 
         assert_eq!(hints.len(), 4);
         assert!(hints.iter().all(|hint| hint.position.line == 1));
+    }
+
+    #[test]
+    fn clamps_range_ending_past_document_end() {
+        let text = "#1=IFCWALL('first',#2,$,*);\n#3=IFCWALL('second',#4,$,*);";
+        let document = Document::new_unloaded(text.to_string());
+
+        for end in [Position::new(2, 0), Position::new(1, 999)] {
+            let range = Range {
+                start: Position::new(0, 0),
+                end,
+            };
+            let hints = inlay_hints(&document, range, &schema_docs_with_wall(), Some("IFC4"))
+                .expect("range should be clamped");
+
+            assert_eq!(hints.len(), 8);
+        }
     }
 
     #[test]

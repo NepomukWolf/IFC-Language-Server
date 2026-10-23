@@ -29,8 +29,8 @@ pub fn legend() -> SemanticTokensLegend {
 }
 
 pub fn semantic_tokens_range(document: &Document, range: Range) -> Option<SemanticTokens> {
-    let emit_start = document.position_to_offset(range.start)?;
-    let emit_end = document.position_to_offset(range.end)?;
+    let emit_start = document.clamped_position_to_offset(range.start)?;
+    let emit_end = document.clamped_position_to_offset(range.end)?;
     if emit_end < emit_start {
         return None;
     }
@@ -170,6 +170,19 @@ mod tests {
                 .iter()
                 .all(|token| token.delta_line == 0 || token.delta_line == 1)
         );
+    }
+
+    #[test]
+    fn clamps_range_ending_past_document_end() {
+        let document = Document::new_unloaded("#1=IFCWALL(#2);\n#2=IFCDOOR();".to_string());
+        let range = Range {
+            start: Position::new(0, 0),
+            end: Position::new(2, 0),
+        };
+
+        let tokens = semantic_tokens_range(&document, range).expect("range should be clamped");
+
+        assert!(!tokens.data.is_empty());
     }
 
     #[test]
