@@ -260,8 +260,10 @@ impl Backend {
     #[instrument(skip(self, snapshot), fields(uri = %uri))]
     async fn request_time_diagnostics(&self, snapshot: Option<DiagnosticSnapshot>, uri: &Url) {
         if let Some(snapshot) = snapshot {
-            let ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
-            self.schedule_diagnostics(ticket, snapshot).await;
+            let schema = self.resolve_schema(snapshot.schema_name()).await;
+            self.diagnostic_scheduler
+                .schedule_if_inputs_changed(uri.clone(), snapshot, schema)
+                .await;
         }
     }
 
@@ -452,12 +454,18 @@ fn config_state_with_client_capabilities(
 }
 
 /// Drops AST-backed parse state from every open document except `active_uri`.
-/// The backend keeps tree-sitter state for at most one document at a time.
+/// The backend keeps tree-sitter state for at most one document at a time. Unloaded trees are
+/// freed on a blocking thread instead of inside the handler that switched documents.
 fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &Url) {
+    let mut unloaded_trees = Vec::new();
     for (document_uri, document) in documents.iter_mut() {
         if document_uri != active_uri {
+            unloaded_trees.extend(document.tree.take());
             document.unload_parse_state();
         }
+    }
+    if !unloaded_trees.is_empty() {
+        crate::document::drop_on_blocking_thread(unloaded_trees);
     }
 }
 
@@ -1186,6 +1194,72 @@ mod tests {
         assert!(next_state.semantic_tokens_enabled);
         assert!(next_state.completion_snippet_support);
         assert!(next_state.completion_documentation_resolve_support);
+    }
+
+    async fn open_document(backend: &Backend, uri: &Url, text: &str) {
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "ifc".to_string(),
+                    version: 1,
+                    text: text.to_string(),
+                },
+            })
+            .await;
+    }
+
+    async fn hover_at_start(backend: &Backend, uri: &Url) {
+        backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(0, 5),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("hover succeeds");
+    }
+
+    #[tokio::test]
+    async fn requests_that_reload_an_unchanged_document_do_not_rediagnose_it() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
+            normalize_name("IFC4"),
+            SchemaDoc {
+                entities: HashMap::new(),
+                types: HashMap::new(),
+            },
+        )]);
+        let large = Url::parse("file:///tmp/large.ifc").unwrap();
+        let other = Url::parse("file:///tmp/other.ifc").unwrap();
+        open_document(
+            backend,
+            &large,
+            "FILE_SCHEMA(('IFC4'));\n#1=IFCWALL('gid',$);\n",
+        )
+        .await;
+        open_document(backend, &other, "#1=IFCDOOR('gid',$);\n").await;
+        let scheduler = &backend.diagnostic_scheduler;
+        let large_generation = scheduler.current_generation(&large).await;
+        let other_generation = scheduler.current_generation(&other).await;
+
+        hover_at_start(backend, &large).await;
+        hover_at_start(backend, &other).await;
+        backend
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: large.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("document symbols succeed");
+
+        assert!(backend.documents.read().await[&large].is_parse_state_loaded());
+        assert_eq!(scheduler.current_generation(&large).await, large_generation);
+        assert_eq!(scheduler.current_generation(&other).await, other_generation);
     }
 
     #[test]
