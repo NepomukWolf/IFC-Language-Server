@@ -16,7 +16,9 @@ pub enum IfcVersion {
 }
 
 impl IfcVersion {
-    pub fn supported() -> [Self; 3] {
+    pub const SUPPORTED_COUNT: usize = 3;
+
+    pub fn supported() -> [Self; Self::SUPPORTED_COUNT] {
         [Self::Ifc2x3Tc1, Self::Ifc4Add2Tc1, Self::Ifc4x3Add2]
     }
 

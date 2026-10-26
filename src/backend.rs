@@ -125,16 +125,48 @@ impl Backend {
         }
 
         let schema_known = self.selected_schema_name(schema_name).await.is_some();
+        let load_error = match (schema_known, schema_name) {
+            (false, Some(schema_name)) => self
+                .schema_docs
+                .read()
+                .await
+                .official_schema_error(schema_name)
+                .map(|error| (schema_name.to_string(), error.to_string())),
+            _ => None,
+        };
+
         let mut warned = self.unknown_schema_warned.write().await;
-        if should_warn_unknown_schema(&mut warned, uri, schema_name, schema_known) {
+        if should_warn_unknown_schema(
+            &mut warned,
+            uri,
+            schema_name,
+            schema_known,
+            load_error.as_ref().map(|(_, error)| error.as_str()),
+        ) {
             drop(warned);
-            warn!("document schema is unknown or unsupported");
-            self.client
-                .show_message(
-                    MessageType::WARNING,
-                    "This IFC file uses an unknown or unsupported schema version. Schema-aware diagnostics and hover information may be incomplete.",
-                )
-                .await;
+            match load_error {
+                Some((schema_name, error)) => {
+                    warn!(schema_name, error, "bundled schema failed to load");
+                    self.client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!(
+                                "The bundled schema `{}` failed to load, so schema-aware diagnostics and hover information are unavailable: {error}",
+                                normalize_name(&schema_name)
+                            ),
+                        )
+                        .await;
+                }
+                None => {
+                    warn!("document schema is unknown or unsupported");
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "This IFC file uses an unknown or unsupported schema version. Schema-aware diagnostics and hover information may be incomplete.",
+                        )
+                        .await;
+                }
+            }
         }
     }
 
@@ -374,7 +406,7 @@ impl Backend {
 
     #[instrument(skip(self, config), fields(ast_file_size_limit_bytes = config.ast_file_size_limit_bytes))]
     async fn apply_config(&self, config: ServerConfig) {
-        let mut schema_docs = SchemaDocCollection::new();
+        let mut schema_docs = self.schema_docs.read().await.sharing_official();
         let mut next_state = {
             let current_state = self.config.read().await;
             config_state_with_client_capabilities(&config, &current_state)
@@ -575,11 +607,6 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("IFC LSP server initialized");
-
-        let load_errors = self.schema_docs.read().await.load_errors().to_vec();
-        for error in load_errors {
-            warn!(error, "failed to load bundled schema documentation");
-        }
 
         let pending_init_config = {
             let mut config = self.config.write().await;
@@ -1033,20 +1060,25 @@ fn append_completion_items(
     }
 }
 
-/// Records the schema name a document was last warned about and returns whether a new
-/// warning is due: once per document, and again only when its declared schema name changes.
+/// Records the reason a document was last warned about and returns whether a new warning is
+/// due: once per document, and again only when the reason changes (declared schema name, or
+/// a bundled schema's load error appearing, clearing, or changing text).
 fn should_warn_unknown_schema(
     warned: &mut HashMap<Url, Option<String>>,
     uri: &Url,
     schema_name: Option<&str>,
     schema_known: bool,
+    load_error: Option<&str>,
 ) -> bool {
     if schema_known {
         warned.remove(uri);
         return false;
     }
 
-    let current = schema_name.map(str::to_owned);
+    let current = match load_error {
+        Some(error) => Some(format!("error:{}:{error}", schema_name.unwrap_or(""))),
+        None => schema_name.map(str::to_owned),
+    };
     if warned.get(uri) == Some(&current) {
         return false;
     }
@@ -1059,13 +1091,14 @@ mod tests {
     use tower_lsp::LspService;
 
     use super::*;
+    use crate::schema::{IfcVersion, recording_official_schemas};
 
     fn warn_for(
         warned: &mut HashMap<Url, Option<String>>,
         uri: &Url,
         schema_name: Option<&str>,
     ) -> bool {
-        should_warn_unknown_schema(warned, uri, schema_name, false)
+        should_warn_unknown_schema(warned, uri, schema_name, false, None)
     }
 
     #[test]
@@ -1102,9 +1135,60 @@ mod tests {
             &mut warned,
             &uri,
             Some("IFC4"),
-            true
+            true,
+            None
         ));
         assert!(warn_for(&mut warned, &uri, Some("IFC4X3")));
+    }
+
+    #[test]
+    fn load_error_warning_is_sent_once_and_repeats_if_the_error_text_changes() {
+        let mut warned = HashMap::new();
+        let uri = Url::parse("file:///tmp/a.ifc").unwrap();
+
+        assert!(should_warn_unknown_schema(
+            &mut warned,
+            &uri,
+            Some("IFC4"),
+            false,
+            Some("broken")
+        ));
+        assert!(!should_warn_unknown_schema(
+            &mut warned,
+            &uri,
+            Some("IFC4"),
+            false,
+            Some("broken")
+        ));
+        assert!(should_warn_unknown_schema(
+            &mut warned,
+            &uri,
+            Some("IFC4"),
+            false,
+            Some("still broken")
+        ));
+    }
+
+    #[test]
+    fn warning_repeats_when_switching_between_generic_and_load_error_reasons() {
+        let mut warned = HashMap::new();
+        let uri = Url::parse("file:///tmp/a.ifc").unwrap();
+
+        assert!(warn_for(&mut warned, &uri, Some("IFC4")));
+        assert!(should_warn_unknown_schema(
+            &mut warned,
+            &uri,
+            Some("IFC4"),
+            false,
+            Some("broken")
+        ));
+        assert!(!should_warn_unknown_schema(
+            &mut warned,
+            &uri,
+            Some("IFC4"),
+            false,
+            Some("broken")
+        ));
     }
 
     #[tokio::test]
@@ -1155,6 +1239,73 @@ mod tests {
             .await
             .expect("forced schema resolves");
         assert_eq!(name, normalize_name("Forced"));
+    }
+
+    fn empty_schema() -> SchemaDoc {
+        SchemaDoc {
+            entities: HashMap::new(),
+            types: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn applying_config_twice_keeps_official_schemas_parsed_once() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let (official, parsed) = recording_official_schemas(|_| Ok(empty_schema()));
+        *backend.schema_docs.write().await = SchemaDocCollection::with_official(official);
+
+        let (_, before_reload) = backend.resolve_schema(Some("IFC4")).await.unwrap();
+        backend.apply_config(ServerConfig::default()).await;
+        backend.apply_config(ServerConfig::default()).await;
+        let (_, after_reload) = backend.resolve_schema(Some("IFC4")).await.unwrap();
+
+        assert!(Arc::ptr_eq(&before_reload, &after_reload));
+        assert_eq!(*parsed.lock().unwrap(), [IfcVersion::Ifc4Add2Tc1]);
+    }
+
+    #[tokio::test]
+    async fn forced_local_schema_replaces_official_schema_of_same_name() {
+        let path = std::env::temp_dir().join(format!("ifc-ls-{}.exp", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "SCHEMA IFC4;\nENTITY IfcLocalOnly;\nEND_ENTITY;\nEND_SCHEMA;\n",
+        )
+        .unwrap();
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let (official, parsed) = recording_official_schemas(|_| Ok(empty_schema()));
+        *backend.schema_docs.write().await = SchemaDocCollection::with_official(official);
+
+        backend
+            .apply_config(ServerConfig {
+                overwrite_exp_schema_with_local: Some(path.clone()),
+                ..ServerConfig::default()
+            })
+            .await;
+        let resolved = backend.resolve_schema(Some("IFC4")).await;
+        std::fs::remove_file(&path).unwrap();
+
+        let (name, schema) = resolved.expect("local schema resolves");
+        assert_eq!(name, "IFC4");
+        assert!(schema.entity("IfcLocalOnly").is_some());
+        assert!(parsed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_official_schema_is_not_retried_after_config_reload() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let (official, parsed) = recording_official_schemas(|_| Err("broken".to_string()));
+        *backend.schema_docs.write().await = SchemaDocCollection::with_official(official);
+
+        assert!(backend.resolve_schema(Some("IFC4")).await.is_none());
+        backend.apply_config(ServerConfig::default()).await;
+        assert!(backend.resolve_schema(Some("IFC4")).await.is_none());
+
+        let schema_docs = backend.schema_docs.read().await;
+        assert_eq!(schema_docs.official_schema_error("IFC4"), Some("broken"));
+        assert_eq!(*parsed.lock().unwrap(), [IfcVersion::Ifc4Add2Tc1]);
     }
 
     #[test]
