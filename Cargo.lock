@@ -571,6 +571,7 @@ name = "ifc-language-server"
 version = "0.6.0"
 dependencies = [
  "espr",
+ "percent-encoding",
  "serde_json",
  "sha2",
  "time",

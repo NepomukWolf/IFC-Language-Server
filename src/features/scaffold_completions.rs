@@ -5,6 +5,7 @@
 use crate::document::Document;
 use crate::features::ifc_guid::new_guid;
 use crate::schema::IfcVersion;
+use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tower_lsp::lsp_types::{
@@ -303,10 +304,10 @@ fn step_timestamp(timestamp: OffsetDateTime) -> String {
 }
 
 fn file_name_from_uri(uri: &Url) -> String {
-    uri.to_file_path()
-        .ok()
-        .and_then(|path| path.file_name().map(|file_name| file_name.to_owned()))
-        .and_then(|file_name| file_name.into_string().ok())
+    uri.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .and_then(|segment| percent_decode_str(segment).decode_utf8().ok())
+        .map(String::from)
         .filter(|file_name| !file_name.is_empty())
         .unwrap_or_else(|| "model.ifc".to_string())
 }
@@ -466,6 +467,22 @@ mod tests {
                 .expect("expected completion");
 
         assert!(new_text.contains("FILE_NAME('test.ifc'"));
+    }
+
+    #[test]
+    fn takes_file_name_from_any_hierarchical_uri() {
+        let uri = |text: &str| Url::parse(text).expect("URI should be valid");
+
+        assert_eq!(
+            file_name_from_uri(&uri("file:///C:/tmp/my%20model.ifc")),
+            "my model.ifc"
+        );
+        assert_eq!(
+            file_name_from_uri(&uri("inmemory://model/house.ifc")),
+            "house.ifc"
+        );
+        assert_eq!(file_name_from_uri(&uri("file:///tmp/")), "model.ifc");
+        assert_eq!(file_name_from_uri(&uri("untitled:Untitled-1")), "model.ifc");
     }
 
     #[test]
