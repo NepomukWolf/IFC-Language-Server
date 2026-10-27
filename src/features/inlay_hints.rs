@@ -42,8 +42,10 @@ pub fn inlay_hints(
             continue;
         };
 
-        for (argument_start, attribute) in
-            instance.argument_starts.into_iter().zip(&entity.attributes)
+        for (argument_start, attribute) in instance
+            .argument_starts()
+            .into_iter()
+            .zip(&entity.attributes)
         {
             if argument_start < emit_start || argument_start >= emit_end {
                 continue;
