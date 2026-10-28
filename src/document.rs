@@ -319,6 +319,27 @@ impl Document {
         (utf16_units == position.character).then_some(line_end)
     }
 
+    /// Like `position_to_offset`, but a line past the last line maps to the end of the
+    /// text and a character past the end of a line maps to the end of that line.
+    pub fn clamped_position_to_offset(&self, position: Position) -> Option<usize> {
+        let line_index = position.line as usize;
+        if line_index >= self.line_offsets.len() {
+            return Some(self.text.len());
+        }
+        let line_start = self.line_offsets[line_index];
+        let line_end = self.line_end_offset(line_index)?;
+        let line_utf16_len: usize = self
+            .text
+            .get(line_start..line_end)?
+            .chars()
+            .map(char::len_utf16)
+            .sum();
+        if position.character as usize >= line_utf16_len {
+            return Some(line_end);
+        }
+        self.position_to_offset(position)
+    }
+
     pub fn offset_to_position(&self, offset: usize) -> Option<Position> {
         if offset > self.text.len() || !self.text.is_char_boundary(offset) {
             return None;
@@ -996,6 +1017,29 @@ mod tests {
             .expect("change should be valid");
         assert!(!document.ast_skipped);
         assert!(document.has_ast());
+    }
+
+    #[test]
+    fn clamped_position_to_offset_clamps_past_line_and_document_end() {
+        let document = parse_document("ab😀\ncd\n");
+
+        assert_eq!(
+            document.clamped_position_to_offset(Position::new(0, 1)),
+            Some(1)
+        );
+        assert_eq!(
+            document.clamped_position_to_offset(Position::new(0, 99)),
+            Some(6)
+        );
+        assert_eq!(
+            document.clamped_position_to_offset(Position::new(1, 99)),
+            Some(9)
+        );
+        assert_eq!(
+            document.clamped_position_to_offset(Position::new(99, 0)),
+            Some(document.text.len())
+        );
+        assert_eq!(document.position_to_offset(Position::new(0, 99)), None);
     }
 
     #[test]
