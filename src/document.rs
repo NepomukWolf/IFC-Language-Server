@@ -558,10 +558,13 @@ pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstance
 pub fn build_entity_type_index(tree: Option<&Tree>, text: &str) -> EntityTypeIndex {
     let mut index = EntityTypeIndex::default();
 
-    if let Some(tree) = tree {
-        let mut cursor = tree.root_node().walk();
-        traverse_headers(&mut cursor, text, &mut index);
-    }
+    for_each_entity_node(tree, |node| {
+        if let Some(instance) = parse_entity_header(node, text)
+            && let Some(id) = instance.id
+        {
+            index.entity_names_by_id.insert(id, instance.entity_name);
+        }
+    });
 
     index
 }
@@ -613,17 +616,23 @@ fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInsta
     }
 }
 
-fn traverse_headers(cursor: &mut TreeCursor, text: &str, index: &mut EntityTypeIndex) {
+pub(crate) fn for_each_entity_node<'a>(tree: Option<&'a Tree>, mut visit: impl FnMut(Node<'a>)) {
+    if let Some(tree) = tree {
+        visit_entity_nodes(&mut tree.root_node().walk(), &mut visit);
+    }
+}
+
+fn visit_entity_nodes<'a>(cursor: &mut TreeCursor<'a>, visit: &mut impl FnMut(Node<'a>)) {
     loop {
         let node = cursor.node();
-        if node.kind() == "entity_instance"
-            && let Some((Some(id), entity_name)) = parse_entity_identity(node, text)
-        {
-            index.entity_names_by_id.insert(id, entity_name);
+        let is_entity = node.kind() == "entity_instance";
+        if is_entity {
+            visit(node);
         }
 
-        if cursor.goto_first_child() {
-            traverse_headers(cursor, text, index);
+        // Valid entity parameters cannot contain entity instances; error recovery can.
+        if (!is_entity || node.has_error()) && cursor.goto_first_child() {
+            visit_entity_nodes(cursor, visit);
             cursor.goto_parent();
         }
 
@@ -633,40 +642,24 @@ fn traverse_headers(cursor: &mut TreeCursor, text: &str, index: &mut EntityTypeI
     }
 }
 
-fn parse_entity_identity(node: Node<'_>, text: &str) -> Option<(Option<u32>, String)> {
+pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+    let mut instance = parse_entity_header(node, text)?;
     let mut cursor = node.walk();
-    let mut id = None;
-    let mut entity_name = None;
-
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "instance_id" => {
-                id = child
-                    .utf8_text(text.as_bytes())
-                    .ok()
-                    .and_then(|value| value.trim_start_matches('#').parse::<u32>().ok());
-            }
-            "entity_name" => {
-                entity_name = child
-                    .utf8_text(text.as_bytes())
-                    .ok()
-                    .map(|value| value.to_ascii_uppercase());
-            }
-            _ => {}
+        if child.kind() == "parameter_list" {
+            instance.parameters = parse_parameter_list(child, text);
         }
     }
-
-    Some((id, entity_name?))
+    Some(instance)
 }
 
-pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+fn parse_entity_header(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
     let mut entity_name = None;
     let mut entity_name_range = None;
     let mut parameter_list_range = None;
-    let mut parameters = Vec::new();
 
     for child in node.children(&mut child_cursor) {
         match child.kind() {
@@ -682,7 +675,6 @@ pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<Entity
             }
             "parameter_list" => {
                 parameter_list_range = Some(node_range(&child));
-                parameters = parse_parameter_list(child, text);
             }
             _ => {}
         }
@@ -695,7 +687,7 @@ pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<Entity
         entity_name_range: entity_name_range?,
         entity_range: node_range(&node),
         parameter_list_range,
-        parameters,
+        parameters: Vec::new(),
     })
 }
 

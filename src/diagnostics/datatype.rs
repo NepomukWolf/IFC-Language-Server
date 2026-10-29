@@ -42,57 +42,17 @@ pub fn collect_streaming(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    if let Some(tree) = tree {
-        let mut cursor = tree.root_node().walk();
-        collect_streaming_entities(
-            &mut cursor,
-            text,
-            entity_types,
-            schema,
-            schema_name,
-            &mut diagnostics,
-        );
-    }
-
-    diagnostics
-}
-
-fn collect_streaming_entities(
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    text: &str,
-    entity_types: &EntityTypeIndex,
-    schema: &SchemaDoc,
-    schema_name: Option<&str>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    loop {
-        let node = cursor.node();
-        if node.kind() == "entity_instance"
-            && let Some(instance) = crate::document::parse_entity_instance(node, text)
-        {
+    crate::document::for_each_entity_node(tree, |node| {
+        if let Some(instance) = crate::document::parse_entity_instance(node, text) {
             if let Some(entity) = schema.entity(&instance.entity_name) {
-                validate_instance(entity_types, schema, entity, &instance, diagnostics);
+                validate_instance(entity_types, schema, entity, &instance, &mut diagnostics);
             } else {
                 diagnostics.push(unknown_entity_diagnostic(&instance, schema_name));
             }
         }
+    });
 
-        if cursor.goto_first_child() {
-            collect_streaming_entities(
-                cursor,
-                text,
-                entity_types,
-                schema,
-                schema_name,
-                diagnostics,
-            );
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
+    diagnostics
 }
 
 fn validate_instance(
@@ -571,16 +531,41 @@ mod tests {
 
     #[test]
     fn streaming_validation_matches_collection_validation() {
-        let text = "#1=IFCWALL('gid',#2);\n#2=IFCWALL('gid2',$);";
+        let schema = schema_from(
+            r#"
+            SCHEMA IFC4;
+              ENTITY IfcTarget; END_ENTITY;
+              ENTITY IfcChild SUBTYPE OF (IfcTarget); END_ENTITY;
+              ENTITY IfcOther; END_ENTITY;
+              ENTITY IfcHolder;
+                A : LIST [1:?] OF IfcTarget;
+                B : LIST [1:?] OF IfcTarget;
+                C : IfcTarget;
+                D : IfcTarget;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        );
+        let text = "#1=IFCHOLDER((#2,#3),(#9),#4,#5);\n#2=IFCCHILD();\n#3=IFCOTHER();\n#4=IFCTARGET();\n#4=IFCOTHER();\n#5=IFCCHILD();";
         let document = parse_document(text);
         let instances = instances(&document);
-        let schema = test_schema();
 
         let collected = collect_with_schema_name(&instances, &schema, None);
         let index = crate::document::build_entity_type_index(document.tree.as_ref(), text);
         let streamed = collect_streaming(document.tree.as_ref(), text, &index, &schema, None);
 
         assert_eq!(streamed, collected);
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "A: expected reference to `IFCTARGET` but `#3` points to `IFCOTHER`",
+                "B: reference `#9` does not resolve to a local entity",
+                "C: expected reference to `IFCTARGET` but `#4` points to `IFCOTHER`",
+            ]
+        );
     }
 
     /// Test that the datatype validator allows omitted (`*`) values for inherited
