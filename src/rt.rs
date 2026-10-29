@@ -26,6 +26,16 @@ pub async fn spawn_blocking<T>(work: impl FnOnce() -> T) -> Result<T, std::conve
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_blocking_detached(work: impl FnOnce() + Send + 'static) {
+    tokio::task::spawn_blocking(work);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_blocking_detached(work: impl FnOnce()) {
+    work();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn yield_now() {
     tokio::task::yield_now().await;
 }

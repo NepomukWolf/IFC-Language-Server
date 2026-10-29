@@ -532,7 +532,7 @@ impl Document {
 /// Freeing the tree of a large document takes hundreds of milliseconds, so values that may own the
 /// last reference to one are dropped on a blocking thread instead of inside an async handler.
 pub fn drop_on_blocking_thread<T: Send + 'static>(value: T) {
-    tokio::task::spawn_blocking(move || drop(value));
+    crate::rt::spawn_blocking_detached(move || drop(value));
 }
 
 pub(crate) fn is_identifier_part(byte: u8) -> bool {
