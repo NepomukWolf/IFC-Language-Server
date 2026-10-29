@@ -774,9 +774,9 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                 .unwrap_or_default();
             ParameterValue::List { items, range }
         }
-        "compact_number_list" => {
+        "compact_number_list" | "compact_reference_list" => {
             let range = node_range(&node);
-            let value = node.utf8_text(text.as_bytes()).expect("numeric list text");
+            let value = node.utf8_text(text.as_bytes()).expect("compact list text");
             let mut position = point_after_text(node.start_position(), "(");
             let items = value[1..value.len() - 1]
                 .split(',')
@@ -786,12 +786,20 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                     let start = point_after_text(position, &part[..leading]);
                     let end = point_after_text(start, item);
                     position = point_after_text(point_after_text(position, part), ",");
-                    ParameterValue::Number {
-                        text: item.to_string(),
-                        range: Range {
-                            start: Position::new(start.row as u32, start.column as u32),
-                            end: Position::new(end.row as u32, end.column as u32),
-                        },
+                    let range = Range {
+                        start: Position::new(start.row as u32, start.column as u32),
+                        end: Position::new(end.row as u32, end.column as u32),
+                    };
+                    if let Some(id) = item.strip_prefix('#') {
+                        match id.parse::<u32>() {
+                            Ok(id) => ParameterValue::Reference { id, range },
+                            Err(_) => ParameterValue::Unknown { range },
+                        }
+                    } else {
+                        ParameterValue::Number {
+                            text: item.to_string(),
+                            range,
+                        }
                     }
                 })
                 .collect();
@@ -904,6 +912,31 @@ mod tests {
                 ParameterValue::Number {
                     text: ".75".into(),
                     range: Range::new(Position::new(1, 8), Position::new(1, 11))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_aggregate_preserves_ranges_and_overflow() {
+        let document = parse_document("#1=IFCPOLYLINE((#12,\n #4294967296,#3));");
+        let instances = build_entity_instances(document.tree.as_ref(), &document.text);
+        let ParameterValue::List { items, .. } = &instances.instances[0].parameters[0] else {
+            panic!("reference aggregate expected");
+        };
+        assert_eq!(
+            items,
+            &vec![
+                ParameterValue::Reference {
+                    id: 12,
+                    range: Range::new(Position::new(0, 16), Position::new(0, 19))
+                },
+                ParameterValue::Unknown {
+                    range: Range::new(Position::new(1, 1), Position::new(1, 12))
+                },
+                ParameterValue::Reference {
+                    id: 3,
+                    range: Range::new(Position::new(1, 13), Position::new(1, 15))
                 },
             ]
         );
