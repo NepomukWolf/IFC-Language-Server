@@ -17,8 +17,9 @@ use crate::diagnostics::DiagnosticSnapshot;
 use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
 use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
 use crate::features::{
-    completions, definition, document_highlight, document_symbols, hover, inlay_hints, references,
-    related_entities, scaffold_completions, semantic_tokens, signature_help,
+    call_hierarchy, completions, definition, document_highlight, document_symbols, hover,
+    inlay_hints, references, related_entities, scaffold_completions, semantic_tokens,
+    signature_help,
 };
 use crate::schema::{
     SchemaDoc, SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -539,6 +540,15 @@ fn completion_documentation_resolve_support(params: &InitializeParams) -> bool {
         })
 }
 
+/// The instance id in a call hierarchy item's `data`, which every item this server returns has.
+fn call_hierarchy_item_id(item: &CallHierarchyItem) -> Result<u32> {
+    call_hierarchy::item_id(item).ok_or_else(|| {
+        tower_lsp::jsonrpc::Error::invalid_params(
+            "call hierarchy item data does not name an instance id",
+        )
+    })
+}
+
 fn completion_trigger_characters() -> Vec<String> {
     ["!", "(", ",", "#", "."]
         .into_iter()
@@ -584,6 +594,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
@@ -949,6 +960,90 @@ impl LanguageServer for Backend {
         debug!(
             result_count = result.as_ref().map_or(0, Vec::len),
             "find references request completed"
+        );
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.text_document_position_params.text_document.uri))]
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = call_hierarchy::prepare(
+            document,
+            &uri,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            position,
+        );
+        debug!(
+            found = result.is_some(),
+            "prepare call hierarchy request completed"
+        );
+
+        Ok(result)
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.item.uri, item = %params.item.name))]
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let id = call_hierarchy_item_id(&params.item)?;
+        let uri = params.item.uri;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = call_hierarchy::incoming_calls(
+            document,
+            &uri,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            id,
+        );
+        debug!(
+            result_count = result.len(),
+            "incoming calls request completed"
+        );
+
+        Ok(Some(result))
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.item.uri, item = %params.item.name))]
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let id = call_hierarchy_item_id(&params.item)?;
+        let uri = params.item.uri;
+
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = call_hierarchy::outgoing_calls(
+            document,
+            &uri,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            id,
+        );
+        debug!(
+            result_count = result.as_ref().map_or(0, Vec::len),
+            "outgoing calls request completed"
         );
 
         Ok(result)
