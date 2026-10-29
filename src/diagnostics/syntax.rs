@@ -28,8 +28,9 @@ fn collect_error_nodes(
         }
 
         // An ERROR node's range covers everything nested in it, including the leaf ERROR
-        // that tree-sitter creates for a token the lexer cannot recognize.
-        if !node.is_error() && cursor.goto_first_child() {
+        // that tree-sitter creates for a token the lexer cannot recognize. `has_error` is also
+        // true on every ancestor of a MISSING node.
+        if !node.is_error() && node.has_error() && cursor.goto_first_child() {
             collect_error_nodes(cursor, diagnostics);
             cursor.goto_parent();
         }
@@ -124,5 +125,39 @@ mod tests {
 
         assert_eq!(diagnostic.range.start, Position::new(0, 17));
         assert_eq!(diagnostic.range.end, Position::new(0, 17));
+    }
+
+    #[test]
+    fn reports_errors_nested_among_valid_entities() {
+        let doc = parse_document(concat!(
+            "DATA;\n",
+            "#1=IFCCARTESIANPOINT((0.,1.,2.));\n",
+            "#2=IFCPOLYLINE((#1,#4))\n",
+            "#3=IFCDIRECTION((1.,0.,0.));\n",
+            "#4=IFCWALL('a',IFCLABEL('x',(#2,#3));\n",
+            "#5=IFCDIRECTION((1.,0.,0.));\n",
+            "#6=IFCWALL('b',$,%);\n",
+            "#7=IFCCARTESIANPOINT((3.,4.,5.));\n",
+            "ENDSEC;\n",
+        ));
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| {
+                let Range { start, end } = diagnostic.range;
+                (
+                    (start.line, start.character, end.line, end.character),
+                    diagnostic.message,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [
+                ((2, 23, 2, 23), "Missing `;`".to_string()),
+                ((4, 36, 4, 36), "Missing `)`".to_string()),
+                ((6, 16, 6, 18), "Invalid IFC STEP syntax".to_string()),
+            ]
+        );
     }
 }
