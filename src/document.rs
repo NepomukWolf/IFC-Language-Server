@@ -547,10 +547,11 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
 pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
 
-    if let Some(tree) = tree {
-        let mut cursor = tree.root_node().walk();
-        traverse(&mut cursor, text, &mut instances);
-    }
+    for_each_entity_node(tree, |node| {
+        if let Some(instance) = parse_entity_instance(node, text) {
+            instances.push(instance);
+        }
+    });
 
     EntityInstanceCollection::new(instances)
 }
@@ -595,27 +596,6 @@ impl EntityInstanceCollection {
     }
 }
 
-fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInstanceInfo>) {
-    loop {
-        let node = cursor.node();
-
-        let is_entity_instance = node.kind() == "entity_instance";
-        if is_entity_instance && let Some(instance) = parse_entity_instance(node, text) {
-            instances.push(instance);
-        }
-
-        // The grammar never nests entity instances, so only error recovery can put one inside another.
-        if (!is_entity_instance || node.has_error()) && cursor.goto_first_child() {
-            traverse(cursor, text, instances);
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
 pub(crate) fn for_each_entity_node<'a>(tree: Option<&'a Tree>, mut visit: impl FnMut(Node<'a>)) {
     if let Some(tree) = tree {
         visit_entity_nodes(&mut tree.root_node().walk(), &mut visit);
@@ -630,7 +610,7 @@ fn visit_entity_nodes<'a>(cursor: &mut TreeCursor<'a>, visit: &mut impl FnMut(No
             visit(node);
         }
 
-        // Valid entity parameters cannot contain entity instances; error recovery can.
+        // The grammar never nests entity instances, so only error recovery can put one inside another.
         if (!is_entity || node.has_error()) && cursor.goto_first_child() {
             visit_entity_nodes(cursor, visit);
             cursor.goto_parent();
