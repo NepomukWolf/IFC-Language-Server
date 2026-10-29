@@ -5,13 +5,16 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{
+    EntityInstanceCollection, EntityInstanceInfo, EntityTypeIndex, ParameterValue,
+};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
 
-pub fn collect_with_schema_name(
+#[cfg(test)]
+fn collect_with_schema_name(
     instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     schema_name: Option<&str>,
@@ -30,8 +33,70 @@ pub fn collect_with_schema_name(
     diagnostics
 }
 
+pub fn collect_streaming(
+    tree: Option<&tree_sitter::Tree>,
+    text: &str,
+    entity_types: &EntityTypeIndex,
+    schema: &SchemaDoc,
+    schema_name: Option<&str>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    if let Some(tree) = tree {
+        let mut cursor = tree.root_node().walk();
+        collect_streaming_entities(
+            &mut cursor,
+            text,
+            entity_types,
+            schema,
+            schema_name,
+            &mut diagnostics,
+        );
+    }
+
+    diagnostics
+}
+
+fn collect_streaming_entities(
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    text: &str,
+    entity_types: &EntityTypeIndex,
+    schema: &SchemaDoc,
+    schema_name: Option<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    loop {
+        let node = cursor.node();
+        if node.kind() == "entity_instance"
+            && let Some(instance) = crate::document::parse_entity_instance(node, text)
+        {
+            if let Some(entity) = schema.entity(&instance.entity_name) {
+                validate_instance(entity_types, schema, entity, &instance, diagnostics);
+            } else {
+                diagnostics.push(unknown_entity_diagnostic(&instance, schema_name));
+            }
+        }
+
+        if cursor.goto_first_child() {
+            collect_streaming_entities(
+                cursor,
+                text,
+                entity_types,
+                schema,
+                schema_name,
+                diagnostics,
+            );
+            cursor.goto_parent();
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
 fn validate_instance(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
@@ -85,7 +150,7 @@ fn unknown_entity_diagnostic(
 }
 
 fn validate_value(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     value: &ParameterValue,
     attribute: &EntityAttributeDoc,
@@ -110,7 +175,7 @@ fn validate_value(
 }
 
 fn validate_non_null_value(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected: &TypeRef,
@@ -131,7 +196,7 @@ fn validate_non_null_value(
 }
 
 fn validate_named_type(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     value: &ParameterValue,
     type_name: &str,
@@ -183,7 +248,7 @@ fn unwrap_inline_typed_value<'a>(
 }
 
 fn validate_select(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     value: &ParameterValue,
     select: &SelectTypeDef,
@@ -222,7 +287,7 @@ fn validate_enum_value(value: &ParameterValue, items: &[String]) -> Option<Strin
 }
 
 fn validate_aggregate(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     value: &ParameterValue,
     aggregate: &AggregateTypeRef,
@@ -266,7 +331,7 @@ fn validate_aggregate(
 }
 
 fn validate_entity_reference(
-    instances: &EntityInstanceCollection,
+    instances: &impl EntityReferenceLookup,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected_entity: &str,
@@ -279,20 +344,37 @@ fn validate_entity_reference(
         ));
     };
 
-    let Some(instance) = instances.instance_by_id(*id) else {
+    let Some(entity_name) = instances.entity_name_by_id(*id) else {
         return Some(format!(
             "reference `#{}` does not resolve to a local entity",
             id
         ));
     };
 
-    if schema.is_entity_compatible(&instance.entity_name, expected_entity) {
+    if schema.is_entity_compatible(entity_name, expected_entity) {
         None
     } else {
         Some(format!(
             "expected reference to `{}` but `#{}` points to `{}`",
-            expected_entity, id, instance.entity_name
+            expected_entity, id, entity_name
         ))
+    }
+}
+
+trait EntityReferenceLookup {
+    fn entity_name_by_id(&self, id: u32) -> Option<&str>;
+}
+
+impl EntityReferenceLookup for EntityInstanceCollection {
+    fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        self.instance_by_id(id)
+            .map(|instance| instance.entity_name.as_str())
+    }
+}
+
+impl EntityReferenceLookup for EntityTypeIndex {
+    fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        EntityTypeIndex::entity_name_by_id(self, id)
     }
 }
 
@@ -485,6 +567,20 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("does not resolve"));
+    }
+
+    #[test]
+    fn streaming_validation_matches_collection_validation() {
+        let text = "#1=IFCWALL('gid',#2);\n#2=IFCWALL('gid2',$);";
+        let document = parse_document(text);
+        let instances = instances(&document);
+        let schema = test_schema();
+
+        let collected = collect_with_schema_name(&instances, &schema, None);
+        let index = crate::document::build_entity_type_index(document.tree.as_ref(), text);
+        let streamed = collect_streaming(document.tree.as_ref(), text, &index, &schema, None);
+
+        assert_eq!(streamed, collected);
     }
 
     /// Test that the datatype validator allows omitted (`*`) values for inherited

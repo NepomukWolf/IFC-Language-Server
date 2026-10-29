@@ -34,6 +34,11 @@ pub struct EntityInstanceCollection {
     instance_indexes_by_id: HashMap<u32, usize>,
 }
 
+#[derive(Debug, Default)]
+pub struct EntityTypeIndex {
+    entity_names_by_id: HashMap<u32, String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityInstanceInfo {
     pub id: Option<u32>,
@@ -550,6 +555,23 @@ pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstance
     EntityInstanceCollection::new(instances)
 }
 
+pub fn build_entity_type_index(tree: Option<&Tree>, text: &str) -> EntityTypeIndex {
+    let mut index = EntityTypeIndex::default();
+
+    if let Some(tree) = tree {
+        let mut cursor = tree.root_node().walk();
+        traverse_headers(&mut cursor, text, &mut index);
+    }
+
+    index
+}
+
+impl EntityTypeIndex {
+    pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        self.entity_names_by_id.get(&id).map(String::as_str)
+    }
+}
+
 impl EntityInstanceCollection {
     pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
         let instance_indexes_by_id = instances
@@ -591,7 +613,53 @@ fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInsta
     }
 }
 
-fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+fn traverse_headers(cursor: &mut TreeCursor, text: &str, index: &mut EntityTypeIndex) {
+    loop {
+        let node = cursor.node();
+        if node.kind() == "entity_instance"
+            && let Some((Some(id), entity_name)) = parse_entity_identity(node, text)
+        {
+            index.entity_names_by_id.insert(id, entity_name);
+        }
+
+        if cursor.goto_first_child() {
+            traverse_headers(cursor, text, index);
+            cursor.goto_parent();
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn parse_entity_identity(node: Node<'_>, text: &str) -> Option<(Option<u32>, String)> {
+    let mut cursor = node.walk();
+    let mut id = None;
+    let mut entity_name = None;
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "instance_id" => {
+                id = child
+                    .utf8_text(text.as_bytes())
+                    .ok()
+                    .and_then(|value| value.trim_start_matches('#').parse::<u32>().ok());
+            }
+            "entity_name" => {
+                entity_name = child
+                    .utf8_text(text.as_bytes())
+                    .ok()
+                    .map(|value| value.to_ascii_uppercase());
+            }
+            _ => {}
+        }
+    }
+
+    Some((id, entity_name?))
+}
+
+pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
