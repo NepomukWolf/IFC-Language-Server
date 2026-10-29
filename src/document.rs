@@ -774,6 +774,29 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                 .unwrap_or_default();
             ParameterValue::List { items, range }
         }
+        "compact_number_list" => {
+            let range = node_range(&node);
+            let value = node.utf8_text(text.as_bytes()).expect("numeric list text");
+            let mut position = point_after_text(node.start_position(), "(");
+            let items = value[1..value.len() - 1]
+                .split(',')
+                .map(|part| {
+                    let leading = part.len() - part.trim_start().len();
+                    let item = part.trim();
+                    let start = point_after_text(position, &part[..leading]);
+                    let end = point_after_text(start, item);
+                    position = point_after_text(point_after_text(position, part), ",");
+                    ParameterValue::Number {
+                        text: item.to_string(),
+                        range: Range {
+                            start: Position::new(start.row as u32, start.column as u32),
+                            end: Position::new(end.row as u32, end.column as u32),
+                        },
+                    }
+                })
+                .collect();
+            ParameterValue::List { items, range }
+        }
         "typed_parameter" => {
             let range = node_range(&node);
             let mut cursor = node.walk();
@@ -854,6 +877,36 @@ mod tests {
             .expect("Error loading IFC parser");
 
         Document::parse(&mut parser, text.to_string())
+    }
+
+    #[test]
+    fn numeric_aggregate_preserves_values_and_multiline_ranges() {
+        let document = parse_document("#1=IFCCARTESIANPOINT(( 1.25,\n -2E-3, .75 ));");
+        let instances = build_entity_instances(document.tree.as_ref(), &document.text);
+        let ParameterValue::List { items, range } = &instances.instances[0].parameters[0] else {
+            panic!("coordinate aggregate expected");
+        };
+        assert_eq!(
+            *range,
+            Range::new(Position::new(0, 21), Position::new(1, 13))
+        );
+        assert_eq!(
+            items,
+            &vec![
+                ParameterValue::Number {
+                    text: "1.25".into(),
+                    range: Range::new(Position::new(0, 23), Position::new(0, 27))
+                },
+                ParameterValue::Number {
+                    text: "-2E-3".into(),
+                    range: Range::new(Position::new(1, 1), Position::new(1, 6))
+                },
+                ParameterValue::Number {
+                    text: ".75".into(),
+                    range: Range::new(Position::new(1, 8), Position::new(1, 11))
+                },
+            ]
+        );
     }
 
     fn instances(document: &Document) -> EntityInstanceCollection {
