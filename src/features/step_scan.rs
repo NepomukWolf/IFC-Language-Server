@@ -146,12 +146,12 @@ pub(crate) fn scan_instance(
     ))
 }
 
-/// Reads only the entity name at a known `#id=` definition offset.
+/// Reads only the entity name, as written, at a known `#id=` definition offset.
 pub(crate) fn scan_definition_entity_name(
     text: &str,
     start: usize,
     scan_end: usize,
-) -> Option<String> {
+) -> Option<&str> {
     let bytes = text.as_bytes();
     let (_, mut offset) = scan_instance_id(bytes, start, scan_end)?;
     offset = skip_trivia(bytes, offset, scan_end);
@@ -162,7 +162,7 @@ pub(crate) fn scan_definition_entity_name(
     offset = skip_trivia(bytes, offset + 1, scan_end);
     let entity_start = offset;
     offset = scan_identifier(bytes, offset, scan_end)?;
-    text.get(entity_start..offset).map(str::to_ascii_uppercase)
+    text.get(entity_start..offset)
 }
 
 /// Collects every local instance id (`#N`) referenced within `[start, end)`, skipping strings
@@ -341,8 +341,8 @@ mod tests {
         let text = "#12 = IfcWall(";
 
         assert_eq!(
-            scan_definition_entity_name(text, 0, text.len()).as_deref(),
-            Some("IFCWALL")
+            scan_definition_entity_name(text, 0, text.len()),
+            Some("IfcWall")
         );
     }
 
