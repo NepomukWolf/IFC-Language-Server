@@ -27,6 +27,7 @@ The shipped LSP features are:
 - call hierarchy over instance references
 - range-based semantic tokens
 - schema-aware diagnostics
+- model-query custom requests: `ifc/instances`, `ifc/entityCounts`, `ifc/findInstances`
 
 ## Core Design
 
@@ -212,6 +213,7 @@ These features do not require an AST:
 - schema name detection from `FILE_SCHEMA(...)`
 - related-entity navigation code actions, when schema docs are available
 - call hierarchy
+- `ifc/entityCounts` and `ifc/findInstances`
 - range-based semantic tokens
 
 These features require an AST:
@@ -220,6 +222,7 @@ These features require an AST:
 - schema-aware datatype diagnostics
 - parsed entity argument validation
 - derived `*` hover for `IfcSIUnit` and `IfcGeometricRepresentationSubContext`
+- `ifc/instances`
 
 New features should explicitly choose the cheapest data source that is sufficient. Prefer the text index for navigation and simple token lookup. Use tree-sitter only when syntax structure or parsed parameter values are required.
 
@@ -315,14 +318,17 @@ client with `window/showDocument` to move the cursor. This depends on the client
 `window.showDocument.support`; clients that do not implement it (e.g. Zed before its
 `window/showDocument` support landed) will show the actions but the jump will not occur.
 
-### Call Hierarchy
+### Call Hierarchy And Model Queries
 
 `src/features/call_hierarchy.rs` exposes local `#id` references as an LSP call hierarchy: incoming
 calls are the instances that reference an instance, outgoing calls the instances it references.
 Referrers are found through `Document::references` and `Document::enclosing_definition`, which walks
 back from a reference to its `#id=` definition, so cost does not grow with file size.
 
-`docs/instance-navigation.md` documents the call hierarchy items' `data`.
+`src/features/instances.rs` (`ifc/instances`) and `src/features/instance_queries.rs`
+(`ifc/entityCounts`, `ifc/findInstances`) are custom requests that `Backend::service()` registers
+for both the native binary and the wasm build. `docs/instance-navigation.md` documents their
+params and result shapes and the call hierarchy items' `data`.
 
 ### Semantic Tokens
 

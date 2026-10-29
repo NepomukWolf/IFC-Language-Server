@@ -419,6 +419,17 @@ impl Document {
         Some((id, start))
     }
 
+    /// Definition offsets and their ids, in document order.
+    pub fn definitions_in_order(&self) -> Vec<(usize, u32)> {
+        let mut definitions: Vec<(usize, u32)> = self
+            .definitions
+            .iter()
+            .map(|(&id, &offset)| (offset, id))
+            .collect();
+        definitions.sort_unstable();
+        definitions
+    }
+
     /// The last `#id=` definition at or before `offset`, as its offset and id. Walks back from
     /// `offset` and accepts only the `#` tokens the text index records as definitions, so ids in
     /// strings and comments are passed over; the cost is the distance to that definition.

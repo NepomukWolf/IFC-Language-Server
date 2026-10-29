@@ -11,6 +11,8 @@ pub mod hover;
 mod ifc_guid;
 pub mod inlay_hints;
 mod instance_labels;
+pub mod instance_queries;
+pub mod instances;
 pub mod references;
 pub mod related_entities;
 pub mod scaffold_completions;

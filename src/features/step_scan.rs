@@ -1,8 +1,8 @@
 //! Shared lightweight STEP entity-instance argument scanner.
 //! Given a known `#id=` definition offset, this walks the positional argument list without a
 //! full tree-sitter parse. Shared by the text-index features (inlay hints, completions,
-//! related-entity navigation and call hierarchy), which only need argument boundaries, enclosing
-//! entity names, string values, and referenced ids within a bounded region.
+//! related-entity navigation, call hierarchy and the `ifc/*` instance requests), which only need argument
+//! boundaries, enclosing entity names, string values, and referenced ids within a bounded region.
 
 use crate::step::string_literal::decode_string;
 
