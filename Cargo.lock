@@ -1447,6 +1447,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-ifc"
 version = "0.1.1"
+source = "git+https://github.com/Amixx/tree-sitter-ifc?rev=01a6b72a384f9b86c69a464a40aeaadc40ca26bb#01a6b72a384f9b86c69a464a40aeaadc40ca26bb"
 dependencies = [
  "cc",
  "tree-sitter-language",
