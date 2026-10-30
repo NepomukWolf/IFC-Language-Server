@@ -14,29 +14,6 @@ use crate::schema::{
 };
 
 #[tracing::instrument(skip_all)]
-pub fn collect_streaming(
-    tree: Option<&crate::document_tree::DocumentTree>,
-    text: &str,
-    entity_types: &EntityTypeIndex,
-    schema: &SchemaDoc,
-    schema_name: Option<&str>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    crate::document::for_each_entity_node(tree, |node| {
-        if let Some(instance) = crate::document::parse_entity_instance(node, text) {
-            if let Some(entity) = schema.entity(&instance.entity_name) {
-                validate_instance(entity_types, schema, entity, &instance, &mut diagnostics);
-            } else {
-                diagnostics.push(unknown_entity_diagnostic(&instance, schema_name));
-            }
-        }
-    });
-
-    diagnostics
-}
-
-#[tracing::instrument(skip_all)]
 pub fn collect_lazy(
     lazy: &crate::handwritten::Document,
     text: &str,
@@ -555,19 +532,9 @@ mod tests {
         schema: &SchemaDoc,
         schema_name: Option<&str>,
     ) -> Vec<Diagnostic> {
-        let tree = document.tree.as_ref();
-        let entity_types = crate::document::build_entity_type_index(tree, &document.text);
-        let diagnostics =
-            collect_streaming(tree, &document.text, &entity_types, schema, schema_name);
-
-        let lazy = crate::handwritten::Document::parse(document.text.as_bytes(), false);
-        let lazy_types = crate::document::lazy_entity_type_index(&lazy, &document.text);
-        assert_eq!(
-            collect_lazy(&lazy, &document.text, &lazy_types, schema, schema_name),
-            diagnostics,
-            "lazy index diagnostics differ"
-        );
-        diagnostics
+        let lazy = document.lazy.as_deref().expect("document has lazy index");
+        let lazy_types = crate::document::lazy_entity_type_index(lazy, &document.text);
+        collect_lazy(lazy, &document.text, &lazy_types, schema, schema_name)
     }
 
     /// Helper function to load a schema from a fixture source string.

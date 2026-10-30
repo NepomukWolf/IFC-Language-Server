@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::Diagnostic;
 
 use crate::document::Document;
-use crate::document_tree::DocumentTree;
 use crate::handwritten;
 use crate::schema::SchemaDoc;
 
@@ -18,7 +17,6 @@ pub mod syntax;
 
 #[derive(Debug)]
 pub struct DiagnosticSnapshot {
-    tree: Option<DocumentTree>,
     lazy: Option<Arc<handwritten::Document>>,
     lazy_edits: incremental::LazyEdits,
     validation_cache: Arc<incremental::ValidationCache>,
@@ -29,7 +27,6 @@ pub struct DiagnosticSnapshot {
 impl DiagnosticSnapshot {
     pub fn from_document(document: &Document) -> Self {
         Self {
-            tree: document.tree.clone(),
             lazy: document.lazy.clone(),
             lazy_edits: document.lazy_edits.clone(),
             validation_cache: Arc::clone(&document.validation_cache),
@@ -40,10 +37,6 @@ impl DiagnosticSnapshot {
 
     pub fn schema_name(&self) -> Option<&str> {
         self.schema_name.as_deref()
-    }
-
-    pub fn tree(&self) -> Option<&DocumentTree> {
-        self.tree.as_ref()
     }
 
     pub fn lazy(&self) -> Option<&handwritten::Document> {
@@ -77,16 +70,6 @@ pub fn collect(
         );
         tracing::info!(?mode, "lazy datatype diagnostics");
         diagnostics.extend(datatype);
-    } else if let Some((schema_name, schema)) = schema {
-        let entity_types =
-            crate::document::build_entity_type_index(snapshot.tree(), snapshot.text());
-        diagnostics.extend(datatype::collect_streaming(
-            snapshot.tree(),
-            snapshot.text(),
-            &entity_types,
-            schema,
-            Some(schema_name),
-        ));
     }
     diagnostics
 }

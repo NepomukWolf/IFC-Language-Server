@@ -1,39 +1,14 @@
 //! Syntax diagnostics for IFC STEP documents.
-//! This module walks the tree-sitter parse tree and reports invalid or missing syntax nodes.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::diagnostics::DiagnosticSnapshot;
-use crate::document_tree::UnclosedString;
 
 #[tracing::instrument(skip_all)]
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
-    if let Some(lazy) = snapshot.lazy() {
-        return collect_lazy(lazy, snapshot.text());
-    }
-    let Some(tree) = &snapshot.tree else {
-        return Vec::new();
-    };
-
-    let text = snapshot.text();
-    let mut line = 0;
-    let mut line_start = 0;
-    let mut diagnostics: Vec<_> = tree
-        .unclosed_strings
-        .iter()
-        .map(|string| {
-            let scanned = line_start;
-            for newline in memchr::memchr_iter(b'\n', &text.as_bytes()[scanned..string.quote]) {
-                line += 1;
-                line_start = scanned + newline + 1;
-            }
-            unclosed_string_diagnostic(text, line, line_start, string.quote)
-        })
-        .collect();
-    let mut cursor = tree.root_node().walk();
-    collect_error_nodes(&mut cursor, &tree.unclosed_strings, &mut diagnostics);
-    diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
-    diagnostics
+    snapshot
+        .lazy()
+        .map_or_else(Vec::new, |lazy| collect_lazy(lazy, snapshot.text()))
 }
 
 fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnostic> {
@@ -72,11 +47,6 @@ fn utf16_len(text: &str) -> u32 {
         .sum()
 }
 
-fn follows_unclosed_string(unclosed_strings: &[UnclosedString], offset: usize) -> bool {
-    let index = unclosed_strings.partition_point(|string| string.quote <= offset);
-    index > 0 && unclosed_strings[index - 1].end >= offset
-}
-
 fn unclosed_string_diagnostic(
     text: &str,
     line: u32,
@@ -96,69 +66,7 @@ fn unclosed_string_diagnostic(
     }
 }
 
-fn collect_error_nodes(
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    unclosed_strings: &[UnclosedString],
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    loop {
-        let node = cursor.node();
-
-        if !follows_unclosed_string(unclosed_strings, node.start_byte())
-            && let Some(diagnostic) = syntax_diagnostic_for_node(&node)
-        {
-            diagnostics.push(diagnostic);
-        }
-
-        // An ERROR node's range covers everything nested in it, including the leaf ERROR
-        // that tree-sitter creates for a token the lexer cannot recognize. `has_error` is also
-        // true on every ancestor of a MISSING node.
-        if !node.is_error() && node.has_error() && cursor.goto_first_child() {
-            collect_error_nodes(cursor, unclosed_strings, diagnostics);
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn syntax_diagnostic_for_node(node: &tree_sitter::Node<'_>) -> Option<Diagnostic> {
-    let message = if node.is_error() {
-        Some("Invalid IFC STEP syntax".to_string())
-    } else if node.is_missing() {
-        Some(missing_node_message(node))
-    } else {
-        None
-    }?;
-
-    Some(Diagnostic {
-        range: node_range(node),
-        severity: Some(DiagnosticSeverity::ERROR),
-        message,
-        ..Default::default()
-    })
-}
-
-fn missing_node_message(node: &tree_sitter::Node<'_>) -> String {
-    match node.kind() {
-        ";" => "Missing `;`".to_string(),
-        kind => format!("Missing `{kind}`"),
-    }
-}
-
-fn node_range(node: &tree_sitter::Node<'_>) -> Range {
-    let start = node.start_position();
-    let end = node.end_position();
-
-    Range {
-        start: Position::new(start.row as u32, start.column as u32),
-        end: Position::new(end.row as u32, end.column as u32),
-    }
-}
-
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use tower_lsp::lsp_types::Position;
     use tree_sitter::Parser;

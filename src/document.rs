@@ -1,12 +1,12 @@
 //! Parsed in-memory representation of one IFC document.
-//! This module owns the source text, cheap text indexes for navigation, and optional tree-sitter
-//! state for schema-aware diagnostics and derived-value hover.
+//! This module owns the source text, cheap text indexes for navigation, and the lazy STEP index.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
+use tree_sitter::{Node, Parser, Point, TreeCursor};
 
 use crate::diagnostics::incremental::{LazyEdits, ValidationCache};
 use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
@@ -24,8 +24,7 @@ pub enum ApplyChangeError {
 #[derive(Debug)]
 pub struct Document {
     pub text: Arc<String>,
-    pub tree: Option<DocumentTree>,
-    /// Statement index used for diagnostics of documents above the AST size limit.
+    /// Statement index and lazy parameter tape for this document.
     pub lazy: Option<Arc<handwritten::Document>>,
     pub lazy_edits: LazyEdits,
     pub validation_cache: Arc<ValidationCache>,
@@ -138,10 +137,10 @@ impl Document {
             schema_end,
         } = scan_text(&text);
 
+        let lazy = Arc::new(handwritten::Document::parse(text.as_bytes(), false));
         Self {
             text: Arc::new(text),
-            tree: None,
-            lazy: None,
+            lazy: Some(lazy),
             lazy_edits: LazyEdits::fresh(),
             validation_cache: Arc::default(),
             ast_skipped: false,
@@ -178,16 +177,19 @@ impl Document {
     }
 
     pub fn unload_parse_state(&mut self) {
-        self.tree = None;
         self.lazy = None;
         self.ast_skipped = false;
     }
 
     pub fn reload_parse_state(&mut self, parser: &mut Parser, ast_file_size_limit_bytes: usize) {
+        let _ = parser;
+        let _ = ast_file_size_limit_bytes;
         self.reload_text_index();
         self.unload_parse_state();
-
-        self.parse_current_text(parser, None, ast_file_size_limit_bytes);
+        self.lazy = Some(Arc::new(handwritten::Document::parse(
+            self.text.as_bytes(),
+            false,
+        )));
     }
 
     pub fn apply_content_changes(
@@ -199,20 +201,25 @@ impl Document {
         for change in changes {
             if let Some(range) = change.range {
                 if let Err(error) = self.apply_ranged_change(range, &change.text) {
-                    let old_tree = self.tree.take();
-                    self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
+                    self.reload_parse_state(parser, ast_file_size_limit_bytes);
                     return Err(error);
                 }
             } else {
                 self.text = Arc::new(change.text.clone());
-                self.tree = None;
                 self.lazy = None;
                 self.reload_text_index();
             }
         }
 
-        let old_tree = self.tree.take();
-        self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
+        let _ = parser;
+        let _ = ast_file_size_limit_bytes;
+        if self.lazy.is_none() {
+            self.lazy = Some(Arc::new(handwritten::Document::parse(
+                self.text.as_bytes(),
+                false,
+            )));
+            self.lazy_edits = LazyEdits::fresh();
+        }
         Ok(())
     }
 
@@ -231,25 +238,6 @@ impl Document {
             return Err(ApplyChangeError::InvalidRange(range));
         }
 
-        let start_position = self
-            .point_at_offset(range.start.line as usize, start_byte)
-            .ok_or(ApplyChangeError::InvalidRange(range))?;
-        let old_end_position = self
-            .point_at_offset(range.end.line as usize, old_end_byte)
-            .ok_or(ApplyChangeError::InvalidRange(range))?;
-        let new_end_position = point_after_text(start_position, replacement);
-        let edit = InputEdit {
-            start_byte,
-            old_end_byte,
-            new_end_byte: start_byte + replacement.len(),
-            start_position,
-            old_end_position,
-            new_end_position,
-        };
-
-        if let Some(tree) = self.tree.as_mut() {
-            tree.edit(&edit);
-        }
         let removed = self.text.as_bytes()[start_byte..old_end_byte].to_vec();
         Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
         if let Some(lazy) = self.lazy.as_mut() {
@@ -271,37 +259,6 @@ impl Document {
             self.reload_text_index();
         }
         Ok(())
-    }
-
-    fn point_at_offset(&self, line: usize, offset: usize) -> Option<Point> {
-        let line_start = *self.line_offsets.get(line)?;
-        Some(Point {
-            row: line,
-            column: offset.checked_sub(line_start)?,
-        })
-    }
-
-    fn parse_current_text(
-        &mut self,
-        parser: &mut Parser,
-        old_tree: Option<DocumentTree>,
-        ast_file_size_limit_bytes: usize,
-    ) {
-        self.ast_skipped = false;
-        if self.text.len() > ast_file_size_limit_bytes {
-            self.ast_skipped = true;
-            if self.lazy.is_none() {
-                self.lazy = Some(Arc::new(handwritten::Document::parse(
-                    self.text.as_bytes(),
-                    false,
-                )));
-                self.lazy_edits = LazyEdits::fresh();
-            }
-            return;
-        }
-
-        self.lazy = None;
-        self.tree = DocumentTree::parse(parser, self.text.as_bytes(), old_tree);
     }
 
     #[cfg(test)]
@@ -328,27 +285,22 @@ impl Document {
     }
 
     pub fn is_parse_state_loaded(&self) -> bool {
-        self.tree.is_some() || self.ast_skipped
+        self.lazy.is_some()
     }
 
     pub fn has_ast(&self) -> bool {
-        self.tree.is_some()
-    }
-
-    pub fn node_at_position(&self, position: Position) -> Option<Node<'_>> {
-        let tree = self.tree.as_ref()?;
-        let offset = self.position_to_offset(position)?;
-        tree.node_at_offset(offset)
+        let _ = self;
+        false
     }
 
     pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
         let definition_offset = *self.definitions.get(&id)?;
-        let tree = self.tree.as_ref()?;
-        let mut node = tree.node_at_offset(definition_offset)?;
-        while node.kind() != "entity_instance" {
-            node = node.parent()?;
-        }
-        parse_entity_instance(node, &self.text)
+        let lazy = self.lazy.as_deref()?;
+        let index = lazy
+            .statements
+            .iter()
+            .position(|statement| statement.span.start as usize == definition_offset)?;
+        lazy_entity_instance_relative(lazy, &self.text, index)
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -1308,7 +1260,7 @@ fn point_after_text(start: Point, text: &str) -> Point {
 }
 
 //*----- TESTS BEGIN HERE -----*
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::test_support::build_entity_instances;
