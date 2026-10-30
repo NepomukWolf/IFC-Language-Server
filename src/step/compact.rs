@@ -1,6 +1,6 @@
 //! Values inside a `compact_parameter_list` token. The grammar only emits that token for a
 //! well-formed parameter list whose parameters are atoms, typed atoms such as `IFCLABEL('x')`,
-//! or flat lists of those, so the scanner below never sees malformed input.
+//! or lists of those nested one level deep, so the scanner below never sees malformed input.
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompactKind {
@@ -40,7 +40,7 @@ pub struct CompactEntity {
 
 /// A leaf `entity_instance` is a whole-entity token; structured instances always have children.
 pub fn is_compact_entity(node: tree_sitter::Node<'_>) -> bool {
-    node.kind() == "entity_instance" && node.child_count() == 0
+    node.kind() == "entity_instance" && node.child_count() == 0 && !node.is_missing()
 }
 
 pub fn entity(text: &str, start: usize) -> CompactEntity {
