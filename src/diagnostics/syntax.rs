@@ -14,36 +14,45 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
 fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnostic> {
     lazy.errors
         .iter()
-        .map(|error| {
+        .flat_map(|error| {
             let mut start = error.span.start as usize;
             let mut end = error.span.end as usize;
             let statement_index = lazy
                 .statements
                 .partition_point(|statement| statement.span.start as usize <= start);
-            let unclosed_quote = statement_index.checked_sub(1).and_then(|index| {
+            let statement = statement_index.checked_sub(1).and_then(|index| {
                 let statement = lazy.statements[index];
-                (start <= statement.span.end as usize)
-                    .then(|| unclosed_quote(text.as_bytes(), statement.span.range()))
-                    .flatten()
+                (start <= statement.span.end as usize).then_some(statement)
             });
-            if let Some(offset) = unclosed_quote {
-                let line = memchr::memchr_iter(b'\n', &text.as_bytes()[..offset]).count() as u32;
-                let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
-                return unclosed_string_diagnostic(text, line, line_start, offset);
-            }
-            if error.message == "expected parameter" && start > 0 {
-                let before = text[..start].trim_end();
-                if before.ends_with(',') {
-                    start = before.len() - 1;
+            if let Some(statement) = statement {
+                if let Some(offset) = unclosed_quote(text.as_bytes(), statement.span.range()) {
+                    let line =
+                        memchr::memchr_iter(b'\n', &text.as_bytes()[..offset]).count() as u32;
+                    let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
+                    return vec![unclosed_string_diagnostic(text, line, line_start, offset)];
+                }
+                let span = statement.span.range();
+                let points = crate::document::positions_of(text, [span.start, span.end]);
+                if let Some(tree) = crate::step::parse_recovery(
+                    text,
+                    tree_sitter::Range {
+                        start_byte: span.start,
+                        end_byte: span.end,
+                        start_point: tree_sitter::Point::new(
+                            points[0].line as usize,
+                            points[0].character as usize,
+                        ),
+                        end_point: tree_sitter::Point::new(
+                            points[1].line as usize,
+                            points[1].character as usize,
+                        ),
+                    },
+                ) {
+                    let mut diagnostics = Vec::new();
+                    collect_error_nodes(tree.root_node(), &mut diagnostics);
+                    return diagnostics;
                 }
             }
-            let message = if error.message == "expected ;" {
-                "Missing `;`"
-            } else if error.message == "expected )" && start == end {
-                "Missing `)`"
-            } else {
-                "Invalid IFC STEP syntax"
-            };
             while !text.is_char_boundary(start) {
                 start -= 1;
             }
@@ -55,14 +64,42 @@ fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnost
                 let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
                 Position::new(line, utf16_len(&text[line_start..offset]))
             };
-            Diagnostic {
+            vec![Diagnostic {
                 range: Range::new(position(start), position(end)),
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: message.to_string(),
+                message: "Invalid IFC STEP syntax".to_string(),
                 ..Default::default()
-            }
+            }]
         })
         .collect()
+}
+
+fn collect_error_nodes(node: tree_sitter::Node<'_>, diagnostics: &mut Vec<Diagnostic>) {
+    let message = if node.is_error() {
+        Some("Invalid IFC STEP syntax".to_string())
+    } else if node.is_missing() {
+        Some(format!("Missing `{}`", node.kind()))
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        let start = node.start_position();
+        let end = node.end_position();
+        diagnostics.push(Diagnostic {
+            range: Range::new(
+                Position::new(start.row as u32, start.column as u32),
+                Position::new(end.row as u32, end.column as u32),
+            ),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message,
+            ..Default::default()
+        });
+    }
+    if !node.is_error() && node.has_error() {
+        for child in node.children(&mut node.walk()) {
+            collect_error_nodes(child, diagnostics);
+        }
+    }
 }
 
 fn unclosed_quote(text: &[u8], span: std::ops::Range<usize>) -> Option<usize> {

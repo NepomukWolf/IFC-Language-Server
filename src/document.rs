@@ -650,19 +650,15 @@ fn lazy_entity_instance(
     {
         let start = points.position(span.start);
         let end = points.position(span.end);
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE_STRUCTURED.into())
-            .expect("IFC ABI");
-        parser
-            .set_included_ranges(&[tree_sitter::Range {
+        let tree = crate::step::parse_recovery(
+            text,
+            tree_sitter::Range {
                 start_byte: span.start,
                 end_byte: span.end,
                 start_point: Point::new(start.line as usize, start.character as usize),
                 end_point: Point::new(end.line as usize, end.character as usize),
-            }])
-            .expect("statement range");
-        let tree = parser.parse(text, None)?;
+            },
+        )?;
         let mut instance = None;
         visit_entity_nodes(&mut tree.root_node().walk(), &mut |node| {
             if instance.is_none() {
