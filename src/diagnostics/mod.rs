@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
+use crate::document_tree::DocumentTree;
 use tower_lsp::lsp_types::Diagnostic;
-use tree_sitter::Tree;
 
 use crate::document::Document;
 use crate::schema::SchemaDoc;
@@ -16,7 +16,7 @@ pub mod syntax;
 
 #[derive(Debug)]
 pub struct DiagnosticSnapshot {
-    tree: Option<Tree>,
+    tree: Option<DocumentTree>,
     text: Arc<String>,
     schema_name: Option<String>,
 }
@@ -34,7 +34,7 @@ impl DiagnosticSnapshot {
         self.schema_name.as_deref()
     }
 
-    pub fn tree(&self) -> Option<&Tree> {
+    pub fn tree(&self) -> Option<&DocumentTree> {
         self.tree.as_ref()
     }
 
