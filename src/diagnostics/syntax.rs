@@ -7,6 +7,9 @@ use crate::diagnostics::DiagnosticSnapshot;
 use crate::document_tree::UnclosedString;
 
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
+    if let Some(lazy) = snapshot.lazy() {
+        return collect_lazy(lazy, snapshot.text());
+    }
     let Some(tree) = &snapshot.tree else {
         return Vec::new();
     };
@@ -30,6 +33,42 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     collect_error_nodes(&mut cursor, &tree.unclosed_strings, &mut diagnostics);
     diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
     diagnostics
+}
+
+fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnostic> {
+    let mut line = 0;
+    let mut line_start = 0;
+    lazy.errors
+        .iter()
+        .map(|error| {
+            let offset = error.span.start as usize;
+            let scanned = line_start;
+            for newline in memchr::memchr_iter(b'\n', &text.as_bytes()[scanned..offset]) {
+                line += 1;
+                line_start = scanned + newline + 1;
+            }
+            if error.message == "unclosed string" {
+                return unclosed_string_diagnostic(text, line, line_start, offset);
+            }
+            let column = utf16_len(&text[line_start..offset]);
+            let width = utf16_len(&text[error.span.range()]);
+            Diagnostic {
+                range: Range::new(
+                    Position::new(line, column),
+                    Position::new(line, column + width),
+                ),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Invalid IFC STEP syntax; {}", error.message),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn utf16_len(text: &str) -> u32 {
+    text.chars()
+        .map(|character| character.len_utf16() as u32)
+        .sum()
 }
 
 fn follows_unclosed_string(unclosed_strings: &[UnclosedString], offset: usize) -> bool {

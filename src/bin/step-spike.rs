@@ -170,7 +170,7 @@ fn main() {
     let mut reparsed_bytes = None;
     if let Some(doc) = &mut hand {
         reparsed_bytes = Some(doc.edit(
-            &text,
+            &text[start..start + deleted],
             &new,
             Edit {
                 start,

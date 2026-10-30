@@ -234,7 +234,7 @@ impl Document {
         params
     }
 
-    pub fn edit(&mut self, old: &[u8], new: &[u8], edit: Edit) -> usize {
+    pub fn edit(&mut self, removed: &[u8], new: &[u8], edit: Edit) -> usize {
         let first = self
             .statements
             .partition_point(|s| (s.span.end as usize) < edit.start)
@@ -244,7 +244,7 @@ impl Document {
             .partition_point(|s| s.span.start as usize <= edit.start + edit.delete_len)
             + 1)
         .min(self.statements.len());
-        let changed = &old[edit.start..edit.start + edit.delete_len];
+        let changed = removed;
         let inserted = &new[edit.start..edit.start + edit.insert_len];
         if first >= last
             || edit.start < self.statements[first].span.start as usize
@@ -625,7 +625,7 @@ mod tests {
                     text.splice(start..start + 1, insert.iter().copied());
                     let mut doc = Document::parse(original, retain);
                     doc.edit(
-                        original,
+                        &original[start..start + 1],
                         &text,
                         Edit {
                             start,
@@ -635,7 +635,7 @@ mod tests {
                     );
                     assert_eq!(doc, Document::parse(&text, retain), "{start} {insert:?}");
                     doc.edit(
-                        &text,
+                        &text[start..start + insert.len()],
                         original,
                         Edit {
                             start,

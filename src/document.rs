@@ -10,6 +10,7 @@ use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
 
 use crate::document_index::{TextIndex, index_neutral_edit, rescan_text, scan_text};
 use crate::document_tree::DocumentTree;
+use crate::handwritten;
 use crate::step::compact::{self, CompactKind, CompactValue};
 
 pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
@@ -23,6 +24,8 @@ pub enum ApplyChangeError {
 pub struct Document {
     pub text: Arc<String>,
     pub tree: Option<DocumentTree>,
+    /// Statement index used for diagnostics of documents above the AST size limit.
+    pub lazy: Option<Arc<handwritten::Document>>,
     pub ast_skipped: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
@@ -40,6 +43,7 @@ pub struct EntityInstanceCollection {
 #[derive(Debug, Default)]
 pub struct EntityTypeIndex<'a> {
     entity_names_by_id: Vec<(u32, &'a str)>,
+    lazy: Option<(&'a handwritten::Document, &'a str)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +138,7 @@ impl Document {
         Self {
             text: Arc::new(text),
             tree: None,
+            lazy: None,
             ast_skipped: false,
             schema_name,
             line_offsets,
@@ -172,6 +177,7 @@ impl Document {
 
     pub fn unload_parse_state(&mut self) {
         self.tree = None;
+        self.lazy = None;
         self.ast_skipped = false;
     }
 
@@ -203,6 +209,7 @@ impl Document {
             } else {
                 self.text = Arc::new(change.text.clone());
                 self.tree = None;
+                self.lazy = None;
                 index_valid = false;
             }
             if !index_valid && index + 1 < changes.len() {
@@ -255,7 +262,22 @@ impl Document {
         if let Some(tree) = self.tree.as_mut() {
             tree.edit(&edit);
         }
+        let removed = self
+            .lazy
+            .is_some()
+            .then(|| self.text.as_bytes()[start_byte..old_end_byte].to_vec());
         Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
+        if let (Some(lazy), Some(removed)) = (self.lazy.as_mut(), removed) {
+            Arc::make_mut(lazy).edit(
+                &removed,
+                self.text.as_bytes(),
+                handwritten::Edit {
+                    start: start_byte,
+                    delete_len: removed.len(),
+                    insert_len: replacement.len(),
+                },
+            );
+        }
         if keep_index {
             let delta = replacement.len() as isize - (old_end_byte - start_byte) as isize;
             if delta != 0 {
@@ -330,9 +352,16 @@ impl Document {
         self.ast_skipped = false;
         if self.text.len() > ast_file_size_limit_bytes {
             self.ast_skipped = true;
+            if self.lazy.is_none() {
+                self.lazy = Some(Arc::new(handwritten::Document::parse(
+                    self.text.as_bytes(),
+                    false,
+                )));
+            }
             return;
         }
 
+        self.lazy = None;
         self.tree = DocumentTree::parse(parser, self.text.as_bytes(), old_tree);
     }
 
@@ -629,6 +658,161 @@ pub fn build_entity_type_index<'a>(
     index
 }
 
+pub fn lazy_entity_type_index<'a>(
+    lazy: &'a handwritten::Document,
+    text: &'a str,
+) -> EntityTypeIndex<'a> {
+    EntityTypeIndex {
+        entity_names_by_id: Vec::new(),
+        lazy: Some((lazy, text)),
+    }
+}
+
+/// Decodes each well-formed statement of a lazy index, in document order, one at a time.
+pub(crate) fn for_each_lazy_entity_instance(
+    lazy: &handwritten::Document,
+    text: &str,
+    mut visit: impl FnMut(EntityInstanceInfo),
+) {
+    let mut points = LinePoints {
+        text: text.as_bytes(),
+        offset: 0,
+        row: 0,
+        line_start: 0,
+    };
+    let mut errors = lazy.errors.iter().peekable();
+    for (index, statement) in lazy.statements.iter().enumerate() {
+        let span = statement.span.range();
+        while errors
+            .next_if(|error| (error.span.start as usize) < span.start)
+            .is_some()
+        {}
+        if errors
+            .peek()
+            .is_some_and(|error| span.contains(&(error.span.start as usize)))
+            || statement.name.end == 0
+        {
+            continue;
+        }
+        let tape = lazy.decode(text.as_bytes(), index);
+        let Some(list) = tape.first() else {
+            continue;
+        };
+        let id_range = Range {
+            start: points.position(span.start),
+            end: points.position(
+                span.start
+                    + 1
+                    + text.as_bytes()[span.start + 1..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_digit())
+                        .count(),
+            ),
+        };
+        let name = statement.name.range();
+        let entity_name_range = Range {
+            start: points.position(name.start),
+            end: points.position(name.end),
+        };
+        let list_start = points.position(list.span.start as usize);
+        let parameters = lazy_parameter_values(&tape, 1, tape.len(), text, &mut points);
+        let parameter_list_range = Range {
+            start: list_start,
+            end: points.position(list.span.end as usize),
+        };
+        let entity_end = points.position(span.end);
+        visit(EntityInstanceInfo {
+            id: Some(statement.id),
+            id_range: Some(id_range),
+            entity_name: text[name].to_ascii_uppercase(),
+            entity_name_range,
+            entity_range: Range {
+                start: id_range.start,
+                end: entity_end,
+            },
+            parameter_list_range: Some(parameter_list_range),
+            parameters,
+        });
+    }
+}
+
+fn lazy_parameter_values(
+    tape: &[handwritten::Param],
+    mut slot: usize,
+    end: usize,
+    text: &str,
+    points: &mut LinePoints<'_>,
+) -> Vec<ParameterValue> {
+    use handwritten::Kind;
+    let mut values = Vec::new();
+    while slot < end {
+        let param = tape[slot];
+        let span = param.span.range();
+        let start = points.position(span.start);
+        let children = match param.kind {
+            Kind::List | Kind::Typed => {
+                lazy_parameter_values(tape, slot + 1, param.next as usize, text, points)
+            }
+            _ => Vec::new(),
+        };
+        let range = Range {
+            start,
+            end: points.position(span.end),
+        };
+        let source = &text[span];
+        values.push(match param.kind {
+            Kind::String | Kind::Binary => ParameterValue::String { range },
+            Kind::Number => ParameterValue::Number {
+                text: source.to_string(),
+                range,
+            },
+            Kind::Reference => match source[1..].parse::<u32>() {
+                Ok(id) => ParameterValue::Reference { id, range },
+                Err(_) => ParameterValue::Unknown { range },
+            },
+            Kind::Enumeration => ParameterValue::Enumeration {
+                value: source.trim_matches('.').to_ascii_uppercase(),
+                range,
+            },
+            Kind::Null => ParameterValue::Null { range },
+            Kind::Omitted => ParameterValue::Omitted { range },
+            Kind::Typed => ParameterValue::Typed {
+                type_name: source[..source.find('(').unwrap_or(source.len())]
+                    .trim_end()
+                    .to_ascii_uppercase(),
+                inner: children,
+                range,
+            },
+            Kind::List => ParameterValue::List {
+                items: children,
+                range,
+            },
+        });
+        slot = param.next as usize;
+    }
+    values
+}
+
+/// Converts monotonically increasing byte offsets to positions with byte columns.
+struct LinePoints<'a> {
+    text: &'a [u8],
+    offset: usize,
+    row: usize,
+    line_start: usize,
+}
+
+impl LinePoints<'_> {
+    fn position(&mut self, offset: usize) -> Position {
+        let skipped = &self.text[self.offset..offset];
+        if let Some(last) = memchr::memrchr(b'\n', skipped) {
+            self.row += memchr::memchr_iter(b'\n', skipped).count();
+            self.line_start = self.offset + last + 1;
+        }
+        self.offset = offset;
+        Position::new(self.row as u32, (offset - self.line_start) as u32)
+    }
+}
+
 fn entity_id_and_name<'a>(node: Node<'_>, text: &'a str) -> Option<(u32, &'a str)> {
     let (id, name) = if compact::is_compact_entity(node) {
         let entity = compact::entity(text, node.start_byte());
@@ -653,6 +837,10 @@ fn entity_id_and_name<'a>(node: Node<'_>, text: &'a str) -> Option<(u32, &'a str
 
 impl EntityTypeIndex<'_> {
     pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        if let Some((lazy, text)) = self.lazy {
+            let name = lazy.statements[lazy.find(id)?].name;
+            return (name.end != 0).then(|| &text[name.range()]);
+        }
         let index = self
             .entity_names_by_id
             .binary_search_by_key(&id, |&(id, _)| id)
@@ -1560,6 +1748,48 @@ mod tests {
                 .entity_name,
             "IFCDOOR"
         );
+    }
+
+    #[test]
+    fn documents_above_the_ast_limit_keep_a_lazy_index_in_step_with_edits() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+        let mut document =
+            Document::new_unloaded("DATA;\n#1=IFCWALL('a');\n#2=IFCSLAB($);\nENDSEC;\n".into());
+        document.reload_parse_state(&mut parser, 1);
+        assert!(!document.has_ast() && document.ast_skipped);
+
+        let edits = [
+            (Position::new(1, 11), Position::new(1, 13), "'b"),
+            (Position::new(2, 10), Position::new(2, 10), "X"),
+            (Position::new(0, 5), Position::new(1, 0), "\n\n"),
+            (Position::new(3, 10), Position::new(3, 11), ""),
+        ];
+        for (start, end, text) in edits {
+            document
+                .apply_content_changes(
+                    &mut parser,
+                    &[change(Some(Range::new(start, end)), text)],
+                    1,
+                )
+                .expect("change should be valid");
+            assert_eq!(
+                document.lazy.as_deref(),
+                Some(&handwritten::Document::parse(
+                    document.text.as_bytes(),
+                    false
+                )),
+                "{:?}",
+                document.text
+            );
+        }
+
+        document
+            .apply_content_changes(&mut parser, &[change(None, "#1=IFCWALL($);")], 1024)
+            .expect("change should be valid");
+        assert!(document.lazy.is_none() && document.has_ast());
     }
 
     #[test]

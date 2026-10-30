@@ -8,6 +8,7 @@ use tower_lsp::lsp_types::Diagnostic;
 
 use crate::document::Document;
 use crate::document_tree::DocumentTree;
+use crate::handwritten;
 use crate::schema::SchemaDoc;
 
 pub mod datatype;
@@ -17,6 +18,7 @@ pub mod syntax;
 #[derive(Debug)]
 pub struct DiagnosticSnapshot {
     tree: Option<DocumentTree>,
+    lazy: Option<Arc<handwritten::Document>>,
     text: Arc<String>,
     schema_name: Option<String>,
 }
@@ -25,6 +27,7 @@ impl DiagnosticSnapshot {
     pub fn from_document(document: &Document) -> Self {
         Self {
             tree: document.tree.clone(),
+            lazy: document.lazy.clone(),
             text: Arc::clone(&document.text),
             schema_name: document.schema_name.clone(),
         }
@@ -36,6 +39,10 @@ impl DiagnosticSnapshot {
 
     pub fn tree(&self) -> Option<&DocumentTree> {
         self.tree.as_ref()
+    }
+
+    pub fn lazy(&self) -> Option<&handwritten::Document> {
+        self.lazy.as_deref()
     }
 
     pub fn text(&self) -> &str {
@@ -53,7 +60,16 @@ pub fn collect(
     schema: Option<(&str, &SchemaDoc)>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
-    if let Some((schema_name, schema)) = schema {
+    if let (Some(lazy), Some((schema_name, schema))) = (snapshot.lazy(), schema) {
+        let entity_types = crate::document::lazy_entity_type_index(lazy, snapshot.text());
+        diagnostics.extend(datatype::collect_lazy(
+            lazy,
+            snapshot.text(),
+            &entity_types,
+            schema,
+            Some(schema_name),
+        ));
+    } else if let Some((schema_name, schema)) = schema {
         let entity_types =
             crate::document::build_entity_type_index(snapshot.tree(), snapshot.text());
         diagnostics.extend(datatype::collect_streaming(
@@ -85,6 +101,42 @@ mod tests {
         let snapshot = snapshot_of("FILE_SCHEMA(('IFC4X3'));\n#10=IFCWALL((;\n");
 
         assert!(!collect(&snapshot, None).is_empty());
+    }
+
+    #[test]
+    fn documents_above_the_ast_limit_get_syntax_diagnostics_from_the_lazy_index() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("IFC parser language should load");
+        let mut document =
+            Document::new_unloaded("DATA;\n#1=IFCWALL('a);\n#2=IFCSLAB X$);\nENDSEC;\n".into());
+        document.reload_parse_state(&mut parser, 1);
+
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&document), None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.range, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    tower_lsp::lsp_types::Range::new(
+                        tower_lsp::lsp_types::Position::new(1, 11),
+                        tower_lsp::lsp_types::Position::new(1, 12),
+                    ),
+                    "Unclosed string; expected `'`",
+                ),
+                (
+                    tower_lsp::lsp_types::Range::new(
+                        tower_lsp::lsp_types::Position::new(2, 11),
+                        tower_lsp::lsp_types::Position::new(2, 12),
+                    ),
+                    "Invalid IFC STEP syntax; expected (",
+                ),
+            ]
+        );
     }
 
     #[test]
