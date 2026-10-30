@@ -88,11 +88,8 @@ fn scan(
     mut visit: impl FnMut(IdToken) -> bool,
 ) -> usize {
     while offset < bytes.len() && offset <= stop_after {
+        let wants_schema = schema.as_deref().is_some_and(Option::is_none);
         match bytes[offset] {
-            b'\n' => {
-                line_offsets.push(offset + 1);
-                offset += 1;
-            }
             b'\'' => offset = skip_string(bytes, offset, line_offsets),
             b'/' if bytes.get(offset + 1) == Some(&b'*') => {
                 offset = skip_block_comment(bytes, offset, line_offsets);
@@ -112,20 +109,30 @@ fn scan(
                     offset += 1;
                 }
             }
-            byte if is_identifier_start(byte) => {
+            b'\n' if wants_schema => {
+                line_offsets.push(offset + 1);
+                offset += 1;
+            }
+            byte if wants_schema && is_identifier_start(byte) => {
                 let ident_start = offset;
                 offset += 1;
                 while offset < bytes.len() && is_identifier_part(bytes[offset]) {
                     offset += 1;
                 }
                 if let Some(schema) = schema.as_deref_mut()
-                    && schema.is_none()
                     && bytes[ident_start..offset].eq_ignore_ascii_case(b"FILE_SCHEMA")
                 {
                     *schema = parse_file_schema_name(bytes, offset);
                 }
             }
-            _ => offset += 1,
+            _ if wants_schema => offset += 1,
+            _ => {
+                let end = memchr::memchr3(b'#', b'\'', b'/', &bytes[offset + 1..])
+                    .map_or(bytes.len(), |n| offset + 1 + n)
+                    .min(stop_after.saturating_add(1));
+                push_lines(bytes, offset, end, line_offsets);
+                offset = end;
+            }
         }
     }
     offset
@@ -327,7 +334,8 @@ fn skip_string(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> us
 fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> (usize, bool) {
     let len = bytes.len();
     offset += 1;
-    while offset < len {
+    while let Some(n) = memchr::memchr3(b'\n', b'\'', b';', &bytes[offset..]) {
+        offset += n;
         match bytes[offset] {
             b'\n' => {
                 let mut next = offset + 1;
@@ -347,7 +355,7 @@ fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) ->
                     return (offset + 1, true);
                 }
             }
-            b';' if handwritten::definition(
+            _ if handwritten::definition(
                 bytes,
                 handwritten::trivia(bytes, offset + 1, len),
                 len,
@@ -358,21 +366,30 @@ fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) ->
             _ => offset += 1,
         }
     }
-    (offset, false)
+    (len, false)
 }
 
-fn skip_block_comment(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> usize {
-    offset += 2;
-    while offset + 1 < bytes.len() {
-        if bytes[offset] == b'*' && bytes[offset + 1] == b'/' {
-            return offset + 2;
+fn skip_block_comment(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> usize {
+    match memchr::memmem::find(&bytes[offset + 2..], b"*/") {
+        Some(n) => {
+            let end = offset + 2 + n;
+            push_lines(bytes, offset + 2, end, line_offsets);
+            end + 2
         }
-        if bytes[offset] == b'\n' {
-            line_offsets.push(offset + 1);
+        None => {
+            push_lines(
+                bytes,
+                offset + 2,
+                (bytes.len() - 1).max(offset + 2),
+                line_offsets,
+            );
+            bytes.len()
         }
-        offset += 1;
     }
-    bytes.len()
+}
+
+fn push_lines(bytes: &[u8], start: usize, end: usize, line_offsets: &mut Vec<usize>) {
+    line_offsets.extend(memchr::memchr_iter(b'\n', &bytes[start..end]).map(|n| start + n + 1));
 }
 
 fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<(String, usize)> {
