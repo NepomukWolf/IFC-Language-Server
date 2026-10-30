@@ -11,10 +11,20 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
         return Vec::new();
     };
 
+    let text = snapshot.text();
+    let mut line = 0;
+    let mut line_start = 0;
     let mut diagnostics: Vec<_> = tree
         .unclosed_strings
         .iter()
-        .map(|string| unclosed_string_diagnostic(snapshot.text(), string.quote))
+        .map(|string| {
+            let scanned = line_start;
+            for newline in memchr::memchr_iter(b'\n', &text.as_bytes()[scanned..string.quote]) {
+                line += 1;
+                line_start = scanned + newline + 1;
+            }
+            unclosed_string_diagnostic(text, line, line_start, string.quote)
+        })
         .collect();
     let mut cursor = tree.root_node().walk();
     collect_error_nodes(&mut cursor, &tree.unclosed_strings, &mut diagnostics);
@@ -27,11 +37,13 @@ fn follows_unclosed_string(unclosed_strings: &[UnclosedString], offset: usize) -
     index > 0 && unclosed_strings[index - 1].end >= offset
 }
 
-fn unclosed_string_diagnostic(text: &str, offset: usize) -> Diagnostic {
-    let prefix = &text[..offset];
-    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
-    let line = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
-    let column = prefix[line_start..]
+fn unclosed_string_diagnostic(
+    text: &str,
+    line: u32,
+    line_start: usize,
+    offset: usize,
+) -> Diagnostic {
+    let column = text[line_start..offset]
         .chars()
         .map(|character| character.len_utf16() as u32)
         .sum::<u32>();
@@ -214,6 +226,37 @@ mod tests {
                     "Unclosed string; expected `'`".to_string()
                 ),
                 (Position::new(5, 7), "Missing `;`".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_errors_read_out_of_phase_until_the_next_unclosed_string() {
+        let text = (1..=30)
+            .map(|id| match id {
+                10 | 20 => format!("#{id}=X('a);\n"),
+                25 => format!("#{id}=X(1)\n"),
+                _ => format!("#{id}=X('v',(1.,2.),.T.,'w',#3);\n"),
+            })
+            .collect::<String>();
+        let doc = parse_document(&format!("DATA;\n{text}ENDSEC;\n"));
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range.start, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [
+                (
+                    Position::new(10, 6),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (
+                    Position::new(20, 6),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (Position::new(25, 8), "Missing `;`".to_string()),
             ]
         );
     }

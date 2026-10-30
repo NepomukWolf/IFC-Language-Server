@@ -52,13 +52,14 @@ impl DocumentTree {
         );
         let odd_quotes = odd_quote_entities(text);
         for (start, end) in &mut errors {
-            let causes = &odd_quotes[causing_strings(text, &odd_quotes, *start)];
+            let causing = causing_strings(text, &odd_quotes, *start);
+            let causes = &odd_quotes[causing.clone()];
             if let (Some(first), Some(last)) = (causes.first(), causes.last()) {
                 result
                     .unclosed_strings
-                    .extend(causes.iter().map(|entity| UnclosedString {
-                        quote: entity.first_quote,
-                        end: swallowed_end(text, entity),
+                    .extend(causing.clone().map(|index| UnclosedString {
+                        quote: odd_quotes[index].first_quote,
+                        end: swallowed_end(text, &odd_quotes, index),
                     }));
                 *start = first.first_quote;
                 *end = line_end(text, last.last_quote);
@@ -79,11 +80,9 @@ impl DocumentTree {
             .unclosed_strings
             .sort_unstable_by_key(|string| string.quote);
         result.unclosed_strings.dedup();
+        let errors = SortedSpans::new(errors);
         for node in entities {
-            if !errors
-                .iter()
-                .any(|&(start, end)| node.start_byte() <= end && node.end_byte() >= start)
-            {
+            if !errors.any_touching(node.start_byte(), node.end_byte()) {
                 let range = node.range();
                 if let Some(previous) = result.omitted.last_mut()
                     && text[previous.end_byte..range.start_byte]
@@ -134,12 +133,11 @@ impl DocumentTree {
             }
             let mut crossing = Vec::new();
             crossing_spans(structured.root_node(), &mut crossing);
+            let crossing = SortedSpans::new(crossing);
             let previous = result.omitted.len();
-            result.omitted.retain(|range| {
-                !crossing
-                    .iter()
-                    .any(|&(start, end)| start < range.end_byte && end > range.start_byte)
-            });
+            result
+                .omitted
+                .retain(|range| !crossing.any_crossing(range.start_byte, range.end_byte));
             if previous == result.omitted.len() {
                 result.structured = Some(structured);
                 break;
@@ -249,6 +247,42 @@ fn collect_recovery_nodes<'a>(
     }
 }
 
+/// Byte spans sorted by start, with the furthest end among each prefix.
+struct SortedSpans {
+    spans: Vec<(usize, usize)>,
+    furthest_ends: Vec<usize>,
+}
+
+impl SortedSpans {
+    fn new(mut spans: Vec<(usize, usize)>) -> Self {
+        spans.sort_unstable();
+        let mut furthest = 0;
+        let furthest_ends = spans
+            .iter()
+            .map(|&(_, end)| {
+                furthest = furthest.max(end);
+                furthest
+            })
+            .collect();
+        Self {
+            spans,
+            furthest_ends,
+        }
+    }
+
+    /// Whether a span starts before `end` and ends after `start`.
+    fn any_crossing(&self, start: usize, end: usize) -> bool {
+        let count = self.spans.partition_point(|span| span.0 < end);
+        count > 0 && self.furthest_ends[count - 1] > start
+    }
+
+    /// Whether a span starts at or before `end` and ends at or after `start`.
+    fn any_touching(&self, start: usize, end: usize) -> bool {
+        let count = self.spans.partition_point(|span| span.0 <= end);
+        count > 0 && self.furthest_ends[count - 1] >= start
+    }
+}
+
 fn crossing_spans(node: Node<'_>, spans: &mut Vec<(usize, usize)>) {
     if node.is_error()
         || node.is_missing()
@@ -333,24 +367,31 @@ fn causing_strings(
 ) -> std::ops::Range<usize> {
     let last = odd_quotes.partition_point(|entity| entity.start <= error_start);
     let mut first = last;
-    while first > 0 && swallowed_end(text, &odd_quotes[first - 1]) >= error_start {
+    while first > 0 && swallowed_end(text, odd_quotes, first - 1) >= error_start {
         first -= 1;
     }
     first..last
 }
 
-/// End of the line where the string opened by the entity's last quote is closed by the next
-/// quote in the document.
-fn swallowed_end(text: &[u8], entity: &OddQuoteEntity) -> usize {
-    let mut offset = entity.last_quote + 1;
-    while let Some(found) = memchr::memchr(b'\'', &text[offset..]) {
-        offset += found;
-        if text.get(offset + 1) != Some(&b'\'') {
-            return line_end(text, offset);
-        }
-        offset += 2;
-    }
-    line_end(text, entity.last_quote)
+/// End of the text affected by the unclosed string of the entity at `index`. Each entity in
+/// `odd_quotes` flips which quotes open strings, so the text from an entity at an even index to
+/// the end of the next one's line is read out of phase; with no next one, everything up to the
+/// last quote is. Error recovery resumes only after the statement that follows.
+fn swallowed_end(text: &[u8], odd_quotes: &[OddQuoteEntity], index: usize) -> usize {
+    let entity = &odd_quotes[index];
+    let last_quote = if index % 2 == 1 {
+        entity.last_quote
+    } else if let Some(next) = odd_quotes.get(index + 1) {
+        next.last_quote
+    } else {
+        entity.last_quote
+            + memchr::memrchr(b'\'', &text[entity.last_quote..])
+                .expect("the entity's own last quote")
+    };
+    let out_of_phase = line_end(text, last_quote);
+    memchr::memchr(b';', &text[out_of_phase..]).map_or(text.len(), |semicolon| {
+        line_end(text, out_of_phase + semicolon)
+    })
 }
 
 fn is_entity_start(text: &[u8], offset: usize) -> bool {
@@ -402,6 +443,19 @@ mod tests {
         assert_eq!(unclosed_quotes(text, 25), [5, 24]);
         let far = b"#1=X('a);\n#2=X(1);\n#3=X(2)\n#4=X(3);\n";
         assert!(unclosed_quotes(far, 27).is_empty());
+    }
+
+    #[test]
+    fn an_unclosed_string_affects_text_up_to_the_statement_after_the_next_one() {
+        let text = "#1=X('a);\n#2=X('b','c');\n#3=X('d');\n#4=X('e);\n#5=X(1);\n#6=X('f');\n";
+        let odd_quotes = odd_quote_entities(text.as_bytes());
+        let ends: Vec<_> = (0..odd_quotes.len())
+            .map(|index| swallowed_end(text.as_bytes(), &odd_quotes, index))
+            .collect();
+        let line_end = |entity: &str| {
+            text.find(entity).unwrap() + text[text.find(entity).unwrap()..].find('\n').unwrap()
+        };
+        assert_eq!(ends, [line_end("#5="), line_end("#5=")]);
     }
 
     #[test]
