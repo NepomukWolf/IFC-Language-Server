@@ -582,6 +582,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-ifc",
+ "tree-sitter-language",
  "ureq",
  "uuid",
 ]

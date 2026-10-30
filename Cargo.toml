@@ -17,6 +17,7 @@ tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.27"
 tree-sitter-ifc = "0.1.0"
+tree-sitter-language = "0.1"
 time = "0.3"
 tracing = { version = "0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
