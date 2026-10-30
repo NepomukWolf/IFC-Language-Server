@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-use tree_sitter::{InputEdit, Language, Node, Parser, Point, Tree, TreeCursor};
+use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
 
 use crate::document_index::{TextIndex, scan_text};
+use crate::document_tree::DocumentTree;
 use crate::step::compact::{self, CompactKind, CompactValue};
 
 pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
@@ -21,7 +22,7 @@ pub enum ApplyChangeError {
 #[derive(Debug)]
 pub struct Document {
     pub text: Arc<String>,
-    pub tree: Option<Tree>,
+    pub tree: Option<DocumentTree>,
     pub ast_skipped: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
@@ -254,7 +255,7 @@ impl Document {
     fn parse_current_text(
         &mut self,
         parser: &mut Parser,
-        old_tree: Option<&Tree>,
+        old_tree: Option<&DocumentTree>,
         ast_file_size_limit_bytes: usize,
     ) {
         self.ast_skipped = false;
@@ -263,7 +264,7 @@ impl Document {
             return;
         }
 
-        self.tree = parse_with_structured_fallback(parser, self.text.as_bytes(), old_tree);
+        self.tree = DocumentTree::parse(parser, self.text.as_bytes(), old_tree);
     }
 
     #[cfg(test)]
@@ -284,21 +285,13 @@ impl Document {
     pub fn node_at_position(&self, position: Position) -> Option<Node<'_>> {
         let tree = self.tree.as_ref()?;
         let offset = self.position_to_offset(position)?;
-        let line_start = *self.line_offsets.get(position.line as usize)?;
-        let point = Point {
-            row: position.line as usize,
-            column: offset.checked_sub(line_start)?,
-        };
-
-        tree.root_node().descendant_for_point_range(point, point)
+        tree.node_at_offset(offset)
     }
 
     pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
         let definition_offset = *self.definitions.get(&id)?;
         let tree = self.tree.as_ref()?;
-        let mut node = tree
-            .root_node()
-            .descendant_for_byte_range(definition_offset, definition_offset)?;
+        let mut node = tree.node_at_offset(definition_offset)?;
         while node.kind() != "entity_instance" {
             node = node.parent()?;
         }
@@ -545,7 +538,7 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
+pub fn build_entity_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
 
     for_each_entity_node(tree, |node| {
@@ -557,7 +550,7 @@ pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstance
     EntityInstanceCollection::new(instances)
 }
 
-pub fn build_entity_type_index(tree: Option<&Tree>, text: &str) -> EntityTypeIndex {
+pub fn build_entity_type_index(tree: Option<&DocumentTree>, text: &str) -> EntityTypeIndex {
     let mut index = EntityTypeIndex::default();
 
     for_each_entity_node(tree, |node| {
@@ -597,50 +590,19 @@ impl EntityInstanceCollection {
     }
 }
 
-/// Parses with the compact grammar unless the text has a syntax error. Trees with errors come
-/// from the structured grammar, whose error recovery the compact tokens would change; an edit
-/// to such a tree stays structured until the text is valid again.
-fn parse_with_structured_fallback(
-    parser: &mut Parser,
-    text: &[u8],
-    old_tree: Option<&Tree>,
-) -> Option<Tree> {
-    let compact: Language = tree_sitter_ifc::LANGUAGE.into();
-    let structured: Language = tree_sitter_ifc::LANGUAGE_STRUCTURED.into();
-    let old_structured = old_tree.filter(|tree| *tree.language() == structured);
-    if old_structured.is_some() {
-        set_language(parser, &structured);
-        let tree = parser.parse(text, old_structured)?;
-        if tree.root_node().has_error() {
-            return Some(tree);
-        }
-    }
-
-    set_language(parser, &compact);
-    let tree = parser.parse(text, old_tree.filter(|_| old_structured.is_none()))?;
-    if !tree.root_node().has_error() {
-        return Some(tree);
-    }
-    drop(tree);
-    set_language(parser, &structured);
-    let tree = parser.parse(text, None);
-    set_language(parser, &compact);
-    tree
-}
-
-fn set_language(parser: &mut Parser, language: &Language) {
-    parser
-        .set_language(language)
-        .expect("IFC grammar matches the tree-sitter ABI");
-}
-
-pub(crate) fn for_each_entity_node<'a>(tree: Option<&'a Tree>, mut visit: impl FnMut(Node<'a>)) {
+pub(crate) fn for_each_entity_node<'a>(
+    tree: Option<&'a DocumentTree>,
+    visit: impl FnMut(Node<'a>),
+) {
     if let Some(tree) = tree {
-        visit_entity_nodes(&mut tree.root_node().walk(), &mut visit);
+        tree.for_each_entity(visit);
     }
 }
 
-fn visit_entity_nodes<'a>(cursor: &mut TreeCursor<'a>, visit: &mut impl FnMut(Node<'a>)) {
+pub(crate) fn visit_entity_nodes<'a>(
+    cursor: &mut TreeCursor<'a>,
+    visit: &mut impl FnMut(Node<'a>),
+) {
     loop {
         let node = cursor.node();
         let is_entity = node.kind() == "entity_instance";
@@ -1015,6 +977,7 @@ fn point_after_text(start: Point, text: &str) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Tree;
 
     fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
@@ -1231,7 +1194,7 @@ mod tests {
         let mut parser = Parser::new();
         let mut document = parse_document(invalid);
         assert_eq!(
-            node_spans(document.tree.as_ref().unwrap()),
+            node_spans(document.tree.as_ref().unwrap().structured.as_ref().unwrap()),
             structured_spans(invalid)
         );
 
@@ -1257,7 +1220,7 @@ mod tests {
             .unwrap();
         assert_eq!(document.text.as_str(), invalid);
         assert_eq!(
-            node_spans(document.tree.as_ref().unwrap()),
+            node_spans(document.tree.as_ref().unwrap().structured.as_ref().unwrap()),
             structured_spans(invalid)
         );
     }

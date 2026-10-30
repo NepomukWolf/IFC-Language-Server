@@ -34,7 +34,7 @@ fn collect_with_schema_name(
 }
 
 pub fn collect_streaming(
-    tree: Option<&tree_sitter::Tree>,
+    tree: Option<&crate::document_tree::DocumentTree>,
     text: &str,
     entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
