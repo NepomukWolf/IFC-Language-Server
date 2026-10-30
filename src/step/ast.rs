@@ -1,5 +1,7 @@
 //! Tree-sitter helpers for locating STEP instance and parameter context around a cursor node.
 
+use crate::step::compact::{self, CompactKind};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParameterContext {
     pub instance_id: u32,
@@ -7,13 +9,24 @@ pub struct ParameterContext {
     pub parameter_index: usize,
 }
 
-pub fn parameter_context(node: tree_sitter::Node<'_>, text: &str) -> Option<ParameterContext> {
+/// `offset` is the byte offset `node` was looked up at.
+pub fn parameter_context(
+    node: tree_sitter::Node<'_>,
+    offset: usize,
+    text: &str,
+) -> Option<ParameterContext> {
     let entity_instance = ancestor_with_kind(node, "entity_instance")?;
-    let parameter_sequence = entity_parameter_sequence(entity_instance)?;
-    let parameter_index = parameter_sequence
-        .named_children(&mut parameter_sequence.walk())
-        .filter(|child| child.kind() == "parameter")
-        .position(|parameter| contains_node(parameter, node))?;
+    let parameter_index = if node.kind() == "compact_parameter_list" {
+        compact::parameters(text, node.start_byte())
+            .iter()
+            .position(|parameter| parameter.start <= offset && offset < parameter.end)?
+    } else {
+        let parameter_sequence = entity_parameter_sequence(entity_instance)?;
+        parameter_sequence
+            .named_children(&mut parameter_sequence.walk())
+            .filter(|child| child.kind() == "parameter")
+            .position(|parameter| contains_node(parameter, node))?
+    };
 
     Some(ParameterContext {
         instance_id: parse_instance_id(entity_instance, text)?,
@@ -22,8 +35,49 @@ pub fn parameter_context(node: tree_sitter::Node<'_>, text: &str) -> Option<Para
     })
 }
 
+/// Byte span of the omitted value (`*`) at `offset`, looked up as `node`.
+pub fn omitted_value_span(
+    node: tree_sitter::Node<'_>,
+    offset: usize,
+    text: &str,
+) -> Option<(usize, usize)> {
+    match node.kind() {
+        "omitted_value" => Some((node.start_byte(), node.end_byte())),
+        "compact_parameter_list" => {
+            let parameters = compact::parameters(text, node.start_byte());
+            let value = *compact::values_at(&parameters, offset).last()?;
+            (value.kind == CompactKind::Omitted).then_some((value.start, value.end))
+        }
+        _ => None,
+    }
+}
+
+/// Byte span of a typed value's type name (`IFCLABEL` in `IFCLABEL('x')`) when `offset`, looked
+/// up as `node`, is inside that name.
+pub fn typed_value_name_span(
+    node: tree_sitter::Node<'_>,
+    offset: usize,
+    text: &str,
+) -> Option<(usize, usize)> {
+    let (start, end) = if node.kind() == "compact_parameter_list" {
+        let parameters = compact::parameters(text, node.start_byte());
+        compact::values_at(&parameters, offset)
+            .into_iter()
+            .rev()
+            .find_map(|value| match value.kind {
+                CompactKind::Typed { name_end, .. } => Some((value.start, name_end)),
+                _ => None,
+            })?
+    } else {
+        let typed_parameter = ancestor_with_kind(node, "typed_parameter")?;
+        let entity_name = child_with_kind(typed_parameter, "entity_name")?;
+        (entity_name.start_byte(), entity_name.end_byte())
+    };
+    (start <= offset && offset < end).then_some((start, end))
+}
+
 /// Walks up from `node` to the nearest ancestor (or `node` itself) with `expected_kind`.
-pub(crate) fn ancestor_with_kind<'tree>(
+fn ancestor_with_kind<'tree>(
     mut node: tree_sitter::Node<'tree>,
     expected_kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
@@ -36,7 +90,7 @@ pub(crate) fn ancestor_with_kind<'tree>(
 }
 
 /// First direct child of `node` with `expected_kind`.
-pub(crate) fn child_with_kind<'tree>(
+fn child_with_kind<'tree>(
     node: tree_sitter::Node<'tree>,
     expected_kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {

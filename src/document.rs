@@ -9,6 +9,7 @@ use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree, TreeCursor};
 
 use crate::document_index::{TextIndex, scan_text};
+use crate::step::compact::{self, CompactKind, CompactValue};
 
 pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
 
@@ -626,8 +627,12 @@ pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<Entity
     let mut instance = parse_entity_header(node, text)?;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "parameter_list" {
-            instance.parameters = parse_parameter_list(child, text);
+        match child.kind() {
+            "parameter_list" => instance.parameters = parse_parameter_list(child, text),
+            "compact_parameter_list" => {
+                instance.parameters = parse_compact_parameter_list(child, text);
+            }
+            _ => {}
         }
     }
     Some(instance)
@@ -653,7 +658,7 @@ fn parse_entity_header(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo>
                 entity_name = Some(name.to_ascii_uppercase());
                 entity_name_range = Some(node_range(&child));
             }
-            "parameter_list" => {
+            "parameter_list" | "compact_parameter_list" => {
                 parameter_list_range = Some(node_range(&child));
             }
             _ => {}
@@ -686,6 +691,86 @@ fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
         .filter(|child| child.kind() == "parameter")
         .map(|parameter| parse_parameter(parameter, text))
         .collect()
+}
+
+fn parse_compact_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
+    let mut points = PointCursor {
+        text: text.as_bytes(),
+        offset: node.start_byte(),
+        point: node.start_position(),
+    };
+    compact::parameters(text, node.start_byte())
+        .iter()
+        .map(|value| compact_parameter_value(value, text, &mut points))
+        .collect()
+}
+
+fn compact_parameter_value(
+    value: &CompactValue,
+    text: &str,
+    points: &mut PointCursor<'_>,
+) -> ParameterValue {
+    let start = points.position(value.start);
+    let source = &text[value.start..value.end];
+    let children = match &value.kind {
+        CompactKind::Typed { inner: values, .. } | CompactKind::List(values) => values
+            .iter()
+            .map(|value| compact_parameter_value(value, text, points))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let range = Range {
+        start,
+        end: points.position(value.end),
+    };
+    match &value.kind {
+        CompactKind::String => ParameterValue::String { range },
+        CompactKind::Number => ParameterValue::Number {
+            text: source.to_string(),
+            range,
+        },
+        CompactKind::Reference => match source[1..].parse::<u32>() {
+            Ok(id) => ParameterValue::Reference { id, range },
+            Err(_) => ParameterValue::Unknown { range },
+        },
+        CompactKind::Enumeration => ParameterValue::Enumeration {
+            value: source.trim_matches('.').to_ascii_uppercase(),
+            range,
+        },
+        CompactKind::Null => ParameterValue::Null { range },
+        CompactKind::Omitted => ParameterValue::Omitted { range },
+        CompactKind::Typed { name_end, .. } => ParameterValue::Typed {
+            type_name: text[value.start..*name_end].to_ascii_uppercase(),
+            inner: children,
+            range,
+        },
+        CompactKind::List(_) => ParameterValue::List {
+            items: children,
+            range,
+        },
+    }
+}
+
+/// Converts monotonically increasing byte offsets to tree-sitter style positions.
+struct PointCursor<'a> {
+    text: &'a [u8],
+    offset: usize,
+    point: Point,
+}
+
+impl PointCursor<'_> {
+    fn position(&mut self, offset: usize) -> Position {
+        for byte in &self.text[self.offset..offset] {
+            if *byte == b'\n' {
+                self.point.row += 1;
+                self.point.column = 0;
+            } else {
+                self.point.column += 1;
+            }
+        }
+        self.offset = offset;
+        Position::new(self.point.row as u32, self.point.column as u32)
+    }
 }
 
 fn parse_parameter(node: Node<'_>, text: &str) -> ParameterValue {
@@ -972,7 +1057,7 @@ mod tests {
 
     #[test]
     fn node_at_position_finds_reference() {
-        let text = "#1=IFCWALL(#2);";
+        let text = "#1=IFCWALL(#2,((#3)));";
         let document = parse_document(text);
 
         let node = document
@@ -981,6 +1066,63 @@ mod tests {
 
         assert_eq!(node.kind(), "reference");
         assert_eq!(node.utf8_text(document.text.as_bytes()).ok(), Some("#2"));
+    }
+
+    fn contains_kind(node: Node<'_>, kind: &str) -> bool {
+        node.kind() == kind
+            || node
+                .children(&mut node.walk())
+                .any(|child| contains_kind(child, kind))
+    }
+
+    #[test]
+    fn compact_parameter_lists_match_structured_parsing() {
+        // `~` becomes a space in the compact text and a form feed, which the compact token does
+        // not accept, in the structured text, so both parse at identical offsets.
+        let cases = [
+            "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL~('it''s'),*);",
+            "#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.~);",
+            "#3=IFCX((1.,-2.5E-3,.5),(#1,#22),(),('a',IFCREAL(1.),*),~#4294967296,.T.,'/');",
+            "#4=IFCX(\n  'a\nb',\n~#5,\n  (1,\n2), ( .A. , $ )\n);",
+            "#5=IFCX(IFCBOOLEAN~(.T.),IFCINTEGER(-3),(IFCLABEL ( '' ),*));",
+            "#6=IFCX(~);",
+        ];
+        for case in cases {
+            let compact = parse_document(&case.replace('~', " "));
+            let structured = parse_document(&case.replace('~', "\u{c}"));
+            let compact_root = compact.tree.as_ref().unwrap().root_node();
+            let structured_root = structured.tree.as_ref().unwrap().root_node();
+            assert!(
+                contains_kind(compact_root, "compact_parameter_list"),
+                "{case}"
+            );
+            assert!(
+                !contains_kind(structured_root, "compact_parameter_list"),
+                "{case}"
+            );
+            assert!(
+                !compact_root.has_error() && !structured_root.has_error(),
+                "{case}"
+            );
+            assert_eq!(
+                build_entity_instances(compact.tree.as_ref(), &compact.text).instances,
+                build_entity_instances(structured.tree.as_ref(), &structured.text).instances,
+                "{case}"
+            );
+
+            for offset in 0..=case.len() {
+                let position = compact.offset_to_position(offset).unwrap();
+                let lookup = |document: &Document| {
+                    let node = document.node_at_position(position)?;
+                    Some((
+                        crate::step::ast::parameter_context(node, offset, &document.text),
+                        crate::step::ast::omitted_value_span(node, offset, &document.text),
+                        crate::step::ast::typed_value_name_span(node, offset, &document.text),
+                    ))
+                };
+                assert_eq!(lookup(&compact), lookup(&structured), "{case} at {offset}");
+            }
+        }
     }
 
     #[test]
