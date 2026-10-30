@@ -254,6 +254,9 @@ impl Backend {
         uri: &Url,
         ticket: &DiagnosticTicket,
     ) -> Option<DiagnosticSnapshot> {
+        if !self.diagnostic_scheduler.is_current(ticket).await {
+            return None;
+        }
         let mut documents = self.documents.write().await;
         if !self.diagnostic_scheduler.is_current(ticket).await {
             return None;
