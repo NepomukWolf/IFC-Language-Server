@@ -637,4 +637,183 @@ mod tests {
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
+
+    fn select_schema() -> SchemaDoc {
+        schema_from(
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcLabel = STRING(255);
+              END_TYPE;
+              TYPE IfcIdentifier = IfcLabel;
+              END_TYPE;
+              TYPE IfcLengthMeasure = REAL;
+              END_TYPE;
+              TYPE IfcCountMeasure = INTEGER;
+              END_TYPE;
+              TYPE IfcBoolean = BOOLEAN;
+              END_TYPE;
+              TYPE IfcWallTypeEnum = ENUMERATION OF (MOVABLE, USERDEFINED);
+              END_TYPE;
+              TYPE IfcMeasureValue = SELECT (IfcLengthMeasure, IfcCountMeasure);
+              END_TYPE;
+              TYPE IfcSimpleValue = SELECT (IfcLabel, IfcIdentifier, IfcBoolean);
+              END_TYPE;
+              TYPE IfcValue = SELECT (IfcMeasureValue, IfcSimpleValue);
+              END_TYPE;
+              TYPE IfcWallSelect = SELECT (IfcWall, IfcWallTypeEnum);
+              END_TYPE;
+              TYPE IfcLooseSelect = SELECT (IfcUndeclared, IfcLabel);
+              END_TYPE;
+              ENTITY IfcRoot;
+              END_ENTITY;
+              ENTITY IfcWall
+                SUBTYPE OF (IfcRoot);
+              END_ENTITY;
+              ENTITY IfcProperty;
+                NominalValue : OPTIONAL IfcValue;
+                Wall : OPTIONAL IfcWallSelect;
+                ListValues : OPTIONAL LIST [1:?] OF IfcValue;
+                Loose : OPTIONAL IfcLooseSelect;
+              END_ENTITY;
+              ENTITY IfcMisc;
+                Count : INTEGER;
+                Ratio : REAL;
+                Name : IfcLabel;
+                Flag : LOGICAL;
+                Data : BINARY;
+                Kind : IfcWallTypeEnum;
+                Parent : IfcRoot;
+                Pair : LIST [1:2] OF IfcLabel;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        )
+    }
+
+    fn rendered_diagnostics(text: &str) -> Vec<String> {
+        let doc = parse_document(text);
+        let instances = instances(&doc);
+        collect_with_schema_name(&instances, &select_schema(), Some("IFC4"))
+            .iter()
+            .map(|diagnostic| {
+                let Range { start, end } = diagnostic.range;
+                format!(
+                    "{}:{}-{}:{} {:?} {:?} {}",
+                    start.line,
+                    start.character,
+                    end.line,
+                    end.character,
+                    diagnostic.severity,
+                    diagnostic.code,
+                    diagnostic.message
+                )
+            })
+            .collect()
+    }
+
+    /// Test that select values matching an option, directly or through nested selects, pass.
+    #[test]
+    fn datatype_validator_accepts_matching_select_values() {
+        let diagnostics = rendered_diagnostics(
+            "#1=IFCWALL();
+#2=IFCPROPERTY(IFCLABEL('x'),$,$,$);
+#3=IFCPROPERTY(IFCLENGTHMEASURE(2.5),$,$,$);
+#4=IFCPROPERTY(IFCCOUNTMEASURE(3),$,$,$);
+#5=IFCPROPERTY('untyped',$,$,$);
+#6=IFCPROPERTY(1.5,$,$,$);
+#7=IFCPROPERTY(IFCIDENTIFIER('a'),$,$,$);
+#8=IFCPROPERTY(IFCBOOLEAN(.T.),$,$,$);
+#9=IFCPROPERTY(.T.,#1,$,$);
+#10=IFCPROPERTY($,.MOVABLE.,$,$);
+#11=IFCPROPERTY($,IFCWALLTYPEENUM(.USERDEFINED.),$,$);
+#12=IFCPROPERTY($,$,(IFCLABEL('a'),IFCCOUNTMEASURE(1),'b'),$);
+#13=IFCPROPERTY($,$,$,IFCWALLTYPEENUM(.MOVABLE.));
+#14=IFCPROPERTY($,$,$,#1);",
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    /// Test the exact diagnostics reported for select values that match no option.
+    #[test]
+    fn datatype_validator_reports_select_mismatches() {
+        let diagnostics = rendered_diagnostics(
+            "#1=IFCWALL();
+#2=IFCPROPERTY(IFCCOUNTMEASURE(2.5),$,$,$);
+#3=IFCPROPERTY(IFCWALLTYPEENUM(.MOVABLE.),$,$,$);
+#4=IFCPROPERTY(#1,$,$,$);
+#5=IFCPROPERTY(IFCLABEL('a','b'),$,$,$);
+#6=IFCPROPERTY(IFCLABEL(1.0),$,$,$);
+#7=IFCPROPERTY(.MOVABLE.,$,$,$);
+#8=IFCPROPERTY(('a'),$,$,$);
+#9=IFCPROPERTY($,#99,$,$);
+#10=IFCPROPERTY($,.NOPE.,$,$);
+#11=IFCPROPERTY($,IFCLABEL('x'),$,$);
+#12=IFCPROPERTY($,$,(IFCLABEL('a'),IFCREAL(1.)),$);
+#13=IFCPROPERTY($,$,IFCLABEL('a'),$);
+#14=IFCPROPERTY($,$,(),$);
+#15=IFCPROPERTY(IFCUNKNOWNTYPE('x'),$,$,$);",
+        );
+
+        assert_eq!(
+            diagnostics,
+            [
+                "1:15-1:35 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "2:15-2:41 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "3:15-3:17 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "4:15-4:32 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "5:15-5:28 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "6:15-6:24 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "7:15-7:20 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+                "8:17-8:20 Some(Error) None Wall: value does not match any option of `IfcWallSelect`",
+                "9:18-9:24 Some(Error) None Wall: value does not match any option of `IfcWallSelect`",
+                "10:18-10:31 Some(Error) None Wall: value does not match any option of `IfcWallSelect`",
+                "11:20-11:47 Some(Error) None ListValues: value does not match any option of `IfcValue`",
+                "12:20-12:33 Some(Error) None ListValues: expected list aggregate but found typed value",
+                "13:20-13:22 Some(Error) None ListValues: expected at least 1 items but found 0",
+                "14:16-14:35 Some(Error) None NominalValue: value does not match any option of `IfcValue`",
+            ]
+        );
+    }
+
+    /// Test the exact diagnostics reported for non-select attribute mismatches.
+    #[test]
+    fn datatype_validator_reports_attribute_mismatches() {
+        let diagnostics = rendered_diagnostics(
+            "#1=IFCWALL();
+#2=IFCMISC(1.5,'r',2,.X.,3,.NOPE.,#99,('a','b','c'));
+#3=IFCMISC('1',#1,IFCIDENTIFIER('a'),'t',.T.,'e',#2,'p');
+#4=IFCMISC($,*,IFCLABEL('a','b'),.T.,'d',IFCWALLTYPEENUM(.MOVABLE.),#1,());
+#5=IFCMISC(1,2.0);
+#6=IFCWALLX();",
+        );
+
+        assert_eq!(
+            diagnostics,
+            [
+                "1:11-1:14 Some(Error) None Count: expected integer number",
+                "1:15-1:18 Some(Error) None Ratio: expected numeric value but found string",
+                "1:19-1:20 Some(Error) None Name: expected string but found number",
+                "1:21-1:24 Some(Error) None Flag: expected logical/boolean enumeration but found enumeration",
+                "1:25-1:26 Some(Error) None Data: expected binary literal but found number",
+                "1:27-1:33 Some(Error) None Kind: expected one of [\"MOVABLE\", \"USERDEFINED\"] but found `.NOPE.`",
+                "1:34-1:37 Some(Error) None Parent: reference `#99` does not resolve to a local entity",
+                "1:38-1:51 Some(Error) None Pair: expected at most 2 items but found 3",
+                "2:11-2:14 Some(Error) None Count: expected integer but found string",
+                "2:15-2:17 Some(Error) None Ratio: expected numeric value but found reference",
+                "2:18-2:36 Some(Error) None Name: expected typed value `IFCLABEL` but found `IFCIDENTIFIER`",
+                "2:37-2:40 Some(Error) None Flag: expected logical/boolean enumeration but found string",
+                "2:41-2:44 Some(Error) None Data: expected binary literal but found enumeration",
+                "2:45-2:48 Some(Error) None Kind: expected enumeration value but found string",
+                "2:49-2:51 Some(Error) None Parent: expected reference to `IFCROOT` but `#2` points to `IFCMISC`",
+                "2:52-2:55 Some(Error) None Pair: expected list aggregate but found string",
+                "3:11-3:12 Some(Error) None Count: attribute is required and does not allow `$`",
+                "3:13-3:14 Some(Error) None Ratio: `*` is not supported for this attribute",
+                "3:15-3:32 Some(Error) None Name: typed value `IFCLABEL` should contain exactly one argument",
+                "3:71-3:73 Some(Error) None Pair: expected at least 1 items but found 0",
+                "4:10-4:17 Some(Error) None IfcMisc expects 8 attributes but found 2",
+                "5:3-5:11 Some(Error) None Unknown IFC entity `IFCWALLX` in selected schema `IFC4`",
+            ]
+        );
+    }
 }
