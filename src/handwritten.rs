@@ -647,15 +647,19 @@ pub(crate) fn trivia(text: &[u8], mut p: usize, end: usize) -> usize {
         if text[p].is_ascii_whitespace() {
             p += 1;
         } else if text.get(p..p + 2) == Some(b"/*") {
-            p = text[p + 2..end]
-                .windows(2)
-                .position(|w| w == b"*/")
-                .map_or(end, |n| p + n + 4);
+            p = comment_end(text, p, end).unwrap_or(end);
         } else {
             break;
         }
     }
     p
+}
+
+/// End of the `/*` comment at `p`, past its `*/`.
+#[cold]
+#[inline(never)]
+fn comment_end(text: &[u8], p: usize, end: usize) -> Option<usize> {
+    memchr::memmem::find(&text[p + 2..end], b"*/").map(|n| p + n + 4)
 }
 
 /// `trivia` up to `end`, or `None` when a comment that opens before `end` doesn't close before it.
@@ -664,7 +668,7 @@ fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Option<usize> {
         if text[p].is_ascii_whitespace() {
             p += 1;
         } else if text.get(p..p + 2) == Some(b"/*") {
-            p = p + 4 + text.get(p + 2..end)?.windows(2).position(|w| w == b"*/")?;
+            p = comment_end(text, p, end)?;
         } else {
             break;
         }
@@ -689,6 +693,16 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
     let mut p = start;
     let mut quote = 0;
     while p < end {
+        let rest = &text[p..end];
+        p += if quote == 0 {
+            let stop = memchr::memchr3(b';', b'\'', b'"', rest).unwrap_or(rest.len());
+            memchr::memchr2(b'\n', b'/', &rest[..stop]).unwrap_or(stop)
+        } else {
+            memchr::memchr3(quote, b';', b'\n', rest).unwrap_or(rest.len())
+        };
+        if p == end {
+            break;
+        }
         // A definition-shaped line inside a string is treated as recovery, not string content.
         if text[p] == b'\n' {
             let mut next = p + 1;
