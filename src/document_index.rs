@@ -14,10 +14,12 @@ pub struct TextIndex {
     pub schema_end: Option<usize>,
 }
 
-/// How far before an edit a local rescan looks for an indexed `#id` to restart from, and how far
-/// past it the rescan may run before a full rescan is cheaper.
+/// Bounds of a local rescan: how far before an edit it looks for an indexed `#id` to restart
+/// from, how far past it it may run, and how many id tokens it may replace. Past them a full
+/// rescan is cheaper.
 const MAX_ANCHOR_DISTANCE: usize = 64 * 1024;
 const MAX_RESCAN_PAST_EDIT: usize = 1024 * 1024;
+const MAX_REPLACED_TOKENS: usize = 64 * 1024;
 
 pub fn scan_text(text: &str) -> TextIndex {
     rescan_text(text, TextIndex::default())
@@ -35,6 +37,7 @@ pub fn rescan_text(text: &str, mut index: TextIndex) -> TextIndex {
     scan(
         text.as_bytes(),
         0,
+        usize::MAX,
         &mut index.line_offsets,
         Some(&mut schema),
         |token| {
@@ -71,17 +74,19 @@ struct IdToken {
     definition: bool,
 }
 
-/// Scans from `offset`, which must be outside any string or comment, until the end or until
-/// `visit` returns false for an id token; returns where it stopped. Only `rescan_text` looks for
+/// Scans from `offset`, which must be outside any string or comment, until the end, until a
+/// token starts past `stop_after`, or until `visit` returns false for an id token; returns where
+/// it stopped. Only `rescan_text` looks for
 /// FILE_SCHEMA, so the other callers must start after it.
 fn scan(
     bytes: &[u8],
     mut offset: usize,
+    stop_after: usize,
     line_offsets: &mut Vec<usize>,
     mut schema: Option<&mut Option<(String, usize)>>,
     mut visit: impl FnMut(IdToken) -> bool,
 ) -> usize {
-    while offset < bytes.len() {
+    while offset < bytes.len() && offset <= stop_after {
         match bytes[offset] {
             b'\n' => {
                 line_offsets.push(offset + 1);
@@ -143,7 +148,7 @@ pub fn edit_text_index(
         return false;
     };
     let floor = schema_end.max(start.saturating_sub(MAX_ANCHOR_DISTANCE));
-    let Some(anchor) = (floor..start).rev().find(|&offset| {
+    let indexed = (floor..start).rev().find(|&offset| {
         bytes[offset] == b'#'
             && parse_id(bytes, offset).is_some_and(|(id, _)| {
                 index
@@ -151,7 +156,10 @@ pub fn edit_text_index(
                     .get(&id)
                     .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
             })
-    }) else {
+    });
+    // The scan leaves the schema name's string right at `schema_end`.
+    let Some(anchor) = indexed.or((floor == schema_end && schema_end < start).then_some(schema_end))
+    else {
         return false;
     };
 
@@ -160,22 +168,26 @@ pub fn edit_text_index(
     let mut new_lines = Vec::new();
     let mut new_tokens = Vec::new();
     let mut synced = false;
-    let new_stop = scan(bytes, anchor, &mut new_lines, None, |token| {
-        if token.offset > new_edit_end + MAX_RESCAN_PAST_EDIT {
-            return false;
-        }
-        synced = token.offset >= new_edit_end
-            && index.references.get(&token.id).is_some_and(|offsets| {
-                offsets
-                    .binary_search(&((token.offset as isize - delta) as usize))
-                    .is_ok()
-            });
-        if !synced {
-            new_tokens.push(token);
-        }
-        !synced
-    });
-    if !synced && new_stop < bytes.len() {
+    let new_stop = scan(
+        bytes,
+        anchor,
+        new_edit_end + MAX_RESCAN_PAST_EDIT,
+        &mut new_lines,
+        None,
+        |token| {
+            synced = token.offset >= new_edit_end
+                && index.references.get(&token.id).is_some_and(|offsets| {
+                    offsets
+                        .binary_search(&((token.offset as isize - delta) as usize))
+                        .is_ok()
+                });
+            if !synced {
+                new_tokens.push(token);
+            }
+            !synced
+        },
+    );
+    if !synced && new_stop < bytes.len() || new_tokens.len() > MAX_REPLACED_TOKENS {
         return false;
     }
 
@@ -186,27 +198,30 @@ pub fn edit_text_index(
     let old_stop = anchor + old_window.len();
     let mut old_lines = Vec::new();
     let mut old_tokens = Vec::new();
-    scan(&old_window, 0, &mut old_lines, None, |token| {
+    scan(&old_window, 0, usize::MAX, &mut old_lines, None, |token| {
         old_tokens.push(token);
-        true
+        old_tokens.len() <= MAX_REPLACED_TOKENS
     });
+    if old_tokens.len() > MAX_REPLACED_TOKENS {
+        return false;
+    }
 
-    let mut touched = Vec::new();
-    for token in &old_tokens {
-        let offset = anchor + token.offset;
+    let mut touched: Vec<u32> = old_tokens
+        .iter()
+        .filter(|token| token.definition)
+        .map(|token| token.id)
+        .collect();
+    let mut old_ids: Vec<u32> = old_tokens.iter().map(|token| token.id).collect();
+    old_ids.sort_unstable();
+    old_ids.dedup();
+    for id in old_ids {
         let offsets = index
             .references
-            .get_mut(&token.id)
+            .get_mut(&id)
             .expect("an old token is indexed");
-        let at = offsets
-            .binary_search(&offset)
-            .expect("an old token's offset is indexed");
-        offsets.remove(at);
+        offsets.retain(|&offset| offset < anchor || offset >= old_stop);
         if offsets.is_empty() {
-            index.references.remove(&token.id);
-        }
-        if token.definition {
-            touched.push(token.id);
+            index.references.remove(&id);
         }
     }
     let shift = |offset: &mut usize| {
@@ -228,13 +243,17 @@ pub fn edit_text_index(
     let lines_to = lines_from + old_lines.len();
     index.line_offsets.splice(lines_from..lines_to, new_lines);
 
-    for token in &new_tokens {
-        let offsets = index.references.entry(token.id).or_default();
-        let at = offsets.partition_point(|&offset| offset < token.offset);
-        offsets.insert(at, token.offset);
-        if token.definition {
-            touched.push(token.id);
-        }
+    touched.extend(
+        new_tokens
+            .iter()
+            .filter(|token| token.definition)
+            .map(|token| token.id),
+    );
+    new_tokens.sort_by_key(|token| token.id);
+    for tokens in new_tokens.chunk_by(|a, b| a.id == b.id) {
+        let offsets = index.references.entry(tokens[0].id).or_default();
+        let at = offsets.partition_point(|&offset| offset < tokens[0].offset);
+        offsets.splice(at..at, tokens.iter().map(|token| token.offset));
     }
     touched.sort_unstable();
     touched.dedup();
@@ -430,6 +449,31 @@ mod tests {
         assert_eq!(index.references.get(&1), Some(&vec![0, 50]));
         assert!(!index.references.contains_key(&2));
         assert!(!index.references.contains_key(&3));
+    }
+
+    #[test]
+    fn edits_that_change_the_rest_of_a_large_file_fall_back_to_a_full_rescan() {
+        let mut text = String::from("FILE_SCHEMA(('IFC4'));\n");
+        for id in 1..=60_000 {
+            text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
+        }
+        let quote = text.find("1',").expect("first closing quote") + 1;
+        let mut without_quote = text.clone();
+        without_quote.remove(quote);
+        let mut index = scan_text(&text);
+        assert!(!edit_text_index(
+            &mut index,
+            &without_quote,
+            quote,
+            b"'",
+            0
+        ));
+        assert!(index == scan_text(&text));
+
+        let mut with_space = text.clone();
+        with_space.insert(quote, ' ');
+        assert!(edit_text_index(&mut index, &with_space, quote, b"", 1));
+        assert!(index == scan_text(&with_space));
     }
 
     #[test]
