@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::diagnostics::DiagnosticSnapshot;
 use crate::document_tree::UnclosedString;
 
+#[tracing::instrument(skip_all)]
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     if let Some(lazy) = snapshot.lazy() {
         return collect_lazy(lazy, snapshot.text());

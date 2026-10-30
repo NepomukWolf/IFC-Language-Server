@@ -55,6 +55,7 @@ impl DiagnosticSnapshot {
 }
 
 /// Syntax diagnostics always run; schema-aware passes run only when a schema is available.
+#[tracing::instrument(skip_all)]
 pub fn collect(
     snapshot: &DiagnosticSnapshot,
     schema: Option<(&str, &SchemaDoc)>,

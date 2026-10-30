@@ -3,7 +3,8 @@
 //! `generate <mb> <out>` writes the synthetic property model.
 //! `equiv <file>...` prints diagnostics that differ between the two paths.
 //! `mutate <file>` does the same for single-statement mutations at sampled statements.
-//! `measure <ast|lazy> <file> <valid|syntax|quote>` prints one JSON record.
+//! `measure <ast|lazy> <file> <valid|syntax|quote>` prints one JSON record; with
+//! `LAZY_DIAG_SPANS` set it also logs the server's span timings to stderr.
 
 #[allow(dead_code)]
 mod lsp_session;
@@ -246,6 +247,14 @@ fn edit_anchor(text: &str) -> (usize, usize) {
 }
 
 fn measure(mode: &str, path: &Path, edit: &str) {
+    if std::env::var_os("LAZY_DIAG_SPANS").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter("ifc_language_server=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    }
     let model = Model::load(&PathBuf::from(path));
     let uri = model.uri();
     let (open, close_quote) = edit_anchor(&model.text);

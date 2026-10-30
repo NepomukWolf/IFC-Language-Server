@@ -636,6 +636,7 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+#[tracing::instrument(skip_all)]
 pub fn build_entity_type_index<'a>(
     tree: Option<&DocumentTree>,
     text: &'a str,

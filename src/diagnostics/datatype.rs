@@ -13,6 +13,7 @@ use crate::schema::{
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
 
+#[tracing::instrument(skip_all)]
 pub fn collect_streaming(
     tree: Option<&crate::document_tree::DocumentTree>,
     text: &str,
@@ -35,6 +36,7 @@ pub fn collect_streaming(
     diagnostics
 }
 
+#[tracing::instrument(skip_all)]
 pub fn collect_lazy(
     lazy: &crate::handwritten::Document,
     text: &str,
