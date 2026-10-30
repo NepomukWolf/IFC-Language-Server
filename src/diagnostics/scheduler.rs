@@ -5,19 +5,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify};
 use tower_lsp::Client;
 use tower_lsp::lsp_types::Url;
 use tracing::{debug, instrument, warn};
 
 use crate::diagnostics::{self, DiagnosticSnapshot};
-use crate::document::drop_on_blocking_thread;
+use crate::document::{EntityInstanceCache, drop_on_blocking_thread};
 use crate::schema::SchemaDoc;
 
 pub struct DiagnosticScheduler {
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
-    semantic_work: Arc<Semaphore>,
+    instance_cache: Arc<EntityInstanceCache>,
 }
 
 pub struct DiagnosticTicket {
@@ -29,19 +29,19 @@ impl DiagnosticScheduler {
     pub fn new(client: Client) -> Self {
         let state = Arc::new(Mutex::new(SchedulerState::default()));
         let notify = Arc::new(Notify::new());
-        let semantic_work = Arc::new(Semaphore::new(1));
+        let instance_cache = Arc::new(EntityInstanceCache::default());
 
         crate::rt::spawn(run_worker(
             client,
             Arc::clone(&state),
             Arc::clone(&notify),
-            Arc::clone(&semantic_work),
+            Arc::clone(&instance_cache),
         ));
 
         Self {
             state,
             notify,
-            semantic_work,
+            instance_cache,
         }
     }
 
@@ -101,8 +101,8 @@ impl DiagnosticScheduler {
         debug!("invalidated document diagnostics");
     }
 
-    pub fn semantic_work(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.semantic_work)
+    pub fn instance_cache(&self) -> Arc<EntityInstanceCache> {
+        Arc::clone(&self.instance_cache)
     }
 
     #[cfg(test)]
@@ -246,7 +246,7 @@ async fn run_worker(
     client: Client,
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
-    semantic_work: Arc<Semaphore>,
+    instance_cache: Arc<EntityInstanceCache>,
 ) {
     loop {
         let next_job = state.lock().await.take_next_job();
@@ -262,25 +262,15 @@ async fn run_worker(
 
         let uri = job.uri.clone();
         let generation = job.generation;
-        let permit = match Arc::clone(&semantic_work).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                warn!(uri = %uri, generation, %error, "semantic work limiter closed");
-                continue;
-            }
-        };
-        if !state.lock().await.is_current(&uri, generation) {
-            debug!(uri = %uri, generation, "skipping stale diagnostics job");
-            continue;
-        }
-        let diagnostics = match crate::rt::spawn_blocking(move || collect(job)).await {
-            Ok(diagnostics) => diagnostics,
-            Err(error) => {
-                warn!(uri = %uri, generation, %error, "diagnostics job failed");
-                continue;
-            }
-        };
-        drop(permit);
+        let job_instance_cache = Arc::clone(&instance_cache);
+        let diagnostics =
+            match crate::rt::spawn_blocking(move || collect(job, &job_instance_cache)).await {
+                Ok(diagnostics) => diagnostics,
+                Err(error) => {
+                    warn!(uri = %uri, generation, %error, "diagnostics job failed");
+                    continue;
+                }
+            };
 
         let state = state.lock().await;
         if !state.is_current(&uri, generation) {
@@ -293,13 +283,16 @@ async fn run_worker(
     }
 }
 
-fn collect(job: DiagnosticJob) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+fn collect(
+    job: DiagnosticJob,
+    instance_cache: &EntityInstanceCache,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let schema = job
         .schema
         .as_ref()
         .map(|(schema_name, schema)| (schema_name.as_str(), schema.as_ref()));
 
-    diagnostics::collect(&job.snapshot, schema)
+    diagnostics::collect(&job.snapshot, schema, instance_cache)
 }
 
 #[cfg(test)]
@@ -508,7 +501,7 @@ mod tests {
             let scheduler = DiagnosticScheduler {
                 state: Arc::new(Mutex::new(SchedulerState::default())),
                 notify: Arc::new(Notify::new()),
-                semantic_work: Arc::new(Semaphore::new(1)),
+                instance_cache: Arc::new(EntityInstanceCache::default()),
             };
             let uri = uri("model");
             let text = Arc::new("#1=IFCWALL($);".to_string());

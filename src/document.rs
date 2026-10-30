@@ -3,7 +3,7 @@
 //! state for schema-aware diagnostics and derived-value hover.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
@@ -570,6 +570,64 @@ impl EntityTypeIndex {
     }
 }
 
+/// The weak text key prevents address reuse without retaining an obsolete document.
+#[derive(Default)]
+pub struct EntityInstanceCache {
+    entry: Mutex<Option<CachedEntityInstances>>,
+}
+
+struct CachedEntityInstances {
+    text: Weak<String>,
+    has_tree: bool,
+    instances: Arc<OnceLock<Arc<EntityInstanceCollection>>>,
+}
+
+impl EntityInstanceCache {
+    pub fn get_or_build(
+        &self,
+        tree: Option<&DocumentTree>,
+        text: &Arc<String>,
+    ) -> Arc<EntityInstanceCollection> {
+        let slot = self.slot(tree.is_some(), text);
+        Arc::clone(slot.get_or_init(|| Arc::new(build_entity_instances(tree, text))))
+    }
+
+    pub fn clear(&self) {
+        if let Some(cached) = self.lock().take() {
+            drop_on_blocking_thread(cached.instances);
+        }
+    }
+
+    fn slot(
+        &self,
+        has_tree: bool,
+        text: &Arc<String>,
+    ) -> Arc<OnceLock<Arc<EntityInstanceCollection>>> {
+        let mut entry = self.lock();
+        if let Some(cached) = entry.as_ref()
+            && cached.has_tree == has_tree
+            && std::ptr::eq(cached.text.as_ptr(), Arc::as_ptr(text))
+        {
+            return Arc::clone(&cached.instances);
+        }
+        let slot = Arc::new(OnceLock::new());
+        let previous = entry.replace(CachedEntityInstances {
+            text: Arc::downgrade(text),
+            has_tree,
+            instances: Arc::clone(&slot),
+        });
+        drop(entry);
+        drop(previous);
+        slot
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CachedEntityInstances>> {
+        self.entry
+            .lock()
+            .expect("entity instance cache lock should not be poisoned")
+    }
+}
+
 impl EntityInstanceCollection {
     pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
         let instance_indexes_by_id = instances
@@ -1061,6 +1119,38 @@ mod tests {
         document
             .offset_to_position(offset)
             .expect("needle offset should convert to a position")
+    }
+
+    #[test]
+    fn instance_cache_reuses_instances_only_for_the_same_text_and_tree_state() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+        let mut document = Document::parse(&mut parser, "#1=IFCWALL($);".to_string());
+        let cache = EntityInstanceCache::default();
+
+        let first = cache.get_or_build(document.tree.as_ref(), &document.text);
+        let repeated = cache.get_or_build(document.tree.as_ref(), &document.text);
+        assert!(Arc::ptr_eq(&first, &repeated));
+
+        document
+            .apply_content_changes(
+                &mut parser,
+                &[TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 6), Position::new(0, 10))),
+                    range_length: None,
+                    text: "DOOR".to_string(),
+                }],
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .expect("replacement should parse");
+        let edited = cache.get_or_build(document.tree.as_ref(), &document.text);
+        let without_tree = cache.get_or_build(None, &document.text);
+
+        assert_eq!(first.instances[0].entity_name, "IFCWALL");
+        assert_eq!(edited.instances[0].entity_name, "IFCDOOR");
+        assert!(without_tree.instances.is_empty());
     }
 
     #[test]

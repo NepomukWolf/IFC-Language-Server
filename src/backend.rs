@@ -669,6 +669,7 @@ impl LanguageServer for Backend {
         self.ast_skip_warning_shown.write().await.remove(&uri);
         self.unknown_schema_warned.write().await.remove(&uri);
         self.diagnostic_scheduler.invalidate(&uri).await;
+        self.diagnostic_scheduler.instance_cache().clear();
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
         info!("document closed");
     }
@@ -900,18 +901,9 @@ impl LanguageServer for Backend {
         } else {
             None
         };
-        let Ok(permit) = self
-            .diagnostic_scheduler
-            .semantic_work()
-            .acquire_owned()
-            .await
-        else {
-            warn!("semantic work limiter closed");
-            return Ok(None);
-        };
+        let instance_cache = self.diagnostic_scheduler.instance_cache();
         let result = crate::rt::spawn_blocking(move || {
-            let _permit = permit;
-            let instances = crate::document::build_entity_instances(tree.as_ref(), &text);
+            let instances = instance_cache.get_or_build(tree.as_ref(), &text);
             document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
         })
         .await
@@ -1411,6 +1403,57 @@ mod tests {
         assert!(backend.documents.read().await[&large].is_parse_state_loaded());
         assert_eq!(scheduler.current_generation(&large).await, large_generation);
         assert_eq!(scheduler.current_generation(&other).await, other_generation);
+    }
+
+    async fn outline(backend: &Backend, uri: &Url) -> Option<DocumentSymbolResponse> {
+        backend
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("document symbols succeed")
+    }
+
+    fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
+        let document = Document::parse(&mut new_parser(), text.to_string());
+        let instances =
+            crate::document::build_entity_instances(document.tree.as_ref(), &document.text);
+        document_symbols::document_symbols(&document.text, &instances, document.ast_skipped, None)
+    }
+
+    #[tokio::test]
+    async fn outline_after_an_edit_reflects_the_edited_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/outline.ifc").unwrap();
+        let before = "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;\n";
+        let after = before.replace("IFCSITE", "IFCBUILDING");
+        open_document(backend, &uri, before).await;
+
+        let first = outline(backend, &uri).await;
+        let repeated = outline(backend, &uri).await;
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(2, 3), Position::new(2, 10))),
+                    range_length: None,
+                    text: "IFCBUILDING".to_string(),
+                }],
+            })
+            .await;
+        let edited = outline(backend, &uri).await;
+
+        assert_eq!(backend.documents.read().await[&uri].text.as_str(), after);
+        assert_eq!(first, outline_of_fresh_parse(before));
+        assert_eq!(repeated, first);
+        assert_eq!(edited, outline_of_fresh_parse(&after));
+        assert_ne!(edited, first);
     }
 
     #[test]
