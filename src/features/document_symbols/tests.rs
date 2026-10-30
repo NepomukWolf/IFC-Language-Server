@@ -529,7 +529,9 @@ async fn outline_instance_cache_returns_instances_only_for_the_same_text_tree_an
     let text = Arc::new("#1=IFCWALL($);".to_string());
     let equal_text = Arc::new("#1=IFCWALL($);".to_string());
     let schema_doc = Arc::new(schema());
-    let instances = Arc::new(EntityInstanceCollection::new(Vec::new()));
+    let instances = Arc::new(EntityInstanceCollection {
+        instances: Vec::new(),
+    });
 
     cache.insert(
         true,
@@ -557,7 +559,9 @@ async fn outline_instance_cache_evicts_only_the_given_text() {
         true,
         &cached_text,
         None,
-        Arc::new(EntityInstanceCollection::new(Vec::new())),
+        Arc::new(EntityInstanceCollection {
+            instances: Vec::new(),
+        }),
     );
 
     cache.evict(&other_text);
