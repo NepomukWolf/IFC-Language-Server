@@ -39,7 +39,7 @@ pub struct EntityInstanceCollection {
 
 #[derive(Debug, Default)]
 pub struct EntityTypeIndex<'a> {
-    entity_names_by_id: HashMap<u32, &'a str>,
+    entity_names_by_id: Vec<(u32, &'a str)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -615,8 +615,15 @@ pub fn build_entity_type_index<'a>(
 
     for_each_entity_node(tree, |node| {
         if let Some((id, name)) = entity_id_and_name(node, text) {
-            index.entity_names_by_id.insert(id, name);
+            index.entity_names_by_id.push((id, name));
         }
+    });
+    index.entity_names_by_id.sort_by_key(|&(id, _)| id);
+    index.entity_names_by_id.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            earlier.1 = later.1;
+        }
+        later.0 == earlier.0
     });
 
     index
@@ -646,7 +653,11 @@ fn entity_id_and_name<'a>(node: Node<'_>, text: &'a str) -> Option<(u32, &'a str
 
 impl EntityTypeIndex<'_> {
     pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
-        self.entity_names_by_id.get(&id).copied()
+        let index = self
+            .entity_names_by_id
+            .binary_search_by_key(&id, |&(id, _)| id)
+            .ok()?;
+        Some(self.entity_names_by_id[index].1)
     }
 }
 
