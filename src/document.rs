@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-use tree_sitter::{InputEdit, Node, Parser, Point, Tree, TreeCursor};
+use tree_sitter::{InputEdit, Language, Node, Parser, Point, Tree, TreeCursor};
 
 use crate::document_index::{TextIndex, scan_text};
 use crate::step::compact::{self, CompactKind, CompactValue};
@@ -263,7 +263,7 @@ impl Document {
             return;
         }
 
-        self.tree = parser.parse(self.text.as_bytes(), old_tree);
+        self.tree = parse_with_structured_fallback(parser, self.text.as_bytes(), old_tree);
     }
 
     #[cfg(test)]
@@ -595,6 +595,43 @@ impl EntityInstanceCollection {
             .get(&id)
             .and_then(|index| self.instances.get(*index))
     }
+}
+
+/// Parses with the compact grammar unless the text has a syntax error. Trees with errors come
+/// from the structured grammar, whose error recovery the compact tokens would change; an edit
+/// to such a tree stays structured until the text is valid again.
+fn parse_with_structured_fallback(
+    parser: &mut Parser,
+    text: &[u8],
+    old_tree: Option<&Tree>,
+) -> Option<Tree> {
+    let compact: Language = tree_sitter_ifc::LANGUAGE.into();
+    let structured: Language = tree_sitter_ifc::LANGUAGE_STRUCTURED.into();
+    let old_structured = old_tree.filter(|tree| *tree.language() == structured);
+    if old_structured.is_some() {
+        set_language(parser, &structured);
+        let tree = parser.parse(text, old_structured)?;
+        if tree.root_node().has_error() {
+            return Some(tree);
+        }
+    }
+
+    set_language(parser, &compact);
+    let tree = parser.parse(text, old_tree.filter(|_| old_structured.is_none()))?;
+    if !tree.root_node().has_error() {
+        return Some(tree);
+    }
+    drop(tree);
+    set_language(parser, &structured);
+    let tree = parser.parse(text, None);
+    set_language(parser, &compact);
+    tree
+}
+
+fn set_language(parser: &mut Parser, language: &Language) {
+    parser
+        .set_language(language)
+        .expect("IFC grammar matches the tree-sitter ABI");
 }
 
 pub(crate) fn for_each_entity_node<'a>(tree: Option<&'a Tree>, mut visit: impl FnMut(Node<'a>)) {
@@ -1124,6 +1161,62 @@ mod tests {
                 assert_eq!(lookup(&compact), lookup(&structured), "{case} at {offset}");
             }
         }
+    }
+
+    fn node_spans(tree: &Tree) -> Vec<(String, usize, usize)> {
+        fn visit(node: Node<'_>, spans: &mut Vec<(String, usize, usize)>) {
+            spans.push((node.kind().to_string(), node.start_byte(), node.end_byte()));
+            for child in node.children(&mut node.walk()) {
+                visit(child, spans);
+            }
+        }
+        let mut spans = Vec::new();
+        visit(tree.root_node(), &mut spans);
+        spans
+    }
+
+    #[test]
+    fn documents_with_syntax_errors_keep_the_structured_tree() {
+        let structured_spans = |text: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_ifc::LANGUAGE_STRUCTURED.into())
+                .unwrap();
+            node_spans(&parser.parse(text, None).unwrap())
+        };
+        let invalid = "DATA;\n#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL'x'),$);\n#2=IFCPROPERTYSET('g',#3,'n',$,(#1));\nENDSEC;\n";
+        let mut parser = Parser::new();
+        let mut document = parse_document(invalid);
+        assert_eq!(
+            node_spans(document.tree.as_ref().unwrap()),
+            structured_spans(invalid)
+        );
+
+        let label = Position::new(1, 43);
+        let edit = |range: Range, text: &str| vec![change(Some(range), text)];
+        document
+            .apply_content_changes(
+                &mut parser,
+                &edit(Range::new(label, label), "("),
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .unwrap();
+        let root = document.tree.as_ref().unwrap().root_node();
+        assert!(!root.has_error());
+        assert!(contains_kind(root, "compact_parameter_list"));
+
+        document
+            .apply_content_changes(
+                &mut parser,
+                &edit(Range::new(label, Position::new(1, 44)), ""),
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .unwrap();
+        assert_eq!(document.text.as_str(), invalid);
+        assert_eq!(
+            node_spans(document.tree.as_ref().unwrap()),
+            structured_spans(invalid)
+        );
     }
 
     #[test]
