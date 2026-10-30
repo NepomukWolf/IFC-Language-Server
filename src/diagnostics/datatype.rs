@@ -47,14 +47,30 @@ pub fn collect_lazy(
     let mut diagnostics = Vec::new();
 
     crate::document::for_each_lazy_entity_instance(lazy, text, |instance| {
-        if let Some(entity) = schema.entity(&instance.entity_name) {
-            validate_instance(entity_types, schema, entity, &instance, &mut diagnostics);
-        } else {
-            diagnostics.push(unknown_entity_diagnostic(&instance, schema_name));
-        }
+        validate(
+            entity_types,
+            schema,
+            schema_name,
+            &instance,
+            &mut diagnostics,
+        );
     });
 
     diagnostics
+}
+
+pub(super) fn validate(
+    entity_types: &EntityTypeIndex,
+    schema: &SchemaDoc,
+    schema_name: Option<&str>,
+    instance: &EntityInstanceInfo,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(entity) = schema.entity(&instance.entity_name) {
+        validate_instance(entity_types, schema, entity, instance, diagnostics);
+    } else {
+        diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
+    }
 }
 
 fn validate_instance(

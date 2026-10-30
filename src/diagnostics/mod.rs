@@ -12,6 +12,7 @@ use crate::handwritten;
 use crate::schema::SchemaDoc;
 
 pub mod datatype;
+pub mod incremental;
 pub mod scheduler;
 pub mod syntax;
 
@@ -19,6 +20,8 @@ pub mod syntax;
 pub struct DiagnosticSnapshot {
     tree: Option<DocumentTree>,
     lazy: Option<Arc<handwritten::Document>>,
+    lazy_edits: incremental::LazyEdits,
+    validation_cache: Arc<incremental::ValidationCache>,
     text: Arc<String>,
     schema_name: Option<String>,
 }
@@ -28,6 +31,8 @@ impl DiagnosticSnapshot {
         Self {
             tree: document.tree.clone(),
             lazy: document.lazy.clone(),
+            lazy_edits: document.lazy_edits.clone(),
+            validation_cache: Arc::clone(&document.validation_cache),
             text: Arc::clone(&document.text),
             schema_name: document.schema_name.clone(),
         }
@@ -62,14 +67,16 @@ pub fn collect(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
     if let (Some(lazy), Some((schema_name, schema))) = (snapshot.lazy(), schema) {
-        let entity_types = crate::document::lazy_entity_type_index(lazy, snapshot.text());
-        diagnostics.extend(datatype::collect_lazy(
+        let (datatype, mode) = incremental::collect(
             lazy,
             snapshot.text(),
-            &entity_types,
+            &snapshot.lazy_edits,
+            &snapshot.validation_cache,
             schema,
-            Some(schema_name),
-        ));
+            schema_name,
+        );
+        tracing::info!(?mode, "lazy datatype diagnostics");
+        diagnostics.extend(datatype);
     } else if let Some((schema_name, schema)) = schema {
         let entity_types =
             crate::document::build_entity_type_index(snapshot.tree(), snapshot.text());

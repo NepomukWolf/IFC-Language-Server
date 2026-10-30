@@ -67,6 +67,20 @@ pub struct Edit {
     pub insert_len: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditOutcome {
+    Rebuilt,
+    /// Statements `first..first + old_len` were replaced by `first..first + new_len`.
+    Local {
+        first: usize,
+        old_len: usize,
+        new_len: usize,
+        /// Ids whose resolved entity name may differ after the edit.
+        changed_ids: Vec<u32>,
+        reparsed_bytes: usize,
+    },
+}
+
 impl Document {
     pub fn parse(text: &[u8], retain: bool) -> Self {
         assert!(text.len() < u32::MAX as usize);
@@ -234,7 +248,8 @@ impl Document {
         params
     }
 
-    pub fn edit(&mut self, removed: &[u8], new: &[u8], edit: Edit) -> usize {
+    #[tracing::instrument(skip_all)]
+    pub fn edit(&mut self, removed: &[u8], new: &[u8], edit: Edit) -> EditOutcome {
         let first = self
             .statements
             .partition_point(|s| (s.span.end as usize) < edit.start)
@@ -255,7 +270,7 @@ impl Document {
             || edit.start + edit.delete_len > self.statements[last - 1].span.end as usize
         {
             *self = Self::parse(new, self.retain);
-            return new.len();
+            return EditOutcome::Rebuilt;
         }
         let start = self.statements[first].span.start as usize;
         let old_end = self.statements[last - 1].span.end as usize;
@@ -278,11 +293,20 @@ impl Document {
             let next = frame_end(new, p, new.len());
             if new[p] != b'#' || next > end {
                 *self = Self::parse(new, self.retain);
-                return new.len();
+                return EditOutcome::Rebuilt;
             }
             local.statement(new, p, next);
             p = next;
         }
+        let changed_ids = changed_ids(
+            &self.statements[first..last],
+            &local.statements,
+            removed,
+            new,
+            edit,
+            start,
+            end,
+        );
         let a = self.statements[first].param_start;
         let b = self.statements[last - 1].param_start + self.statements[last - 1].param_len;
         let param_delta = local.params.len() as i64 - (b - a) as i64;
@@ -304,19 +328,73 @@ impl Document {
             statement.param_start += a;
         }
         self.params.splice(a as usize..b as usize, local.params);
+        let new_len = local.statements.len();
         self.statements.splice(first..last, local.statements);
         self.errors
-            .retain(|e| e.span.end as usize <= start || e.span.start as usize >= old_end);
+            .retain(|e| e.span.end as usize <= start || e.span.start as usize > old_end);
         for error in &mut self.errors {
-            if error.span.start as usize >= old_end {
+            if error.span.start as usize > old_end {
                 error.span.shift(delta);
             }
         }
         self.errors.extend(local.errors);
         self.errors.sort_by_key(|e| e.span.start);
         self.reindex();
-        end - start
+        EditOutcome::Local {
+            first,
+            old_len: last - first,
+            new_len,
+            changed_ids,
+            reparsed_bytes: end - start,
+        }
     }
+}
+
+/// Ids whose sequence of definitions (entity name, or none for an unnamed statement) differs
+/// between the replaced statements and their reparse. `old` spans are in pre-edit offsets.
+fn changed_ids(
+    old: &[Statement],
+    new_statements: &[Statement],
+    removed: &[u8],
+    new: &[u8],
+    edit: Edit,
+    start: usize,
+    end: usize,
+) -> Vec<u32> {
+    let mut old_region = Vec::with_capacity(end - start + removed.len());
+    old_region.extend_from_slice(&new[start..edit.start]);
+    old_region.extend_from_slice(removed);
+    old_region.extend_from_slice(&new[edit.start + edit.insert_len..end]);
+    let name = |text: &[u8], base: usize, statement: &Statement| {
+        (statement.name.end != 0).then(|| {
+            text[statement.name.start as usize - base..statement.name.end as usize - base].to_vec()
+        })
+    };
+    let mut before: Vec<_> = old
+        .iter()
+        .map(|s| (s.id, name(&old_region, start, s)))
+        .collect();
+    let mut after: Vec<_> = new_statements
+        .iter()
+        .map(|s| (s.id, name(new, 0, s)))
+        .collect();
+    before.sort_by_key(|&(id, _)| id);
+    after.sort_by_key(|&(id, _)| id);
+    let mut ids: Vec<u32> = before.iter().chain(&after).map(|&(id, _)| id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.retain(|&id| {
+        let of = |defs: &[(u32, Option<Vec<u8>>)]| {
+            let from = defs.partition_point(|&(other, _)| other < id);
+            let to = defs.partition_point(|&(other, _)| other <= id);
+            defs[from..to]
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        of(&before) != of(&after)
+    });
+    ids
 }
 
 struct Reader<'a, 'p> {
@@ -617,7 +695,15 @@ mod tests {
 
     #[test]
     fn edits_and_repairs_match_full_parse() {
-        let original = b"DATA;\n#1=X(1);\n#2=Y('hello',(#1,3));\n#3=Z(3);\nENDSEC;";
+        for original in [
+            b"DATA;\n#1=X(1);\n#2=Y('hello',(#1,3));\n#3=Z(3);\nENDSEC;".as_slice(),
+            b"DATA;\n#1=X(1);\n#2=Y(2,\n#3=Z(3);\n#4=W(4);\nENDSEC;",
+        ] {
+            edits_match_full_parse(original);
+        }
+    }
+
+    fn edits_match_full_parse(original: &[u8]) {
         for retain in [true, false] {
             for start in 6..original.len() - 8 {
                 for insert in [b" ".as_slice(), b"X", b"'", b";", b"", b"/*"] {

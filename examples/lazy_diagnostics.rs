@@ -3,7 +3,7 @@
 //! `generate <mb> <out>` writes the synthetic property model.
 //! `equiv <file>...` prints diagnostics that differ between the two paths.
 //! `mutate <file>` does the same for single-statement mutations at sampled statements.
-//! `measure <ast|lazy> <file> <valid|syntax|quote>` prints one JSON record; with
+//! `measure <ast|lazy> <file> <valid|syntax|quote|id>` prints one JSON record; with
 //! `LAZY_DIAG_SPANS` set it also logs the server's span timings to stderr.
 
 #[allow(dead_code)]
@@ -218,7 +218,7 @@ fn mutations(path: &Path) {
 
 /// Byte offsets of the first `(` and the first string's closing quote of the quote-bearing
 /// statement nearest the middle of the file.
-fn edit_anchor(text: &str) -> (usize, usize) {
+fn edit_anchor(text: &str) -> (usize, usize, usize) {
     let middle = text.len() / 2;
     let candidates = text[middle..]
         .match_indices("\n#")
@@ -238,7 +238,7 @@ fn edit_anchor(text: &str) -> (usize, usize) {
                     p += 2;
                     continue;
                 }
-                return (start + open, start + p);
+                return (start, start + open, start + p);
             }
             p += 1;
         }
@@ -257,12 +257,17 @@ fn measure(mode: &str, path: &Path, edit: &str) {
     }
     let model = Model::load(&PathBuf::from(path));
     let uri = model.uri();
-    let (open, close_quote) = edit_anchor(&model.text);
+    let (statement, open, close_quote) = edit_anchor(&model.text);
+    let id_len = model.text.as_bytes()[statement + 1..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
     let (start, deleted, replacement) = match edit {
         "valid" => (open + 1, 0, " "),
         "syntax" => (open, 1, "X"),
         "quote" => (close_quote, 1, ""),
-        _ => panic!("edit is valid, syntax or quote"),
+        "id" => (statement + 1, id_len, "999999999"),
+        _ => panic!("edit is valid, syntax, quote or id"),
     };
     let range = Range::new(model.position(start), model.position(start + deleted));
     let mut session = Session::new(json!({ "astFileSizeLimitMb": limit(mode) }));

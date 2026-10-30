@@ -1,6 +1,6 @@
 use ifc_language_server::{
     document_tree::DocumentTree,
-    handwritten::{Document, Edit},
+    handwritten::{Document, Edit, EditOutcome},
 };
 use serde_json::json;
 use std::{env, fs, hint::black_box, time::Instant};
@@ -169,15 +169,20 @@ fn main() {
     let t = Instant::now();
     let mut reparsed_bytes = None;
     if let Some(doc) = &mut hand {
-        reparsed_bytes = Some(doc.edit(
-            &text[start..start + deleted],
-            &new,
-            Edit {
-                start,
-                delete_len: deleted,
-                insert_len: replacement.len(),
+        reparsed_bytes = Some(
+            match doc.edit(
+                &text[start..start + deleted],
+                &new,
+                Edit {
+                    start,
+                    delete_len: deleted,
+                    insert_len: replacement.len(),
+                },
+            ) {
+                EditOutcome::Rebuilt => new.len(),
+                EditOutcome::Local { reparsed_bytes, .. } => reparsed_bytes,
             },
-        ));
+        );
     }
     if let Some(tree) = &mut dev {
         tree.edit(&input);

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
 
+use crate::diagnostics::incremental::{LazyEdits, ValidationCache};
 use crate::document_index::{TextIndex, index_neutral_edit, rescan_text, scan_text};
 use crate::document_tree::DocumentTree;
 use crate::handwritten;
@@ -26,6 +27,8 @@ pub struct Document {
     pub tree: Option<DocumentTree>,
     /// Statement index used for diagnostics of documents above the AST size limit.
     pub lazy: Option<Arc<handwritten::Document>>,
+    pub lazy_edits: LazyEdits,
+    pub validation_cache: Arc<ValidationCache>,
     pub ast_skipped: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
@@ -139,6 +142,8 @@ impl Document {
             text: Arc::new(text),
             tree: None,
             lazy: None,
+            lazy_edits: LazyEdits::fresh(),
+            validation_cache: Arc::default(),
             ast_skipped: false,
             schema_name,
             line_offsets,
@@ -149,6 +154,7 @@ impl Document {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn reload_text_index(&mut self) {
         let previous = TextIndex {
             line_offsets: std::mem::take(&mut self.line_offsets),
@@ -225,6 +231,7 @@ impl Document {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all)]
     fn apply_ranged_change(
         &mut self,
         range: Range,
@@ -268,7 +275,7 @@ impl Document {
             .then(|| self.text.as_bytes()[start_byte..old_end_byte].to_vec());
         Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
         if let (Some(lazy), Some(removed)) = (self.lazy.as_mut(), removed) {
-            Arc::make_mut(lazy).edit(
+            let outcome = Arc::make_mut(lazy).edit(
                 &removed,
                 self.text.as_bytes(),
                 handwritten::Edit {
@@ -277,6 +284,7 @@ impl Document {
                     insert_len: replacement.len(),
                 },
             );
+            self.lazy_edits.record(outcome);
         }
         if keep_index {
             let delta = replacement.len() as isize - (old_end_byte - start_byte) as isize;
@@ -343,6 +351,7 @@ impl Document {
         })
     }
 
+    #[tracing::instrument(skip_all)]
     fn parse_current_text(
         &mut self,
         parser: &mut Parser,
@@ -357,6 +366,7 @@ impl Document {
                     self.text.as_bytes(),
                     false,
                 )));
+                self.lazy_edits = LazyEdits::fresh();
             }
             return;
         }
@@ -681,60 +691,100 @@ pub(crate) fn for_each_lazy_entity_instance(
         row: 0,
         line_start: 0,
     };
-    let mut errors = lazy.errors.iter().peekable();
-    for (index, statement) in lazy.statements.iter().enumerate() {
-        let span = statement.span.range();
-        while errors
-            .next_if(|error| (error.span.start as usize) < span.start)
-            .is_some()
-        {}
-        if errors
-            .peek()
-            .is_some_and(|error| span.contains(&(error.span.start as usize)))
-            || statement.name.end == 0
-        {
-            continue;
+    for index in 0..lazy.statements.len() {
+        if let Some(instance) = lazy_entity_instance(lazy, text, index, &mut points) {
+            visit(instance);
         }
-        let tape = lazy.decode(text.as_bytes(), index);
-        let Some(list) = tape.first() else {
-            continue;
-        };
-        let id_range = Range {
-            start: points.position(span.start),
-            end: points.position(
-                span.start
-                    + 1
-                    + text.as_bytes()[span.start + 1..]
-                        .iter()
-                        .take_while(|byte| byte.is_ascii_digit())
-                        .count(),
-            ),
-        };
-        let name = statement.name.range();
-        let entity_name_range = Range {
-            start: points.position(name.start),
-            end: points.position(name.end),
-        };
-        let list_start = points.position(list.span.start as usize);
-        let parameters = lazy_parameter_values(&tape, 1, tape.len(), text, &mut points);
-        let parameter_list_range = Range {
-            start: list_start,
-            end: points.position(list.span.end as usize),
-        };
-        let entity_end = points.position(span.end);
-        visit(EntityInstanceInfo {
-            id: Some(statement.id),
-            id_range: Some(id_range),
-            entity_name: text[name].to_ascii_uppercase(),
-            entity_name_range,
-            entity_range: Range {
-                start: id_range.start,
-                end: entity_end,
-            },
-            parameter_list_range: Some(parameter_list_range),
-            parameters,
-        });
     }
+}
+
+/// Decodes one statement with positions relative to its start: row 0 columns count from the
+/// statement's first byte, later rows keep absolute columns.
+pub(crate) fn lazy_entity_instance_relative(
+    lazy: &handwritten::Document,
+    text: &str,
+    index: usize,
+) -> Option<EntityInstanceInfo> {
+    let start = lazy.statements[index].span.start as usize;
+    let mut points = LinePoints {
+        text: text.as_bytes(),
+        offset: start,
+        row: 0,
+        line_start: start,
+    };
+    lazy_entity_instance(lazy, text, index, &mut points)
+}
+
+/// Positions of `offsets`, which must be ascending.
+pub(crate) fn positions_of(text: &str, offsets: impl IntoIterator<Item = usize>) -> Vec<Position> {
+    let mut points = LinePoints {
+        text: text.as_bytes(),
+        offset: 0,
+        row: 0,
+        line_start: 0,
+    };
+    offsets
+        .into_iter()
+        .map(|offset| points.position(offset))
+        .collect()
+}
+
+fn lazy_entity_instance(
+    lazy: &handwritten::Document,
+    text: &str,
+    index: usize,
+    points: &mut LinePoints<'_>,
+) -> Option<EntityInstanceInfo> {
+    let statement = lazy.statements[index];
+    let span = statement.span.range();
+    let first_error = lazy
+        .errors
+        .partition_point(|error| (error.span.start as usize) < span.start);
+    if lazy
+        .errors
+        .get(first_error)
+        .is_some_and(|error| span.contains(&(error.span.start as usize)))
+        || statement.name.end == 0
+    {
+        return None;
+    }
+    let tape = lazy.decode(text.as_bytes(), index);
+    let list = tape.first()?;
+    let id_range = Range {
+        start: points.position(span.start),
+        end: points.position(
+            span.start
+                + 1
+                + text.as_bytes()[span.start + 1..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count(),
+        ),
+    };
+    let name = statement.name.range();
+    let entity_name_range = Range {
+        start: points.position(name.start),
+        end: points.position(name.end),
+    };
+    let list_start = points.position(list.span.start as usize);
+    let parameters = lazy_parameter_values(&tape, 1, tape.len(), text, points);
+    let parameter_list_range = Range {
+        start: list_start,
+        end: points.position(list.span.end as usize),
+    };
+    let entity_end = points.position(span.end);
+    Some(EntityInstanceInfo {
+        id: Some(statement.id),
+        id_range: Some(id_range),
+        entity_name: text[name].to_ascii_uppercase(),
+        entity_name_range,
+        entity_range: Range {
+            start: id_range.start,
+            end: entity_end,
+        },
+        parameter_list_range: Some(parameter_list_range),
+        parameters,
+    })
 }
 
 fn lazy_parameter_values(
