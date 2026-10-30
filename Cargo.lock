@@ -1445,9 +1445,8 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-ifc"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "209542697d854966be3c6f5c0bc405f81c4d4caf7d4b8602c85d37850bdc31b5"
+version = "0.1.1"
+source = "git+https://github.com/Amixx/tree-sitter-ifc?rev=3973552f163939b095da9f76ba1f1c035a1e4a53#3973552f163939b095da9f76ba1f1c035a1e4a53"
 dependencies = [
  "cc",
  "tree-sitter-language",

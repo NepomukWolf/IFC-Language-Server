@@ -507,7 +507,7 @@ fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &U
 fn new_parser() -> tree_sitter::Parser {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&tree_sitter_ifc::LANGUAGE.into())
+        .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
         .expect("Error loading IFC parser");
     parser
 }
