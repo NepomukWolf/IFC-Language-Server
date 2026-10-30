@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
 
-use crate::document_index::{TextIndex, index_neutral_edit, scan_text};
+use crate::document_index::{TextIndex, index_neutral_edit, rescan_text, scan_text};
 use crate::document_tree::DocumentTree;
 use crate::step::compact::{self, CompactKind, CompactValue};
 
@@ -146,6 +146,14 @@ impl Document {
     }
 
     pub fn reload_text_index(&mut self) {
+        let previous = TextIndex {
+            line_offsets: std::mem::take(&mut self.line_offsets),
+            definitions: std::mem::take(&mut self.definitions),
+            definitions_by_id: std::mem::take(&mut self.definitions_by_id),
+            references: std::mem::take(&mut self.references),
+            schema_name: self.schema_name.take(),
+            schema_end: self.schema_end.take(),
+        };
         let TextIndex {
             line_offsets,
             definitions,
@@ -153,7 +161,7 @@ impl Document {
             references,
             schema_name,
             schema_end,
-        } = scan_text(&self.text);
+        } = rescan_text(&self.text, previous);
 
         self.line_offsets = line_offsets;
         self.definitions = definitions;

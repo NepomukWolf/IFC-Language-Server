@@ -15,15 +15,20 @@ pub struct TextIndex {
 }
 
 pub fn scan_text(text: &str) -> TextIndex {
+    rescan_text(text, TextIndex::default())
+}
+
+pub fn rescan_text(text: &str, mut index: TextIndex) -> TextIndex {
     let bytes = text.as_bytes();
-    let mut index = TextIndex {
-        line_offsets: vec![0],
-        definitions: HashMap::new(),
-        definitions_by_id: Vec::new(),
-        references: HashMap::new(),
-        schema_name: None,
-        schema_end: None,
-    };
+    index.line_offsets.clear();
+    index.line_offsets.push(0);
+    index.definitions.clear();
+    index.definitions_by_id.clear();
+    for offsets in index.references.values_mut() {
+        offsets.clear();
+    }
+    index.schema_name = None;
+    index.schema_end = None;
     let mut offset = 0usize;
 
     while offset < bytes.len() {
@@ -66,7 +71,8 @@ pub fn scan_text(text: &str) -> TextIndex {
         }
     }
 
-    index.definitions_by_id.sort_by_key(|&(id, _)| id);
+    index.references.retain(|_, offsets| !offsets.is_empty());
+    index.definitions_by_id.sort_unstable();
     index.definitions_by_id.dedup_by(|later, earlier| {
         let duplicate = later.0 == earlier.0;
         if duplicate {
