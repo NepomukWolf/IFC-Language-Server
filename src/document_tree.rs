@@ -232,9 +232,7 @@ fn unclosed_string_start(text: &[u8], error_start: usize) -> Option<usize> {
             quote_count = 0;
         }
         if text[offset..].starts_with(b"/*") {
-            offset = text[offset + 2..]
-                .windows(2)
-                .position(|window| window == b"*/")
+            offset = memchr::memmem::find(&text[offset + 2..], b"*/")
                 .map_or(text.len(), |end| offset + end + 4);
         } else if text[offset] == b'\'' {
             if text.get(offset + 1) == Some(&b'\'') {
@@ -244,8 +242,12 @@ fn unclosed_string_start(text: &[u8], error_start: usize) -> Option<usize> {
                 quote_count += 1;
                 offset += 1;
             }
+        } else if text[offset] == b'\n' {
+            offset += 1;
         } else {
             offset += 1;
+            offset +=
+                memchr::memchr3(b'\n', b'\'', b'/', &text[offset..]).unwrap_or(text.len() - offset);
         }
     }
     if quote_count % 2 == 1 {
@@ -285,6 +287,26 @@ mod tests {
         assert_eq!(
             unclosed_string_start(b"#1=IFCWALL('escaped '' quote');", 0),
             None
+        );
+        assert_eq!(
+            unclosed_string_start(b"#1=X('a/b');\n#2=X('c);", 14),
+            Some(18)
+        );
+        assert_eq!(
+            unclosed_string_start(b"/* it's\n#9=X(' */\n#1=X('a');", 0),
+            None
+        );
+        assert_eq!(
+            unclosed_string_start(b"/* it's\n#9=X(' */\n#1=X('a);", 30),
+            Some(23)
+        );
+        assert_eq!(
+            unclosed_string_start(b"#1=X('a' /x/ 'b);\n#2=X('');", 0),
+            Some(5)
+        );
+        assert_eq!(
+            unclosed_string_start(b"#1=X('a);\n/* x */#2=X('b');", 0),
+            Some(5)
         );
     }
 
