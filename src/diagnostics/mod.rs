@@ -77,6 +77,107 @@ mod tests {
         DiagnosticSnapshot::from_document(&Document::parse(&mut parser, text.to_string()))
     }
 
+    fn lowercase_fixture_schema() -> SchemaDoc {
+        crate::schema::load_express(
+            crate::schema::IfcVersion::Ifc4Add2Tc1,
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcLabel = STRING(255);
+              END_TYPE;
+              TYPE IfcValue = SELECT (IfcLabel);
+              END_TYPE;
+              TYPE IfcWallTypeEnum = ENUMERATION OF (MOVABLE, USERDEFINED);
+              END_TYPE;
+              ENTITY IfcWall;
+                Name : OPTIONAL IfcLabel;
+                PredefinedType : OPTIONAL IfcWallTypeEnum;
+              END_ENTITY;
+              ENTITY IfcPropertySingleValue;
+                Name : IfcLabel;
+                NominalValue : OPTIONAL IfcValue;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        )
+        .expect("fixture schema should parse")
+    }
+
+    fn collect_with_fixture_schema(text: &str) -> Vec<Diagnostic> {
+        collect(
+            &snapshot_of(text),
+            Some(("IFC4", &lowercase_fixture_schema())),
+        )
+    }
+
+    fn assert_single_diagnostic(text: &str, message: &str, start: u32, end: u32) {
+        let diagnostics = collect_with_fixture_schema(text);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, message);
+        assert_eq!(
+            diagnostics[0].range,
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(0, start),
+                tower_lsp::lsp_types::Position::new(0, end),
+            )
+        );
+    }
+
+    #[test]
+    fn mixed_case_entity_name_reports_only_the_case() {
+        assert_single_diagnostic(
+            "#1=IfcWall('w',.MOVABLE.);",
+            "Entity names must be upper case",
+            3,
+            10,
+        );
+    }
+
+    #[test]
+    fn lowercase_typed_value_name_reports_only_the_case() {
+        assert_single_diagnostic(
+            "#1=IFCPROPERTYSINGLEVALUE('p',ifclabel('x'));",
+            "Typed-value names must be upper case",
+            30,
+            38,
+        );
+    }
+
+    #[test]
+    fn lowercase_enumeration_reports_only_the_case() {
+        assert_single_diagnostic(
+            "#1=IFCWALL('w',.movable.);",
+            "Enumeration values must be upper case",
+            15,
+            24,
+        );
+    }
+
+    #[test]
+    fn mixed_case_instance_is_validated_as_its_upper_case_entity() {
+        let diagnostics = collect_with_fixture_schema("#1=IfcWall(1,.USERDEFINED.);");
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+        assert_eq!(messages.len(), 2, "{diagnostics:?}");
+        assert_eq!(messages[0], "Entity names must be upper case");
+        assert!(messages[1].starts_with("Name:"), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn unknown_lowercase_entity_reports_case_and_unknown_entity() {
+        let diagnostics = collect_with_fixture_schema("#1=IfcWal($);");
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+        assert_eq!(
+            messages,
+            [
+                "Entity names must be upper case",
+                "Unknown IFC entity `IFCWAL` in selected schema `IFC4`",
+            ]
+        );
+        assert_eq!(diagnostics[0].range, diagnostics[1].range);
+    }
+
     #[test]
     fn syntax_errors_are_reported_without_a_schema() {
         let snapshot = snapshot_of("FILE_SCHEMA(('IFC4X3'));\n#10=IFCWALL((;\n");
