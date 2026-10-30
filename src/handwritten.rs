@@ -517,19 +517,15 @@ impl Reader<'_, '_> {
                 let quote = self.text[self.p];
                 self.p += 1;
                 loop {
-                    if self.p >= self.end {
+                    let Some(n) = memchr::memchr(quote, &self.text[self.p..self.end]) else {
                         self.p = start;
                         return Err(self.error("unclosed string"));
-                    }
-                    if self.text[self.p] == quote {
+                    };
+                    self.p += n + 1;
+                    if quote == b'\'' && self.p < self.end && self.text[self.p] == quote {
                         self.p += 1;
-                        if quote == b'\'' && self.p < self.end && self.text[self.p] == quote {
-                            self.p += 1;
-                        } else {
-                            break;
-                        }
                     } else {
-                        self.p += 1;
+                        break;
                     }
                 }
                 if quote == b'\'' {
