@@ -77,7 +77,7 @@ fn next_id_completion(
     position: Position,
     offset: usize,
 ) -> Option<CompletionItem> {
-    if entity_argument_context(&document.text, offset).is_some() {
+    if entity_argument_context(&document.text, &document.definitions, offset).is_some() {
         return None;
     }
 
@@ -240,7 +240,8 @@ fn argument_completions(
     snippet_supported: bool,
     eager_documentation: bool,
 ) -> CompletionResults {
-    let Some(context) = entity_argument_context(&document.text, offset) else {
+    let Some(context) = entity_argument_context(&document.text, &document.definitions, offset)
+    else {
         return empty_results();
     };
     let Some(entity) = schema.entity(&context.entity_name) else {
@@ -418,18 +419,10 @@ fn reference_completions(
         return (Vec::new(), false);
     };
 
-    let mut definitions = document
-        .definitions
-        .iter()
-        .map(|(id, offset)| (*id, *offset))
-        .filter(|(id, _)| id.to_string().starts_with(prefix))
-        .collect::<Vec<_>>();
-    definitions.sort_by_key(|(id, _)| *id);
-
     let mut compatible_by_name = HashMap::<&str, bool>::new();
-    let mut matching = definitions
-        .into_iter()
-        .filter_map(|(id, offset)| {
+    let mut matching = definitions_with_id_prefix(&document.sorted_definition_ids, prefix)
+        .filter_map(|&id| {
+            let offset = *document.definitions.get(&id)?;
             let entity_name =
                 scan_definition_entity_name(&document.text, offset, document.text.len())?;
             let compatible = accepts_any_entity
@@ -468,6 +461,32 @@ fn reference_completions(
     let is_incomplete = matching.len() > MAX_REFERENCE_COMPLETIONS;
     matching.truncate(MAX_REFERENCE_COMPLETIONS);
     (matching, is_incomplete)
+}
+
+fn definitions_with_id_prefix<'a>(
+    sorted_definition_ids: &'a [u32],
+    prefix: &str,
+) -> impl Iterator<Item = &'a u32> {
+    let mut ranges = Vec::new();
+    if prefix.is_empty() {
+        ranges.push((0, u64::from(u32::MAX)));
+    } else if prefix == "0" {
+        ranges.push((0, 0));
+    } else if !prefix.starts_with('0')
+        && let Ok(value) = prefix.parse::<u64>()
+    {
+        let (mut low, mut high) = (value, value);
+        while low <= u64::from(u32::MAX) {
+            ranges.push((low, high));
+            low *= 10;
+            high = high * 10 + 9;
+        }
+    }
+    ranges.into_iter().flat_map(move |(low, high)| {
+        let start = sorted_definition_ids.partition_point(|&id| u64::from(id) < low);
+        let end = sorted_definition_ids.partition_point(|&id| u64::from(id) <= high);
+        &sorted_definition_ids[start..end]
+    })
 }
 
 fn render_entity_signature(entity: &EntityDoc) -> String {
@@ -1415,6 +1434,79 @@ mod tests {
                 "#119"
             ]
         );
+    }
+
+    #[test]
+    fn id_prefix_ranges_match_decimal_string_prefixes_in_numeric_order() {
+        let ids = [
+            0,
+            1,
+            9,
+            10,
+            11,
+            19,
+            100,
+            199,
+            1000,
+            2,
+            20,
+            42,
+            429_496_729,
+            4_294_967_295,
+            4_294_967_290,
+            1_000_000_000,
+            999_999_999,
+        ];
+        let mut sorted_definition_ids = ids.to_vec();
+        sorted_definition_ids.sort();
+        for prefix in [
+            "",
+            "0",
+            "00",
+            "01",
+            "1",
+            "10",
+            "100",
+            "19",
+            "2",
+            "4",
+            "42",
+            "429496729",
+            "4294967295",
+            "42949672950",
+            "5",
+            "99999999999999999999999",
+        ] {
+            let expected = sorted_definition_ids
+                .iter()
+                .filter(|id| id.to_string().starts_with(prefix))
+                .copied()
+                .collect::<Vec<_>>();
+            let actual = definitions_with_id_prefix(&sorted_definition_ids, prefix)
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "prefix {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn reference_prefix_orders_ids_written_out_of_order_and_duplicated() {
+        let text = "#100=IFCWALL($);#2=IFCWALL($);#10=IFCWALL($);#1=IFCWALL($);#21=IFCWALL($);\
+                    #10=IFCOWNERHISTORY($);#1000=IFCWALL($);#11=IFCWALL($);#300=IFCWALL($,$,$,(#";
+        let labels = |prefix: &str| {
+            items(&format!("{text}{prefix}"), Some(&schema()))
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            labels(""),
+            ["#1", "#2", "#11", "#21", "#100", "#300", "#1000"]
+        );
+        assert_eq!(labels("1"), ["#1", "#11", "#100", "#1000"]);
+        assert_eq!(labels("10"), ["#100", "#1000"]);
+        assert!(labels("0").is_empty());
     }
 
     #[test]

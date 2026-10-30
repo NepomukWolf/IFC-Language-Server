@@ -8,6 +8,7 @@ use std::collections::HashMap;
 pub struct TextIndex {
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
+    pub sorted_definition_ids: Vec<u32>,
     pub references: HashMap<u32, Vec<usize>>,
     pub schema_name: Option<String>,
 }
@@ -17,6 +18,7 @@ pub fn scan_text(text: &str) -> TextIndex {
     let mut index = TextIndex {
         line_offsets: vec![0],
         definitions: HashMap::new(),
+        sorted_definition_ids: Vec::new(),
         references: HashMap::new(),
         schema_name: None,
     };
@@ -37,6 +39,7 @@ pub fn scan_text(text: &str) -> TextIndex {
                     index.references.entry(id).or_default().push(offset);
                     if is_definition(bytes, end) {
                         index.definitions.insert(id, offset);
+                        index.sorted_definition_ids.push(id);
                     }
                     offset = end;
                 } else {
@@ -59,6 +62,8 @@ pub fn scan_text(text: &str) -> TextIndex {
         }
     }
 
+    index.sorted_definition_ids.sort_unstable();
+    index.sorted_definition_ids.dedup();
     index
 }
 
@@ -224,5 +229,14 @@ mod tests {
         assert_eq!(index.references.get(&1), Some(&vec![0, 50]));
         assert!(!index.references.contains_key(&2));
         assert!(!index.references.contains_key(&3));
+    }
+
+    #[test]
+    fn lists_each_defined_id_once_in_numeric_order() {
+        let text = "#10=A();\n#2=B();\n#10=C();\n#1=D('#3=E();');\n#2=F();\n";
+
+        let index = scan_text(text);
+
+        assert_eq!(index.sorted_definition_ids, vec![1, 2, 10]);
     }
 }
