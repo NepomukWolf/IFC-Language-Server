@@ -1,6 +1,7 @@
 //! Curated IFC spatial hierarchy for Outline, breadcrumbs, and go-to-symbol.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::document::{
     EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_entity_instance,
@@ -74,6 +75,77 @@ pub fn outline_instances(
         },
     );
     EntityInstanceCollection::new(instances)
+}
+
+/// Holds the outline instances of one document text and schema. The entry is keyed by the text's
+/// allocation: the weak handle keeps that address from being reused without keeping the text alive.
+#[derive(Default)]
+pub struct OutlineInstanceCache {
+    entry: Mutex<Option<CachedOutlineInstances>>,
+}
+
+struct CachedOutlineInstances {
+    text: Weak<String>,
+    has_tree: bool,
+    schema: Option<Arc<SchemaDoc>>,
+    instances: Arc<EntityInstanceCollection>,
+}
+
+impl CachedOutlineInstances {
+    fn is_built_from(&self, text: &Arc<String>) -> bool {
+        std::ptr::eq(self.text.as_ptr(), Arc::as_ptr(text))
+    }
+}
+
+impl OutlineInstanceCache {
+    pub fn get(
+        &self,
+        has_tree: bool,
+        text: &Arc<String>,
+        schema: Option<&Arc<SchemaDoc>>,
+    ) -> Option<Arc<EntityInstanceCollection>> {
+        self.lock()
+            .as_ref()
+            .filter(|cached| {
+                cached.has_tree == has_tree
+                    && cached.is_built_from(text)
+                    && match (&cached.schema, schema) {
+                        (Some(cached), Some(schema)) => Arc::ptr_eq(cached, schema),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+            .map(|cached| Arc::clone(&cached.instances))
+    }
+
+    pub fn insert(
+        &self,
+        has_tree: bool,
+        text: &Arc<String>,
+        schema: Option<Arc<SchemaDoc>>,
+        instances: Arc<EntityInstanceCollection>,
+    ) {
+        let previous = self.lock().replace(CachedOutlineInstances {
+            text: Arc::downgrade(text),
+            has_tree,
+            schema,
+            instances,
+        });
+        drop(previous);
+    }
+
+    pub fn evict(&self, text: &Arc<String>) {
+        let evicted = self.lock().take_if(|cached| cached.is_built_from(text));
+        if let Some(evicted) = evicted {
+            crate::document::drop_on_blocking_thread(evicted.instances);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CachedOutlineInstances>> {
+        self.entry
+            .lock()
+            .expect("outline instance cache lock should not be poisoned")
+    }
 }
 
 pub fn document_symbols(

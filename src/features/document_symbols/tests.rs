@@ -522,3 +522,48 @@ fn outline_instances_keep_only_what_the_outline_reads() {
         );
     }
 }
+
+#[tokio::test]
+async fn outline_instance_cache_returns_instances_only_for_the_same_text_tree_and_schema() {
+    let cache = OutlineInstanceCache::default();
+    let text = Arc::new("#1=IFCWALL($);".to_string());
+    let equal_text = Arc::new("#1=IFCWALL($);".to_string());
+    let schema_doc = Arc::new(schema());
+    let instances = Arc::new(EntityInstanceCollection::new(Vec::new()));
+
+    cache.insert(
+        true,
+        &text,
+        Some(Arc::clone(&schema_doc)),
+        Arc::clone(&instances),
+    );
+
+    assert!(Arc::ptr_eq(
+        &cache.get(true, &text, Some(&schema_doc)).unwrap(),
+        &instances
+    ));
+    assert!(cache.get(false, &text, Some(&schema_doc)).is_none());
+    assert!(cache.get(true, &equal_text, Some(&schema_doc)).is_none());
+    assert!(cache.get(true, &text, None).is_none());
+    assert!(cache.get(true, &text, Some(&Arc::new(schema()))).is_none());
+}
+
+#[tokio::test]
+async fn outline_instance_cache_evicts_only_the_given_text() {
+    let cache = OutlineInstanceCache::default();
+    let cached_text = Arc::new("#1=IFCWALL($);".to_string());
+    let other_text = Arc::new("#1=IFCDOOR($);".to_string());
+    cache.insert(
+        true,
+        &cached_text,
+        None,
+        Arc::new(EntityInstanceCollection::new(Vec::new())),
+    );
+
+    cache.evict(&other_text);
+    let kept = cache.get(true, &cached_text, None);
+    cache.evict(&cached_text);
+
+    assert!(kept.is_some());
+    assert!(cache.get(true, &cached_text, None).is_none());
+}
