@@ -10,10 +10,35 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
         return Vec::new();
     };
 
+    if !tree.unclosed_strings.is_empty() {
+        return tree
+            .unclosed_strings
+            .iter()
+            .map(|&offset| unclosed_string_diagnostic(snapshot.text(), offset))
+            .collect();
+    }
+
     let mut diagnostics = Vec::new();
     let mut cursor = tree.root_node().walk();
     collect_error_nodes(&mut cursor, &mut diagnostics);
     diagnostics
+}
+
+fn unclosed_string_diagnostic(text: &str, offset: usize) -> Diagnostic {
+    let prefix = &text[..offset];
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let line = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
+    let column = prefix[line_start..]
+        .chars()
+        .map(|character| character.len_utf16() as u32)
+        .sum::<u32>();
+
+    Diagnostic {
+        range: Range::new(Position::new(line, column), Position::new(line, column + 1)),
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: "Unclosed string; expected `'`".to_string(),
+        ..Default::default()
+    }
 }
 
 fn collect_error_nodes(
@@ -139,6 +164,25 @@ mod tests {
 
         assert_eq!(diagnostic.range.start, Position::new(0, 17));
         assert_eq!(diagnostic.range.end, Position::new(0, 17));
+    }
+
+    #[test]
+    fn reports_one_unclosed_string_diagnostic_at_its_opening_quote() {
+        let doc = parse_document("#1=IFCWALL('Anna's wall');\n#2=IFCWALL('next');\n");
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 11), Position::new(0, 12))
+        );
+        assert_eq!(diagnostics[0].message, "Unclosed string; expected `'`");
+    }
+
+    #[test]
+    fn leaves_a_balanced_multiline_string_alone() {
+        let doc = parse_document("#1=IFCWALL('line\ncontinued');\n");
+        assert!(collect(&DiagnosticSnapshot::from_document(&doc)).is_empty());
     }
 
     #[test]

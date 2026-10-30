@@ -5,6 +5,7 @@ pub struct DocumentTree {
     pub compact: Tree,
     pub structured: Option<Tree>,
     omitted: Vec<Range>,
+    pub unclosed_strings: Vec<usize>,
 }
 
 impl DocumentTree {
@@ -18,6 +19,7 @@ impl DocumentTree {
             compact,
             structured: None,
             omitted: Vec::new(),
+            unclosed_strings: Vec::new(),
         };
         if !result.compact.root_node().has_error() {
             return Some(result);
@@ -26,6 +28,14 @@ impl DocumentTree {
         let mut errors = Vec::new();
         error_spans(result.compact.root_node(), &mut errors);
         for (start, end) in &mut errors {
+            if let Some(quote) = unclosed_string_start(text, *start) {
+                if !result.unclosed_strings.contains(&quote) {
+                    result.unclosed_strings.push(quote);
+                }
+                *start = quote;
+                *end = line_end(text, quote);
+                continue;
+            }
             for _ in 0..2 {
                 *start = text[..*start]
                     .iter()
@@ -196,11 +206,86 @@ fn crossing_spans(node: Node<'_>, spans: &mut Vec<(usize, usize)>) {
     }
 }
 
+fn line_end(text: &[u8], start: usize) -> usize {
+    text[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(text.len(), |offset| start + offset)
+}
+
+fn unclosed_string_start(text: &[u8], error_start: usize) -> Option<usize> {
+    let mut entity_start = None;
+    let mut first_quote = None;
+    let mut quote_count = 0;
+    let mut candidate = None;
+    let mut candidate_entity_start = None;
+    let mut offset = 0;
+    while offset < text.len() {
+        if is_entity_start(text, offset) {
+            if quote_count % 2 == 1 {
+                candidate = first_quote;
+                candidate_entity_start = entity_start;
+            }
+            entity_start = Some(offset);
+            first_quote = None;
+            quote_count = 0;
+        }
+        if text[offset..].starts_with(b"/*") {
+            offset = text[offset + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+                .map_or(text.len(), |end| offset + end + 4);
+        } else if text[offset] == b'\'' {
+            if text.get(offset + 1) == Some(&b'\'') {
+                offset += 2;
+            } else {
+                first_quote.get_or_insert(offset);
+                quote_count += 1;
+                offset += 1;
+            }
+        } else {
+            offset += 1;
+        }
+    }
+    if quote_count % 2 == 1 {
+        candidate = first_quote;
+        candidate_entity_start = entity_start;
+    }
+    candidate.filter(|_| candidate_entity_start.is_some_and(|entity| entity <= error_start))
+}
+
+fn is_entity_start(text: &[u8], offset: usize) -> bool {
+    if offset > 0 && text[offset - 1] != b'\n' {
+        return false;
+    }
+    if text.get(offset) != Some(&b'#') {
+        return false;
+    }
+    let mut end = offset + 1;
+    while text.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    text.get(end) == Some(&b'=')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diagnostics::{DiagnosticSnapshot, syntax};
     use crate::document::{Document, build_entity_instances};
+
+    #[test]
+    fn finds_the_opening_quote_of_an_unclosed_string() {
+        assert_eq!(
+            unclosed_string_start(b"#1=IFCWALL('Anna's wall');", 0),
+            Some(11)
+        );
+        assert_eq!(unclosed_string_start(b"#1=IFCWALL('line\none');", 0), None);
+        assert_eq!(
+            unclosed_string_start(b"#1=IFCWALL('escaped '' quote');", 0),
+            None
+        );
+    }
 
     #[test]
     fn local_recovery_matches_whole_document_recovery() {
@@ -210,6 +295,7 @@ mod tests {
             "#25=IFCX(1)",
             "#25=IFCX((1,2);",
             "#25=IFCX('unclosed);",
+            "#25=IFCX('Anna's wall');",
             "#25=IFCX('a',$,IFCLABEL'x'),$);",
             "#25 IFCX($);",
             "#=IFCX($);",
@@ -237,12 +323,22 @@ mod tests {
                 compact: parser.parse(text.as_bytes(), None).unwrap(),
                 structured: None,
                 omitted: Vec::new(),
+                unclosed_strings: Vec::new(),
             });
-            assert_eq!(
-                syntax::collect(&DiagnosticSnapshot::from_document(&local)),
-                syntax::collect(&DiagnosticSnapshot::from_document(&whole)),
-                "{broken}"
-            );
+            let local_diagnostics = syntax::collect(&DiagnosticSnapshot::from_document(&local));
+            if broken.contains("unclosed") || broken.contains("Anna") {
+                assert_eq!(local_diagnostics.len(), 1, "{local_diagnostics:?}");
+                assert_eq!(
+                    local_diagnostics[0].message,
+                    "Unclosed string; expected `'`"
+                );
+            } else {
+                assert_eq!(
+                    local_diagnostics,
+                    syntax::collect(&DiagnosticSnapshot::from_document(&whole)),
+                    "{broken}"
+                );
+            }
             assert_eq!(
                 build_entity_instances(local.tree.as_ref(), &text).instances,
                 build_entity_instances(whole.tree.as_ref(), &text).instances,
