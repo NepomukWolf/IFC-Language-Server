@@ -493,3 +493,15 @@ fn outline_instances_keep_only_what_the_outline_reads() {
         document_symbols(&doc.text, &full, false, Some(&schema()))
     );
 }
+
+#[test]
+fn outline_json_objects_are_insertion_ordered_maps() {
+    let value = serde_json::to_value(message_symbol("name", "detail")).unwrap();
+    let keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys.first(), Some(&"name"));
+}

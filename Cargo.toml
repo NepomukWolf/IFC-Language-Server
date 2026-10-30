@@ -12,7 +12,7 @@ build = "build.rs"
 espr = "0.4.0"
 memchr = "2"
 percent-encoding = "2"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.27"
