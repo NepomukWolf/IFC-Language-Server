@@ -1401,7 +1401,7 @@ mod tests {
     #[test]
     fn lowercase_names_are_accepted_only_for_typed_values() {
         let document =
-            parse_document("DATA;#1=IFCX(ifclabel('a'),ifcCountMeasure(3),_typed(.T.));ENDSEC;");
+            parse_document("DATA;#1=IFCX(ifclabel('a'),ifcCountMeasure(3),typed_1(.T.));ENDSEC;");
         assert!(!document.tree.as_ref().unwrap().root_node().has_error());
         let collection = instances(&document);
         let names: Vec<_> = collection.instances[0]
@@ -1412,8 +1412,12 @@ mod tests {
                 other => panic!("expected typed value, got {other:?}"),
             })
             .collect();
-        assert_eq!(names, ["IFCLABEL", "IFCCOUNTMEASURE", "_TYPED"]);
-        for text in ["DATA;#1=x(1.);ENDSEC;", "DATA;#1=X(.lower.);ENDSEC;"] {
+        assert_eq!(names, ["IFCLABEL", "IFCCOUNTMEASURE", "TYPED_1"]);
+        for text in [
+            "DATA;#1=x(1.);ENDSEC;",
+            "DATA;#1=X(.lower.);ENDSEC;",
+            "DATA;#1=X(_typed(.T.));ENDSEC;",
+        ] {
             let rejected = parse_document(text);
             assert!(rejected.tree.as_ref().unwrap().root_node().has_error());
         }
