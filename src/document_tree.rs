@@ -297,7 +297,7 @@ fn odd_quote_entities(text: &[u8]) -> Vec<OddQuoteEntity> {
         }
         if text[offset..].starts_with(b"/*") {
             offset = memchr::memmem::find(&text[offset + 2..], b"*/")
-                .map_or(text.len(), |end| offset + end + 4);
+                .map_or(offset + 2, |end| offset + end + 4);
         } else if text[offset] == b'\'' {
             if text.get(offset + 1) == Some(&b'\'') {
                 offset += 2;
@@ -392,6 +392,7 @@ mod tests {
         assert_eq!(unclosed_quotes(b"/* it's\n#9=X(' */\n#1=X('a);", 25), [23]);
         assert_eq!(unclosed_quotes(b"#1=X('a' /x/ 'b);\n#2=X('');", 0), [5]);
         assert_eq!(unclosed_quotes(b"#1=X('a);\n/* x */#2=X('b');", 0), [5]);
+        assert_eq!(unclosed_quotes(b"#1=X('a /* b');\n#2=X('c);", 22), [21]);
     }
 
     #[test]
