@@ -677,6 +677,19 @@ impl EntityInstanceCache {
         }
     }
 
+    /// Drops the cached instances if they were built from `text`.
+    pub fn forget(&self, text: &Arc<String>) {
+        let mut entry = self.lock();
+        if entry
+            .as_ref()
+            .is_some_and(|cached| std::ptr::eq(cached.text.as_ptr(), Arc::as_ptr(text)))
+            && let Some(cached) = entry.take()
+        {
+            drop(entry);
+            drop_on_blocking_thread(cached.instances);
+        }
+    }
+
     fn slot(
         &self,
         has_tree: bool,
@@ -1237,6 +1250,26 @@ mod tests {
         assert_eq!(first.instances[0].entity_name, "IFCWALL");
         assert_eq!(edited.instances[0].entity_name, "IFCDOOR");
         assert!(without_tree.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn instance_cache_forgets_only_instances_of_the_given_text() {
+        let cache = EntityInstanceCache::default();
+        let cached = Arc::new("#1=IFCWALL($);".to_string());
+        let other = Arc::new("#1=IFCWALL($);".to_string());
+        let build = || build_entity_instances(None, &cached);
+        let first = cache.get_or_build_with(false, &cached, build);
+
+        cache.forget(&other);
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache.get_or_build_with(false, &cached, build)
+        ));
+        cache.forget(&cached);
+        assert!(!Arc::ptr_eq(
+            &first,
+            &cache.get_or_build_with(false, &cached, build)
+        ));
     }
 
     #[test]

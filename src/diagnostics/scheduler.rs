@@ -11,13 +11,12 @@ use tower_lsp::lsp_types::Url;
 use tracing::{debug, instrument, warn};
 
 use crate::diagnostics::{self, DiagnosticSnapshot};
-use crate::document::{EntityInstanceCache, drop_on_blocking_thread};
+use crate::document::drop_on_blocking_thread;
 use crate::schema::SchemaDoc;
 
 pub struct DiagnosticScheduler {
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
-    instance_cache: Arc<EntityInstanceCache>,
 }
 
 pub struct DiagnosticTicket {
@@ -29,15 +28,10 @@ impl DiagnosticScheduler {
     pub fn new(client: Client) -> Self {
         let state = Arc::new(Mutex::new(SchedulerState::default()));
         let notify = Arc::new(Notify::new());
-        let instance_cache = Arc::new(EntityInstanceCache::default());
 
         crate::rt::spawn(run_worker(client, Arc::clone(&state), Arc::clone(&notify)));
 
-        Self {
-            state,
-            notify,
-            instance_cache,
-        }
+        Self { state, notify }
     }
 
     #[instrument(skip(self), fields(uri = %uri))]
@@ -94,10 +88,6 @@ impl DiagnosticScheduler {
     pub async fn invalidate(&self, uri: &Url) {
         self.state.lock().await.invalidate(uri);
         debug!("invalidated document diagnostics");
-    }
-
-    pub fn instance_cache(&self) -> Arc<EntityInstanceCache> {
-        Arc::clone(&self.instance_cache)
     }
 
     #[cfg(test)]
@@ -486,7 +476,6 @@ mod tests {
             let scheduler = DiagnosticScheduler {
                 state: Arc::new(Mutex::new(SchedulerState::default())),
                 notify: Arc::new(Notify::new()),
-                instance_cache: Arc::new(EntityInstanceCache::default()),
             };
             let uri = uri("model");
             let text = Arc::new("#1=IFCWALL($);".to_string());

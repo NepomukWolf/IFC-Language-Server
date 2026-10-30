@@ -15,7 +15,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
 use crate::diagnostics::DiagnosticSnapshot;
 use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
-use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
+use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document, EntityInstanceCache};
 use crate::features::{
     completions, definition, document_highlight, document_symbols, hover, inlay_hints, references,
     related_entities, scaffold_completions, semantic_tokens, signature_help,
@@ -57,6 +57,7 @@ pub struct Backend {
     ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>,
     unknown_schema_warned: Arc<RwLock<HashMap<Url, Option<String>>>>,
     diagnostic_scheduler: DiagnosticScheduler,
+    instance_cache: Arc<EntityInstanceCache>,
 }
 
 impl Backend {
@@ -70,6 +71,7 @@ impl Backend {
             ast_skip_warning_shown: Arc::new(RwLock::new(HashSet::new())),
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
+            instance_cache: Arc::new(EntityInstanceCache::default()),
         }
     }
 
@@ -649,7 +651,7 @@ impl LanguageServer for Backend {
         let changes = params.content_changes;
         if !changes.is_empty() {
             debug!(change_count = changes.len(), "document changed");
-            self.diagnostic_scheduler.instance_cache().clear();
+            self.instance_cache.clear();
             let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
             if let Some(snapshot) = self.apply_changes_to_active_document(&uri, changes).await {
                 self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
@@ -664,13 +666,15 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
 
         let mut documents = self.documents.write().await;
-        documents.remove(&uri);
+        let closed = documents.remove(&uri);
         drop(documents);
+        if let Some(closed) = closed {
+            self.instance_cache.forget(&closed.text);
+        }
 
         self.ast_skip_warning_shown.write().await.remove(&uri);
         self.unknown_schema_warned.write().await.remove(&uri);
         self.diagnostic_scheduler.invalidate(&uri).await;
-        self.diagnostic_scheduler.instance_cache().clear();
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
         info!("document closed");
     }
@@ -902,7 +906,7 @@ impl LanguageServer for Backend {
         } else {
             None
         };
-        let instance_cache = self.diagnostic_scheduler.instance_cache();
+        let instance_cache = Arc::clone(&self.instance_cache);
         let result = crate::rt::spawn_blocking(move || {
             let instances = instance_cache.get_or_build_with(tree.is_some(), &text, || {
                 document_symbols::outline_instances(tree.as_ref(), &text)
