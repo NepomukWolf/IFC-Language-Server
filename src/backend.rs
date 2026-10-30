@@ -487,19 +487,18 @@ fn config_state_with_client_capabilities(
     }
 }
 
-/// Drops AST-backed parse state from every open document except `active_uri`.
-/// The backend keeps tree-sitter state for at most one document at a time. Unloaded trees are
-/// freed on a blocking thread instead of inside the handler that switched documents.
+/// Drops lazy parse state from every open document except `active_uri`.
+/// Large decoded tapes are freed on a blocking thread instead of inside the handler that switched documents.
 fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &Url) {
-    let mut unloaded_trees = Vec::new();
+    let mut unloaded_documents = Vec::new();
     for (document_uri, document) in documents.iter_mut() {
         if document_uri != active_uri {
-            unloaded_trees.extend(document.tree.take());
+            unloaded_documents.extend(document.lazy.take());
             document.unload_parse_state();
         }
     }
-    if !unloaded_trees.is_empty() {
-        crate::document::drop_on_blocking_thread(unloaded_trees);
+    if !unloaded_documents.is_empty() {
+        crate::document::drop_on_blocking_thread(unloaded_documents);
     }
 }
 
@@ -823,13 +822,6 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        if let Some(node) = document.node_at_position(position) {
-            debug!(
-                node_kind = node.kind(),
-                node_text = node.utf8_text(document.text.as_bytes()).unwrap_or("?"),
-                "resolved syntax node at hover position"
-            );
-        }
         let schema_docs = self.schema_docs.read().await;
 
         let result = hover::hover(
@@ -897,7 +889,7 @@ impl LanguageServer for Backend {
                 .map(crate::schema::normalize_name)
         });
         let text = Arc::clone(&document.text);
-        let tree = document.tree.clone();
+        let lazy = document.lazy.clone();
         let ast_skipped = document.ast_skipped;
         drop(documents);
 
@@ -908,8 +900,8 @@ impl LanguageServer for Backend {
         };
         let instance_cache = Arc::clone(&self.instance_cache);
         let result = crate::rt::spawn_blocking(move || {
-            let instances = instance_cache.get_or_build_with(tree.is_some(), &text, || {
-                document_symbols::outline_instances(tree.as_ref(), &text)
+            let instances = instance_cache.get_or_build_with(lazy.is_some(), &text, || {
+                document_symbols::outline_instances(lazy.as_deref(), &text)
             });
             document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
         })
@@ -1425,7 +1417,8 @@ mod tests {
 
     fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
         let document = Document::parse(&mut new_parser(), text.to_string());
-        let instances = document_symbols::outline_instances(document.tree.as_ref(), &document.text);
+        let instances =
+            document_symbols::outline_instances(document.lazy.as_deref(), &document.text);
         document_symbols::document_symbols(&document.text, &instances, document.ast_skipped, None)
     }
 

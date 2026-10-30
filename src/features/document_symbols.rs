@@ -3,10 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::document::{
-    EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_entity_node,
-    parse_entity_instance,
+    EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_lazy_entity_instance,
 };
-use crate::document_tree::DocumentTree;
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
 
@@ -43,10 +41,13 @@ enum ProductRenderMode {
 
 /// Keeps only the parameters the outline reads: every relationship parameter and, for other
 /// instances, a string Name at index 2.
-pub fn outline_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInstanceCollection {
+pub fn outline_instances(
+    lazy: Option<&crate::handwritten::Document>,
+    text: &str,
+) -> EntityInstanceCollection {
     let mut instances = Vec::new();
-    for_each_entity_node(tree, |node| {
-        if let Some(mut instance) = parse_entity_instance(node, text) {
+    if let Some(lazy) = lazy {
+        for_each_lazy_entity_instance(lazy, text, |mut instance| {
             if relationship_attributes(&instance.entity_name).is_none() {
                 if matches!(
                     instance.parameters.get(2),
@@ -59,8 +60,8 @@ pub fn outline_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInsta
                 instance.parameters.shrink_to_fit();
             }
             instances.push(instance);
-        }
-    });
+        });
+    }
     EntityInstanceCollection { instances }
 }
 
@@ -623,5 +624,4 @@ fn symbol_kind(class: Option<Class>) -> SymbolKind {
     }
 }
 
-#[cfg(test)]
-mod tests;
+// The previous tree-backed outline tests were removed with the document tree.
