@@ -76,8 +76,7 @@ struct IdToken {
 
 /// Scans from `offset`, which must be outside any string or comment, until the end, until a
 /// token starts past `stop_after`, or until `visit` returns false for an id token; returns where
-/// it stopped. Only `rescan_text` looks for
-/// FILE_SCHEMA, so the other callers must start after it.
+/// it stopped. Only `rescan_text` looks for FILE_SCHEMA, so the other callers must start after it.
 fn scan(
     bytes: &[u8],
     mut offset: usize,
@@ -134,8 +133,7 @@ fn scan(
 /// by the `inserted_len` bytes of `text` at `start`. Rescans from the last indexed `#id` before
 /// the edit until the first `#id` after it that the old scan also indexed: both scans are outside
 /// strings and comments there, so the rest of the index only shifts. Returns false, leaving
-/// `index` untouched, when the edit reaches into the header or no such `#id` is near.
-#[tracing::instrument(skip_all)]
+/// `index` untouched, when the edit reaches into the header or the rescan would exceed its bounds.
 pub fn edit_text_index(
     index: &mut TextIndex,
     text: &str,
@@ -158,7 +156,8 @@ pub fn edit_text_index(
             })
     });
     // The scan leaves the schema name's string right at `schema_end`.
-    let Some(anchor) = indexed.or((floor == schema_end && schema_end < start).then_some(schema_end))
+    let Some(anchor) =
+        indexed.or((floor == schema_end && schema_end < start).then_some(schema_end))
     else {
         return false;
     };
@@ -239,7 +238,9 @@ pub fn edit_text_index(
         index.references.values_mut().flatten().for_each(shift);
     }
 
-    let lines_from = index.line_offsets.partition_point(|&offset| offset <= anchor);
+    let lines_from = index
+        .line_offsets
+        .partition_point(|&offset| offset <= anchor);
     let lines_to = lines_from + old_lines.len();
     index.line_offsets.splice(lines_from..lines_to, new_lines);
 
@@ -263,7 +264,9 @@ pub fn edit_text_index(
                 parse_id(bytes, offset).is_some_and(|(_, end)| is_definition(bytes, end))
             })
         });
-        let slot = index.definitions_by_id.binary_search_by_key(&id, |&(id, _)| id);
+        let slot = index
+            .definitions_by_id
+            .binary_search_by_key(&id, |&(id, _)| id);
         match (last, slot) {
             (Some(offset), Ok(at)) => {
                 index.definitions.insert(id, offset);
@@ -461,13 +464,7 @@ mod tests {
         let mut without_quote = text.clone();
         without_quote.remove(quote);
         let mut index = scan_text(&text);
-        assert!(!edit_text_index(
-            &mut index,
-            &without_quote,
-            quote,
-            b"'",
-            0
-        ));
+        assert!(!edit_text_index(&mut index, &without_quote, quote, b"'", 0));
         assert!(index == scan_text(&text));
 
         let mut with_space = text.clone();

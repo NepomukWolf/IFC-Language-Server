@@ -248,7 +248,6 @@ impl Document {
         params
     }
 
-    #[tracing::instrument(skip_all)]
     pub fn edit(&mut self, removed: &[u8], new: &[u8], edit: Edit) -> EditOutcome {
         let first = self
             .statements
@@ -721,7 +720,17 @@ mod tests {
     fn edits_match_full_parse(original: &[u8]) {
         for retain in [true, false] {
             for start in 6..original.len() - 8 {
-                for insert in [b" ".as_slice(), b"X", b"'", b";", b"", b"/*", b"*/", b"*", b"/"] {
+                for insert in [
+                    b" ".as_slice(),
+                    b"X",
+                    b"'",
+                    b";",
+                    b"",
+                    b"/*",
+                    b"*/",
+                    b"*",
+                    b"/",
+                ] {
                     let mut text = original.to_vec();
                     text.splice(start..start + 1, insert.iter().copied());
                     let mut doc = Document::parse(original, retain);

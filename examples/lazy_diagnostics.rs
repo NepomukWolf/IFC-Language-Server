@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tower_lsp::LanguageServer;
 use tower_lsp::lsp_types::{
-    CompletionParams, CompletionResponse, Diagnostic, GotoDefinitionParams,
-    GotoDefinitionResponse, Range, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, Url,
+    CompletionParams, CompletionResponse, Diagnostic, GotoDefinitionParams, GotoDefinitionResponse,
+    Range, ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentPositionParams,
+    Url,
 };
 
 use lsp_session::{Model, Session};
@@ -282,7 +282,9 @@ fn measure(mode: &str, path: &Path, edit: &str) {
     let target = if edit == "id" {
         model.text[statement + 1..statement + 1 + id_len].to_string()
     } else {
-        let line_end = model.text[open..].find('\n').map_or(model.text.len(), |n| open + n);
+        let line_end = model.text[open..]
+            .find('\n')
+            .map_or(model.text.len(), |n| open + n);
         let reference = model.text[open..line_end].find('#').map(|n| open + n + 1);
         reference.map_or_else(
             || "1".to_string(),

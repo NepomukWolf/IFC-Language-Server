@@ -154,7 +154,6 @@ impl Document {
         }
     }
 
-    #[tracing::instrument(skip_all)]
     pub fn reload_text_index(&mut self) {
         self.with_text_index(|index, text| *index = rescan_text(text, std::mem::take(index)));
     }
@@ -217,7 +216,6 @@ impl Document {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all)]
     fn apply_ranged_change(
         &mut self,
         range: Range,
@@ -283,7 +281,6 @@ impl Document {
         })
     }
 
-    #[tracing::instrument(skip_all)]
     fn parse_current_text(
         &mut self,
         parser: &mut Parser,
@@ -317,7 +314,10 @@ impl Document {
             schema_name: self.schema_name.clone(),
             schema_end: self.schema_end,
         };
-        assert!(index == scan_text(&self.text), "text index differs from a fresh scan");
+        assert!(
+            index == scan_text(&self.text),
+            "text index differs from a fresh scan"
+        );
     }
 
     #[cfg(test)]
@@ -1937,7 +1937,11 @@ mod tests {
             replacement.len(),
         );
         if local {
-            assert_eq!(index, scan_text(&edited), "{text:?} {start}..{end} {replacement:?}");
+            assert_eq!(
+                index,
+                scan_text(&edited),
+                "{text:?} {start}..{end} {replacement:?}"
+            );
         }
         local
     }
@@ -2045,8 +2049,12 @@ mod tests {
                         continue;
                     }
                     let replacement = replacements[random(replacements.len())];
-                    fast +=
-                        usize::from(local_edit_matches_scan(&document.text, start, end, replacement));
+                    fast += usize::from(local_edit_matches_scan(
+                        &document.text,
+                        start,
+                        end,
+                        replacement,
+                    ));
                     let event = change(Some(range), replacement);
                     document
                         .apply_content_changes(&mut parser, std::slice::from_ref(&event), 0)
