@@ -608,6 +608,7 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+#[cfg(test)]
 pub fn build_entity_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
 
@@ -654,15 +655,7 @@ struct CachedEntityInstances {
 }
 
 impl EntityInstanceCache {
-    pub fn get_or_build(
-        &self,
-        tree: Option<&DocumentTree>,
-        text: &Arc<String>,
-    ) -> Arc<EntityInstanceCollection> {
-        self.get_or_build_with(tree.is_some(), text, || build_entity_instances(tree, text))
-    }
-
-    fn get_or_build_with(
+    pub fn get_or_build_with(
         &self,
         has_tree: bool,
         text: &Arc<String>,
@@ -1216,8 +1209,13 @@ mod tests {
         let mut document = Document::parse(&mut parser, "#1=IFCWALL($);".to_string());
         let cache = EntityInstanceCache::default();
 
-        let first = cache.get_or_build(document.tree.as_ref(), &document.text);
-        let repeated = cache.get_or_build(document.tree.as_ref(), &document.text);
+        let build = |document: &Document| {
+            cache.get_or_build_with(document.tree.is_some(), &document.text, || {
+                instances(document)
+            })
+        };
+        let first = build(&document);
+        let repeated = build(&document);
         assert!(Arc::ptr_eq(&first, &repeated));
 
         document
@@ -1231,8 +1229,10 @@ mod tests {
                 DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             )
             .expect("replacement should parse");
-        let edited = cache.get_or_build(document.tree.as_ref(), &document.text);
-        let without_tree = cache.get_or_build(None, &document.text);
+        let edited = build(&document);
+        let without_tree = cache.get_or_build_with(false, &document.text, || {
+            build_entity_instances(None, &document.text)
+        });
 
         assert_eq!(first.instances[0].entity_name, "IFCWALL");
         assert_eq!(edited.instances[0].entity_name, "IFCDOOR");

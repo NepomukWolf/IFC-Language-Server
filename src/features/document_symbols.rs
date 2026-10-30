@@ -2,7 +2,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{
+    EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_entity_node,
+    parse_entity_instance,
+};
+use crate::document_tree::DocumentTree;
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
 
@@ -35,6 +39,29 @@ struct Edge {
 enum ProductRenderMode {
     Direct,
     GroupMultiOnly,
+}
+
+/// Keeps only the parameters the outline reads: every relationship parameter and, for other
+/// instances, a string Name at index 2.
+pub fn outline_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInstanceCollection {
+    let mut instances = Vec::new();
+    for_each_entity_node(tree, |node| {
+        if let Some(mut instance) = parse_entity_instance(node, text) {
+            if relationship_attributes(&instance.entity_name).is_none() {
+                if matches!(
+                    instance.parameters.get(2),
+                    Some(ParameterValue::String { .. })
+                ) {
+                    instance.parameters.truncate(3);
+                } else {
+                    instance.parameters.clear();
+                }
+                instance.parameters.shrink_to_fit();
+            }
+            instances.push(instance);
+        }
+    });
+    EntityInstanceCollection::new(instances)
 }
 
 pub fn document_symbols(
@@ -241,50 +268,56 @@ fn resolve_classes(declared: &[Option<Class>], edges: &[Edge]) -> Vec<Option<Cla
         .collect()
 }
 
+fn relationship_attributes(
+    entity_name: &str,
+) -> Option<(&'static str, &'static str, usize, usize, EdgeKind)> {
+    Some(match entity_name {
+        "IFCRELAGGREGATES" => (
+            "RELATINGOBJECT",
+            "RELATEDOBJECTS",
+            4,
+            5,
+            EdgeKind::Aggregate,
+        ),
+        "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
+        "IFCRELVOIDSELEMENT" => (
+            "RELATINGBUILDINGELEMENT",
+            "RELATEDOPENINGELEMENT",
+            4,
+            5,
+            EdgeKind::Void,
+        ),
+        "IFCRELFILLSELEMENT" => (
+            "RELATINGOPENINGELEMENT",
+            "RELATEDBUILDINGELEMENT",
+            4,
+            5,
+            EdgeKind::Fill,
+        ),
+        "IFCRELCONNECTSPORTTOELEMENT" => (
+            "RELATEDELEMENT",
+            "RELATINGPORT",
+            5,
+            4,
+            EdgeKind::PortContainment,
+        ),
+        "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
+            "RELATINGSTRUCTURE",
+            "RELATEDELEMENTS",
+            5,
+            4,
+            EdgeKind::Containment,
+        ),
+        _ => return None,
+    })
+}
+
 fn relationship_parameters<'a>(
     item: &'a EntityInstanceInfo,
     schema: Option<&SchemaDoc>,
 ) -> Option<(&'a ParameterValue, &'a ParameterValue, EdgeKind)> {
     let (parent_name, children_name, parent_fallback, children_fallback, kind) =
-        match item.entity_name.as_str() {
-            "IFCRELAGGREGATES" => (
-                "RELATINGOBJECT",
-                "RELATEDOBJECTS",
-                4,
-                5,
-                EdgeKind::Aggregate,
-            ),
-            "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
-            "IFCRELVOIDSELEMENT" => (
-                "RELATINGBUILDINGELEMENT",
-                "RELATEDOPENINGELEMENT",
-                4,
-                5,
-                EdgeKind::Void,
-            ),
-            "IFCRELFILLSELEMENT" => (
-                "RELATINGOPENINGELEMENT",
-                "RELATEDBUILDINGELEMENT",
-                4,
-                5,
-                EdgeKind::Fill,
-            ),
-            "IFCRELCONNECTSPORTTOELEMENT" => (
-                "RELATEDELEMENT",
-                "RELATINGPORT",
-                5,
-                4,
-                EdgeKind::PortContainment,
-            ),
-            "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
-                "RELATINGSTRUCTURE",
-                "RELATEDELEMENTS",
-                5,
-                4,
-                EdgeKind::Containment,
-            ),
-            _ => return None,
-        };
+        relationship_attributes(&item.entity_name)?;
     let attribute_index = |name: &str, fallback| {
         schema
             .and_then(|s| s.entity(&item.entity_name))

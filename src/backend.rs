@@ -904,7 +904,9 @@ impl LanguageServer for Backend {
         };
         let instance_cache = self.diagnostic_scheduler.instance_cache();
         let result = crate::rt::spawn_blocking(move || {
-            let instances = instance_cache.get_or_build(tree.as_ref(), &text);
+            let instances = instance_cache.get_or_build_with(tree.is_some(), &text, || {
+                document_symbols::outline_instances(tree.as_ref(), &text)
+            });
             document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
         })
         .await
@@ -1419,8 +1421,7 @@ mod tests {
 
     fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
         let document = Document::parse(&mut new_parser(), text.to_string());
-        let instances =
-            crate::document::build_entity_instances(document.tree.as_ref(), &document.text);
+        let instances = document_symbols::outline_instances(document.tree.as_ref(), &document.text);
         document_symbols::document_symbols(&document.text, &instances, document.ast_skipped, None)
     }
 
