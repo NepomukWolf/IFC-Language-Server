@@ -649,6 +649,7 @@ impl LanguageServer for Backend {
         let changes = params.content_changes;
         if !changes.is_empty() {
             debug!(change_count = changes.len(), "document changed");
+            self.diagnostic_scheduler.instance_cache().clear();
             let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
             if let Some(snapshot) = self.apply_changes_to_active_document(&uri, changes).await {
                 self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
