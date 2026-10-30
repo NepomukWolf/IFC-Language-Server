@@ -61,7 +61,7 @@ pub fn outline_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInsta
             instances.push(instance);
         }
     });
-    EntityInstanceCollection::new(instances)
+    EntityInstanceCollection { instances }
 }
 
 pub fn document_symbols(

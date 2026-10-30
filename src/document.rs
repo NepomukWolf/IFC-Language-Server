@@ -35,12 +35,11 @@ pub struct Document {
 #[derive(Debug)]
 pub struct EntityInstanceCollection {
     pub instances: Vec<EntityInstanceInfo>,
-    instance_indexes_by_id: HashMap<u32, usize>,
 }
 
 #[derive(Debug, Default)]
-pub struct EntityTypeIndex {
-    entity_names_by_id: HashMap<u32, String>,
+pub struct EntityTypeIndex<'a> {
+    entity_names_by_id: HashMap<u32, &'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -608,36 +607,46 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-#[cfg(test)]
-pub fn build_entity_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInstanceCollection {
-    let mut instances = Vec::new();
-
-    for_each_entity_node(tree, |node| {
-        if let Some(instance) = parse_entity_instance(node, text) {
-            instances.push(instance);
-        }
-    });
-
-    EntityInstanceCollection::new(instances)
-}
-
-pub fn build_entity_type_index(tree: Option<&DocumentTree>, text: &str) -> EntityTypeIndex {
+pub fn build_entity_type_index<'a>(
+    tree: Option<&DocumentTree>,
+    text: &'a str,
+) -> EntityTypeIndex<'a> {
     let mut index = EntityTypeIndex::default();
 
     for_each_entity_node(tree, |node| {
-        if let Some(instance) = parse_entity_header(node, text)
-            && let Some(id) = instance.id
-        {
-            index.entity_names_by_id.insert(id, instance.entity_name);
+        if let Some((id, name)) = entity_id_and_name(node, text) {
+            index.entity_names_by_id.insert(id, name);
         }
     });
 
     index
 }
 
-impl EntityTypeIndex {
+fn entity_id_and_name<'a>(node: Node<'_>, text: &'a str) -> Option<(u32, &'a str)> {
+    let (id, name) = if compact::is_compact_entity(node) {
+        let entity = compact::entity(text, node.start_byte());
+        (
+            &text[entity.id.0..entity.id.1],
+            &text[entity.name.0..entity.name.1],
+        )
+    } else {
+        let mut id = None;
+        let mut name = None;
+        for child in node.children(&mut node.walk()) {
+            match child.kind() {
+                "instance_id" => id = Some(&text[child.byte_range()]),
+                "entity_name" => name = Some(&text[child.byte_range()]),
+                _ => {}
+            }
+        }
+        (id?, name?)
+    };
+    Some((id.trim_start_matches('#').parse().ok()?, name))
+}
+
+impl EntityTypeIndex<'_> {
     pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
-        self.entity_names_by_id.get(&id).map(String::as_str)
+        self.entity_names_by_id.get(&id).copied()
     }
 }
 
@@ -717,26 +726,6 @@ impl EntityInstanceCache {
         self.entry
             .lock()
             .expect("entity instance cache lock should not be poisoned")
-    }
-}
-
-impl EntityInstanceCollection {
-    pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
-        let instance_indexes_by_id = instances
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
-            .collect();
-        Self {
-            instances,
-            instance_indexes_by_id,
-        }
-    }
-
-    pub fn instance_by_id(&self, id: u32) -> Option<&EntityInstanceInfo> {
-        self.instance_indexes_by_id
-            .get(&id)
-            .and_then(|index| self.instances.get(*index))
     }
 }
 
@@ -1127,6 +1116,7 @@ fn point_after_text(start: Point, text: &str) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::build_entity_instances;
     use tree_sitter::Tree;
 
     fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
@@ -1291,7 +1281,9 @@ mod tests {
                         peak.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(std::time::Duration::from_millis(50));
                         in_flight.fetch_sub(1, Ordering::SeqCst);
-                        EntityInstanceCollection::new(Vec::new())
+                        EntityInstanceCollection {
+                            instances: Vec::new(),
+                        }
                     });
                 });
             }

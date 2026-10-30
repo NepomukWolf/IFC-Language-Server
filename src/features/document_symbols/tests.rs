@@ -479,7 +479,7 @@ fn outline_instances_keep_only_relationship_parameters_and_string_names() {
     let doc = parse(
         "DATA;\n#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#3=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;",
     );
-    let full = crate::document::build_entity_instances(doc.tree.as_ref(), &doc.text);
+    let full = crate::test_support::build_entity_instances(doc.tree.as_ref(), &doc.text);
     let lean = outline_instances(doc.tree.as_ref(), &doc.text);
 
     let counts: Vec<usize> = lean.instances.iter().map(|i| i.parameters.len()).collect();

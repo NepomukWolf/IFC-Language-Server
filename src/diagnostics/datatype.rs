@@ -7,33 +7,11 @@ use std::fmt;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::{
-    EntityInstanceCollection, EntityInstanceInfo, EntityTypeIndex, ParameterValue,
-};
+use crate::document::{EntityInstanceInfo, EntityTypeIndex, ParameterValue};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
-
-#[cfg(test)]
-fn collect_with_schema_name(
-    instances: &EntityInstanceCollection,
-    schema: &SchemaDoc,
-    schema_name: Option<&str>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    for instance in &instances.instances {
-        let Some(entity) = schema.entity(&instance.entity_name) else {
-            diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
-            continue;
-        };
-
-        validate_instance(instances, schema, entity, instance, &mut diagnostics);
-    }
-
-    diagnostics
-}
 
 pub fn collect_streaming(
     tree: Option<&crate::document_tree::DocumentTree>,
@@ -58,7 +36,7 @@ pub fn collect_streaming(
 }
 
 fn validate_instance(
-    instances: &impl EntityReferenceLookup,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
@@ -81,7 +59,7 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Err(mismatch) = validate_value(instances, schema, value, attribute) {
+        if let Err(mismatch) = validate_value(entity_types, schema, value, attribute) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -247,7 +225,7 @@ impl fmt::Display for Mismatch<'_> {
 type Validation<'a> = Result<(), Mismatch<'a>>;
 
 fn validate_value<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     attribute: &'a EntityAttributeDoc,
@@ -258,33 +236,33 @@ fn validate_value<'a>(
             Err(Mismatch::OmittedUnsupported)
         }
         ParameterValue::Null { .. } | ParameterValue::Omitted { .. } => Ok(()),
-        _ => validate_non_null_value(instances, schema, value, &attribute.ty),
+        _ => validate_non_null_value(entity_types, schema, value, &attribute.ty),
     }
 }
 
 fn validate_non_null_value<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     expected: &'a TypeRef,
 ) -> Validation<'a> {
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
-        TypeRef::Aggregate(aggregate) => validate_aggregate(instances, schema, value, aggregate),
+        TypeRef::Aggregate(aggregate) => validate_aggregate(entity_types, schema, value, aggregate),
         TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => Ok(()),
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
-                validate_entity_reference(instances, schema, value, &named.name)
+                validate_entity_reference(entity_types, schema, value, &named.name)
             }
             NamedTypeKind::Type | NamedTypeKind::Unresolved => {
-                validate_named_type(instances, schema, value, &named.name)
+                validate_named_type(entity_types, schema, value, &named.name)
             }
         },
     }
 }
 
 fn validate_named_type<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     type_name: &'a str,
@@ -295,13 +273,13 @@ fn validate_named_type<'a>(
     match type_def {
         TypeDoc::Alias(alias) => {
             let value = unwrap_inline_typed_value(value, type_name)?;
-            validate_non_null_value(instances, schema, value, &alias.target)
+            validate_non_null_value(entity_types, schema, value, &alias.target)
         }
         TypeDoc::Enumeration(enum_def) => {
             let value = unwrap_inline_typed_value(value, type_name)?;
             validate_enum_value(value, &enum_def.items)
         }
-        TypeDoc::Select(select) => validate_select(instances, schema, value, select),
+        TypeDoc::Select(select) => validate_select(entity_types, schema, value, select),
     }
 }
 
@@ -335,7 +313,7 @@ fn unwrap_inline_typed_value<'a>(
 }
 
 fn validate_select<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     select: &'a SelectTypeDef,
@@ -343,7 +321,7 @@ fn validate_select<'a>(
     if select
         .options
         .iter()
-        .any(|option| select_option_accepts(instances, schema, value, option))
+        .any(|option| select_option_accepts(entity_types, schema, value, option))
     {
         Ok(())
     } else {
@@ -356,7 +334,7 @@ fn validate_select<'a>(
 /// An inline typed value can only match the defined type it names, so differently named aliases
 /// and enumerations are rejected without validating the payload; nested selects are searched.
 fn select_option_accepts<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     option: &'a TypeRef,
@@ -367,14 +345,14 @@ fn select_option_accepts<'a>(
     {
         return match schema.type_decl(&named.name) {
             Some(TypeDoc::Select(select)) => {
-                validate_select(instances, schema, value, select).is_ok()
+                validate_select(entity_types, schema, value, select).is_ok()
             }
             Some(TypeDoc::Alias(_) | TypeDoc::Enumeration(_)) => false,
             None => true,
         };
     }
 
-    validate_non_null_value(instances, schema, value, option).is_ok()
+    validate_non_null_value(entity_types, schema, value, option).is_ok()
 }
 
 fn validate_enum_value<'a>(value: &'a ParameterValue, items: &'a [String]) -> Validation<'a> {
@@ -396,7 +374,7 @@ fn validate_enum_value<'a>(value: &'a ParameterValue, items: &'a [String]) -> Va
 }
 
 fn validate_aggregate<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     aggregate: &'a AggregateTypeRef,
@@ -428,14 +406,14 @@ fn validate_aggregate<'a>(
     }
 
     for item in items {
-        validate_non_null_value(instances, schema, item, &aggregate.item)?;
+        validate_non_null_value(entity_types, schema, item, &aggregate.item)?;
     }
 
     Ok(())
 }
 
 fn validate_entity_reference<'a>(
-    instances: &'a impl EntityReferenceLookup,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     expected_entity: &'a str,
@@ -447,7 +425,7 @@ fn validate_entity_reference<'a>(
         });
     };
 
-    let Some(entity_name) = instances.entity_name_by_id(*id) else {
+    let Some(entity_name) = entity_types.entity_name_by_id(*id) else {
         return Err(Mismatch::UnresolvedReference { id: *id });
     };
 
@@ -459,23 +437,6 @@ fn validate_entity_reference<'a>(
             id: *id,
             found: entity_name,
         })
-    }
-}
-
-trait EntityReferenceLookup {
-    fn entity_name_by_id(&self, id: u32) -> Option<&str>;
-}
-
-impl EntityReferenceLookup for EntityInstanceCollection {
-    fn entity_name_by_id(&self, id: u32) -> Option<&str> {
-        self.instance_by_id(id)
-            .map(|instance| instance.entity_name.as_str())
-    }
-}
-
-impl EntityReferenceLookup for EntityTypeIndex {
-    fn entity_name_by_id(&self, id: u32) -> Option<&str> {
-        EntityTypeIndex::entity_name_by_id(self, id)
     }
 }
 
@@ -535,7 +496,7 @@ impl AggregateKindDisplay for AggregateKind {
 //*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::{Position, Range};
+    use tower_lsp::lsp_types::Range;
     use tree_sitter::Parser;
 
     use super::*;
@@ -551,8 +512,14 @@ mod tests {
         Document::parse(&mut parser, text.to_string())
     }
 
-    fn instances(document: &Document) -> EntityInstanceCollection {
-        crate::document::build_entity_instances(document.tree.as_ref(), &document.text)
+    fn collect(
+        document: &Document,
+        schema: &SchemaDoc,
+        schema_name: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        let tree = document.tree.as_ref();
+        let entity_types = crate::document::build_entity_type_index(tree, &document.text);
+        collect_streaming(tree, &document.text, &entity_types, schema, schema_name)
     }
 
     /// Helper function to load a schema from a fixture source string.
@@ -585,8 +552,7 @@ mod tests {
     #[test]
     fn datatype_validator_reports_mismatched_attribute_type() {
         let doc = parse_document("#1=IFCWALL(123,.MOVABLE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = collect(&doc, &test_schema(), None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
@@ -597,8 +563,7 @@ mod tests {
     #[test]
     fn datatype_validator_accepts_valid_values() {
         let doc = parse_document("#1=IFCWALL('gid',.MOVABLE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = collect(&doc, &test_schema(), None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -606,41 +571,7 @@ mod tests {
     /// Test that the datatype validator reports unresolved references.
     #[test]
     fn datatype_validator_reports_unresolved_reference() {
-        let instances = EntityInstanceCollection::new(vec![crate::document::EntityInstanceInfo {
-            id: Some(1),
-            id_range: Some(Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 2),
-            }),
-            entity_name: "IFCWALL".to_string(),
-            entity_name_range: Range {
-                start: Position::new(0, 3),
-                end: Position::new(0, 10),
-            },
-            entity_range: Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 27),
-            },
-            parameter_list_range: Some(Range {
-                start: Position::new(0, 10),
-                end: Position::new(0, 27),
-            }),
-            parameters: vec![
-                ParameterValue::String {
-                    range: Range {
-                        start: Position::new(0, 11),
-                        end: Position::new(0, 16),
-                    },
-                },
-                ParameterValue::Reference {
-                    id: 2,
-                    range: Range {
-                        start: Position::new(0, 17),
-                        end: Position::new(0, 19),
-                    },
-                },
-            ],
-        }]);
+        let doc = parse_document("#1=IFCWALL('gid',#2);");
 
         let schema = schema_from(
             r#"
@@ -656,14 +587,14 @@ mod tests {
             "#,
         );
 
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect(&doc, &schema, None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("does not resolve"));
     }
 
     #[test]
-    fn streaming_validation_matches_collection_validation() {
+    fn reference_checks_resolve_the_last_definition_of_each_id() {
         let schema = schema_from(
             r#"
             SCHEMA IFC4;
@@ -681,15 +612,9 @@ mod tests {
         );
         let text = "#1=IFCHOLDER((#2,#3),(#9),#4,#5);\n#2=IFCCHILD();\n#3=IFCOTHER();\n#4=IFCTARGET();\n#4=IFCOTHER();\n#5=IFCCHILD();";
         let document = parse_document(text);
-        let instances = instances(&document);
 
-        let collected = collect_with_schema_name(&instances, &schema, None);
-        let index = crate::document::build_entity_type_index(document.tree.as_ref(), text);
-        let streamed = collect_streaming(document.tree.as_ref(), text, &index, &schema, None);
-
-        assert_eq!(streamed, collected);
         assert_eq!(
-            streamed
+            collect(&document, &schema, None)
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
@@ -732,8 +657,7 @@ mod tests {
         );
 
         let doc = parse_document("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect(&doc, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -765,8 +689,7 @@ mod tests {
         let doc = parse_document(
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));\n#2=IFCPROPERTYSINGLEVALUE('Offset',$,IFCLENGTHMEASURE(2.6));",
         );
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect(&doc, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -825,8 +748,7 @@ mod tests {
 
     fn rendered_diagnostics(text: &str) -> Vec<String> {
         let doc = parse_document(text);
-        let instances = instances(&doc);
-        collect_with_schema_name(&instances, &select_schema(), Some("IFC4"))
+        collect(&doc, &select_schema(), Some("IFC4"))
             .iter()
             .map(|diagnostic| {
                 let Range { start, end } = diagnostic.range;

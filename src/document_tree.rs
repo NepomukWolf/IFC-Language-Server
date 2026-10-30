@@ -371,7 +371,8 @@ fn is_entity_start(text: &[u8], offset: usize) -> bool {
 mod tests {
     use super::*;
     use crate::diagnostics::{DiagnosticSnapshot, syntax};
-    use crate::document::{Document, build_entity_instances};
+    use crate::document::Document;
+    use crate::test_support::build_entity_instances;
 
     fn unclosed_quotes(text: &[u8], error_start: usize) -> Vec<usize> {
         let odd_quotes = odd_quote_entities(text);
