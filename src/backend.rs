@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
@@ -211,14 +211,14 @@ impl Backend {
         snapshot
     }
 
-    #[instrument(skip(self, changes), fields(uri = %uri, change_count = changes.len()))]
+    #[instrument(skip(self, documents, changes), fields(uri = %uri, change_count = changes.len()))]
     async fn apply_changes_to_active_document(
         &self,
+        mut documents: RwLockWriteGuard<'_, HashMap<Url, Document>>,
         uri: &Url,
         changes: Vec<TextDocumentContentChangeEvent>,
     ) -> Option<DiagnosticSnapshot> {
         let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
-        let mut documents = self.documents.write().await;
         unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
@@ -650,9 +650,15 @@ impl LanguageServer for Backend {
         let changes = params.content_changes;
         if !changes.is_empty() {
             debug!(change_count = changes.len(), "document changed");
+            // tower-lsp polls handlers in arrival order, so queueing for the document lock before
+            // any other await makes every later request read the changed text.
+            let documents = self.documents.write().await;
             self.instance_cache.clear();
             let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
-            if let Some(snapshot) = self.apply_changes_to_active_document(&uri, changes).await {
+            if let Some(snapshot) = self
+                .apply_changes_to_active_document(documents, &uri, changes)
+                .await
+            {
                 self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
             } else {
                 warn!("received document change for an unopened document");
@@ -1453,6 +1459,57 @@ mod tests {
         assert_eq!(repeated, first);
         assert_eq!(edited, outline_of_fresh_parse(&after));
         assert_ne!(edited, first);
+    }
+
+    #[tokio::test]
+    async fn a_request_sent_after_a_change_reads_the_changed_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/order.ifc").unwrap();
+        open_document(
+            backend,
+            &uri,
+            "DATA;\n#1=IFCWALL($);\n#2=IFCDOOR(#1);\nENDSEC;\n",
+        )
+        .await;
+        let busy = backend.diagnostic_scheduler.hold().await;
+        let change = backend.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 0), Position::new(1, 0))),
+                range_length: None,
+                text: "#3=IFCSLAB($);\n".to_string(),
+            }],
+        });
+        let hover = backend.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(3, 12),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+        futures::pin_mut!(change, hover);
+
+        assert!(futures::poll!(&mut change).is_pending());
+        let early = futures::poll!(&mut hover);
+        drop(busy);
+        change.await;
+        let hover = match early {
+            std::task::Poll::Ready(hover) => hover,
+            std::task::Poll::Pending => hover.await,
+        };
+
+        let Some(Hover {
+            contents: HoverContents::Markup(markup),
+            ..
+        }) = hover.unwrap()
+        else {
+            panic!("hover on `#1` in the changed text");
+        };
+        assert!(markup.value.contains("#1=IFCWALL($);"), "{}", markup.value);
     }
 
     #[test]

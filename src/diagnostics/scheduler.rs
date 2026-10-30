@@ -90,6 +90,12 @@ impl DiagnosticScheduler {
         debug!("invalidated document diagnostics");
     }
 
+    /// Holds the scheduler busy, as its worker does while publishing, until the guard drops.
+    #[cfg(test)]
+    pub async fn hold(&self) -> impl Drop + '_ {
+        self.state.lock().await
+    }
+
     #[cfg(test)]
     pub async fn current_generation(&self, uri: &Url) -> Option<u64> {
         self.state
