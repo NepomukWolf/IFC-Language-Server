@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use crate::handwritten;
+
 #[derive(Debug, Default, PartialEq)]
 pub struct TextIndex {
     pub line_offsets: Vec<usize>,
@@ -146,13 +148,16 @@ pub fn edit_text_index(
         return false;
     };
     let floor = schema_end.max(start.saturating_sub(MAX_ANCHOR_DISTANCE));
+    // Whether a string before an `#id` ends there depends on the `=` after it, so that lookahead
+    // must end before the edit.
     let indexed = (floor..start).rev().find(|&offset| {
         bytes[offset] == b'#'
-            && parse_id(bytes, offset).is_some_and(|(id, _)| {
-                index
-                    .references
-                    .get(&id)
-                    .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
+            && parse_id(bytes, offset).is_some_and(|(id, end)| {
+                handwritten::trivia(bytes, end, start) < start
+                    && index
+                        .references
+                        .get(&id)
+                        .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
             })
     });
     // The scan leaves the schema name's string right at `schema_end`.
@@ -312,11 +317,26 @@ fn is_definition(bytes: &[u8], mut offset: usize) -> bool {
     bytes.get(offset) == Some(&b'=')
 }
 
-fn skip_string(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> usize {
+fn skip_string(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> usize {
+    string_end(bytes, offset, line_offsets).0
+}
+
+/// End of the string opening at `offset` and whether a quote closed it. Like
+/// `handwritten::frame_end`, a string that runs into the start of another statement ends there,
+/// so an unclosed string swallows only its own.
+fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> (usize, bool) {
+    let len = bytes.len();
     offset += 1;
-    while offset < bytes.len() {
+    while offset < len {
         match bytes[offset] {
             b'\n' => {
+                let mut next = offset + 1;
+                while next < len && matches!(bytes[next], b' ' | b'\t' | b'\r') {
+                    next += 1;
+                }
+                if handwritten::definition(bytes, next, len) {
+                    return (offset, false);
+                }
                 line_offsets.push(offset + 1);
                 offset += 1;
             }
@@ -324,13 +344,21 @@ fn skip_string(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -
                 if bytes.get(offset + 1) == Some(&b'\'') {
                     offset += 2;
                 } else {
-                    return offset + 1;
+                    return (offset + 1, true);
                 }
+            }
+            b';' if handwritten::definition(
+                bytes,
+                handwritten::trivia(bytes, offset + 1, len),
+                len,
+            ) =>
+            {
+                return (offset + 1, false);
             }
             _ => offset += 1,
         }
     }
-    offset
+    (offset, false)
 }
 
 fn skip_block_comment(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> usize {
@@ -363,55 +391,11 @@ fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<(String, us
     None
 }
 
-fn parse_schema_string(bytes: &[u8], mut offset: usize) -> Option<(String, usize)> {
-    offset += 1;
-    let start = offset;
-    let mut value = Vec::new();
-
-    while offset < bytes.len() {
-        if bytes[offset] == b'\'' {
-            if bytes.get(offset + 1) == Some(&b'\'') {
-                value.extend_from_slice(&bytes[start..offset]);
-                value.push(b'\'');
-                offset += 2;
-                return parse_schema_string_tail(bytes, offset, value);
-            }
-            value.extend_from_slice(&bytes[start..offset]);
-            return String::from_utf8(value)
-                .ok()
-                .map(|schema_name| (schema_name.to_ascii_uppercase(), offset + 1));
-        }
-        offset += 1;
-    }
-
-    None
-}
-
-fn parse_schema_string_tail(
-    bytes: &[u8],
-    mut offset: usize,
-    mut value: Vec<u8>,
-) -> Option<(String, usize)> {
-    let mut start = offset;
-    while offset < bytes.len() {
-        if bytes[offset] == b'\'' {
-            if bytes.get(offset + 1) == Some(&b'\'') {
-                value.extend_from_slice(&bytes[start..offset]);
-                value.push(b'\'');
-                offset += 2;
-                start = offset;
-            } else {
-                value.extend_from_slice(&bytes[start..offset]);
-                return String::from_utf8(value)
-                    .ok()
-                    .map(|schema_name| (schema_name.to_ascii_uppercase(), offset + 1));
-            }
-        } else {
-            offset += 1;
-        }
-    }
-
-    None
+fn parse_schema_string(bytes: &[u8], offset: usize) -> Option<(String, usize)> {
+    let (end, closed) = string_end(bytes, offset, &mut Vec::new());
+    closed.then_some(())?;
+    let value = std::str::from_utf8(&bytes[offset + 1..end - 1]).ok()?;
+    Some((value.replace("''", "'").to_ascii_uppercase(), end))
 }
 
 fn is_identifier_start(byte: u8) -> bool {
@@ -460,17 +444,53 @@ mod tests {
         for id in 1..=60_000 {
             text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
         }
-        let quote = text.find("1',").expect("first closing quote") + 1;
-        let mut without_quote = text.clone();
-        without_quote.remove(quote);
+        let open = text.find("#2=").expect("second statement");
+        let mut with_comment = text.clone();
+        with_comment.insert_str(open, "/*");
         let mut index = scan_text(&text);
-        assert!(!edit_text_index(&mut index, &without_quote, quote, b"'", 0));
+        assert!(!edit_text_index(&mut index, &with_comment, open, b"", 2));
         assert!(index == scan_text(&text));
 
+        let quote = text.find("1',").expect("first closing quote") + 1;
         let mut with_space = text.clone();
         with_space.insert(quote, ' ');
         assert!(edit_text_index(&mut index, &with_space, quote, b"", 1));
         assert!(index == scan_text(&with_space));
+    }
+
+    #[test]
+    fn an_unclosed_string_ends_at_the_next_statement() {
+        let text = "#1=X('a);\n#2=Y(#1);\n#3=Z('b,\n  #4=W(#2);";
+        let at = |needle: &str| text.find(needle).unwrap();
+        let index = scan_text(text);
+
+        assert_eq!(
+            index.definitions_by_id,
+            vec![(1, 0), (2, at("#2=")), (3, at("#3=")), (4, at("#4="))]
+        );
+        assert_eq!(index.references.get(&1), Some(&vec![0, at("#1)")]));
+        assert_eq!(index.references.get(&2), Some(&vec![at("#2="), at("#2)")]));
+        assert_eq!(
+            index.line_offsets,
+            vec![0, at("#2="), at("#3="), at("  #4=")]
+        );
+    }
+
+    #[test]
+    fn deleting_a_closing_quote_rescans_only_its_statement() {
+        let mut text = String::from("FILE_SCHEMA(('IFC4'));\n");
+        for id in 1..=60_000 {
+            text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
+        }
+        let quote = text.find("1',").expect("first closing quote") + 1;
+        let mut without_quote = text.clone();
+        without_quote.remove(quote);
+        let mut index = scan_text(&text);
+
+        assert!(edit_text_index(&mut index, &without_quote, quote, b"'", 0));
+        assert!(index == scan_text(&without_quote));
+        assert!(edit_text_index(&mut index, &text, quote, b"", 1));
+        assert!(index == scan_text(&text));
     }
 
     #[test]

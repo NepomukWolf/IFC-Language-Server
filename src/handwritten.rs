@@ -642,7 +642,7 @@ impl Reader<'_, '_> {
     }
 }
 
-fn trivia(text: &[u8], mut p: usize, end: usize) -> usize {
+pub(crate) fn trivia(text: &[u8], mut p: usize, end: usize) -> usize {
     while p < end {
         if text[p].is_ascii_whitespace() {
             p += 1;
@@ -672,7 +672,8 @@ fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Option<usize> {
     Some(p)
 }
 
-fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
+/// Whether `#<digits> =` starts at `p`.
+pub(crate) fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
     if text.get(p) != Some(&b'#') {
         return false;
     }

@@ -239,7 +239,7 @@ impl Document {
         }
 
         let removed = self.text.as_bytes()[start_byte..old_end_byte].to_vec();
-        Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
+        replace_text(&mut self.text, start_byte..old_end_byte, replacement);
         if let Some(lazy) = self.lazy.as_mut() {
             let outcome = Arc::make_mut(lazy).edit(
                 &removed,
@@ -557,6 +557,24 @@ impl Document {
         }
 
         digit_end > offset && offset > 0 && bytes[offset - 1] == b'#'
+    }
+}
+
+/// Spare capacity given to the text when an edit has to reallocate it, so that typing does not
+/// double the allocation of a large document.
+const TEXT_HEADROOM: usize = 64 * 1024;
+
+fn replace_text(text: &mut Arc<String>, range: std::ops::Range<usize>, replacement: &str) {
+    let len = text.len() - range.len() + replacement.len();
+    match Arc::get_mut(text) {
+        Some(owned) if owned.capacity() >= len => owned.replace_range(range, replacement),
+        _ => {
+            let mut edited = String::with_capacity(len + TEXT_HEADROOM);
+            edited.push_str(&text[..range.start]);
+            edited.push_str(replacement);
+            edited.push_str(&text[range.end..]);
+            *text = Arc::new(edited);
+        }
     }
 }
 
@@ -1388,6 +1406,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn an_insertion_into_a_full_text_reserves_bounded_headroom() {
+        let mut parser = Parser::new();
+        let text = format!("DATA;\n{}ENDSEC;\n", "#1=IFCWALL($);\n".repeat(100_000));
+        let mut document = Document::new_unloaded(text.clone());
+        let mut text = text;
+        text.shrink_to_fit();
+        document.text = Arc::new(text);
+        let shared = Arc::clone(&document.text);
+
+        for snapshot in [Some(shared), None] {
+            document
+                .apply_content_changes(
+                    &mut parser,
+                    &[change(
+                        Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
+                        "x",
+                    )],
+                    DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+                )
+                .unwrap();
+            drop(snapshot);
+            let spare = document.text.capacity() - document.text.len();
+            assert!(spare <= TEXT_HEADROOM, "{spare} bytes spare");
+        }
     }
 
     fn instances(document: &Document) -> EntityInstanceCollection {
