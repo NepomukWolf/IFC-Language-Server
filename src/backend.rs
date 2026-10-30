@@ -59,6 +59,7 @@ pub struct Backend {
     config: Arc<RwLock<ConfigState>>,
     ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>,
     unknown_schema_warned: Arc<RwLock<HashMap<Url, Option<String>>>>,
+    last_change: Arc<RwLock<HashMap<Url, tokio::time::Instant>>>,
     diagnostic_scheduler: DiagnosticScheduler,
 }
 
@@ -72,6 +73,7 @@ impl Backend {
             config: Arc::new(RwLock::new(ConfigState::default())),
             ast_skip_warning_shown: Arc::new(RwLock::new(HashSet::new())),
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
+            last_change: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
         }
     }
@@ -233,7 +235,7 @@ impl Backend {
             warn!(?error, "received invalid incremental document change");
         }
         let now = tokio::time::Instant::now();
-        let delay = match document.last_change.replace(now) {
+        let delay = match self.last_change.write().await.insert(uri.clone(), now) {
             Some(previous) if now - previous < DIAGNOSTICS_DEBOUNCE => DIAGNOSTICS_DEBOUNCE,
             _ => std::time::Duration::ZERO,
         };
@@ -734,6 +736,7 @@ impl LanguageServer for Backend {
 
         self.ast_skip_warning_shown.write().await.remove(&uri);
         self.unknown_schema_warned.write().await.remove(&uri);
+        self.last_change.write().await.remove(&uri);
         self.diagnostic_scheduler.invalidate(&uri).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
         info!("document closed");
