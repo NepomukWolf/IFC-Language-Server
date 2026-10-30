@@ -4,24 +4,27 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::diagnostics::DiagnosticSnapshot;
+use crate::document_tree::UnclosedString;
 
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     let Some(tree) = &snapshot.tree else {
         return Vec::new();
     };
 
-    if !tree.unclosed_strings.is_empty() {
-        return tree
-            .unclosed_strings
-            .iter()
-            .map(|&offset| unclosed_string_diagnostic(snapshot.text(), offset))
-            .collect();
-    }
-
-    let mut diagnostics = Vec::new();
+    let mut diagnostics: Vec<_> = tree
+        .unclosed_strings
+        .iter()
+        .map(|string| unclosed_string_diagnostic(snapshot.text(), string.quote))
+        .collect();
     let mut cursor = tree.root_node().walk();
-    collect_error_nodes(&mut cursor, &mut diagnostics);
+    collect_error_nodes(&mut cursor, &tree.unclosed_strings, &mut diagnostics);
+    diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
     diagnostics
+}
+
+fn follows_unclosed_string(unclosed_strings: &[UnclosedString], offset: usize) -> bool {
+    let index = unclosed_strings.partition_point(|string| string.quote <= offset);
+    index > 0 && unclosed_strings[index - 1].end >= offset
 }
 
 fn unclosed_string_diagnostic(text: &str, offset: usize) -> Diagnostic {
@@ -43,12 +46,15 @@ fn unclosed_string_diagnostic(text: &str, offset: usize) -> Diagnostic {
 
 fn collect_error_nodes(
     cursor: &mut tree_sitter::TreeCursor<'_>,
+    unclosed_strings: &[UnclosedString],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     loop {
         let node = cursor.node();
 
-        if let Some(diagnostic) = syntax_diagnostic_for_node(&node) {
+        if !follows_unclosed_string(unclosed_strings, node.start_byte())
+            && let Some(diagnostic) = syntax_diagnostic_for_node(&node)
+        {
             diagnostics.push(diagnostic);
         }
 
@@ -56,7 +62,7 @@ fn collect_error_nodes(
         // that tree-sitter creates for a token the lexer cannot recognize. `has_error` is also
         // true on every ancestor of a MISSING node.
         if !node.is_error() && node.has_error() && cursor.goto_first_child() {
-            collect_error_nodes(cursor, diagnostics);
+            collect_error_nodes(cursor, unclosed_strings, diagnostics);
             cursor.goto_parent();
         }
 
@@ -177,6 +183,39 @@ mod tests {
             Range::new(Position::new(0, 11), Position::new(0, 12))
         );
         assert_eq!(diagnostics[0].message, "Unclosed string; expected `'`");
+    }
+
+    #[test]
+    fn reports_two_unclosed_strings_and_unrelated_errors() {
+        let doc = parse_document(concat!(
+            "DATA;\n",
+            "#1=X('a);\n",
+            "#2=X(1);\n",
+            "#3=X('b);\n",
+            "#4=X(1);\n",
+            "#5=X(2)\n",
+            "#6=X(3);\n",
+            "ENDSEC;\n",
+        ));
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range.start, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [
+                (
+                    Position::new(1, 5),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (
+                    Position::new(3, 5),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (Position::new(5, 7), "Missing `;`".to_string()),
+            ]
+        );
     }
 
     #[test]

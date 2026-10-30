@@ -2,13 +2,29 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Range, Tree, TreeCursor};
 
 #[derive(Clone, Debug)]
 pub struct DocumentTree {
-    pub compact: Tree,
-    pub structured: Option<Tree>,
+    compact: Tree,
+    structured: Option<Tree>,
     omitted: Vec<Range>,
-    pub unclosed_strings: Vec<usize>,
+    pub(crate) unclosed_strings: Vec<UnclosedString>,
+}
+
+/// A string whose closing quote is missing, reported at `quote`. Errors from `quote` to `end`
+/// follow from the text it swallowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnclosedString {
+    pub(crate) quote: usize,
+    pub(crate) end: usize,
 }
 
 impl DocumentTree {
+    /// Parses with the compact grammar and, when that tree has errors, reparses only the text
+    /// around them with the structured grammar, keeping error-free compact entities elsewhere.
+    ///
+    /// An error caused by an unclosed string is bounded to the lines of that string; any other
+    /// error is widened by two `;`-terminated statements on each side. A structured error,
+    /// string, comment or entity that crosses a kept compact entity drops that entity and the
+    /// reparse is repeated. The third attempt keeps no compact entities, so the worst case is
+    /// two partial structured parses followed by one of the whole document.
     pub fn parse(parser: &mut Parser, text: &[u8], old: Option<Self>) -> Option<Self> {
         parser.set_included_ranges(&[]).expect("whole document");
         parser
@@ -34,13 +50,18 @@ impl DocumentTree {
             &mut errors,
             &mut entities,
         );
+        let odd_quotes = odd_quote_entities(text);
         for (start, end) in &mut errors {
-            if let Some(quote) = unclosed_string_start(text, *start) {
-                if !result.unclosed_strings.contains(&quote) {
-                    result.unclosed_strings.push(quote);
-                }
-                *start = quote;
-                *end = line_end(text, quote);
+            let causes = &odd_quotes[causing_strings(text, &odd_quotes, *start)];
+            if let (Some(first), Some(last)) = (causes.first(), causes.last()) {
+                result
+                    .unclosed_strings
+                    .extend(causes.iter().map(|entity| UnclosedString {
+                        quote: entity.first_quote,
+                        end: swallowed_end(text, entity),
+                    }));
+                *start = first.first_quote;
+                *end = line_end(text, last.last_quote);
                 continue;
             }
             for _ in 0..2 {
@@ -54,6 +75,10 @@ impl DocumentTree {
                     .map_or(text.len(), |offset| *end + offset + 1);
             }
         }
+        result
+            .unclosed_strings
+            .sort_unstable_by_key(|string| string.quote);
+        result.unclosed_strings.dedup();
         for node in entities {
             if !errors
                 .iter()
@@ -128,6 +153,11 @@ impl DocumentTree {
             .set_language(&tree_sitter_ifc::LANGUAGE.into())
             .expect("IFC ABI");
         Some(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn structured(&self) -> Option<&Tree> {
+        self.structured.as_ref()
     }
 
     pub fn edit(&mut self, edit: &InputEdit) {
@@ -238,21 +268,31 @@ fn line_end(text: &[u8], start: usize) -> usize {
         .map_or(text.len(), |offset| start + offset)
 }
 
-fn unclosed_string_start(text: &[u8], error_start: usize) -> Option<usize> {
-    let mut entity_start = None;
-    let mut first_quote = None;
+/// An entity line whose quotes do not pair up.
+struct OddQuoteEntity {
+    start: usize,
+    first_quote: usize,
+    last_quote: usize,
+}
+
+fn odd_quote_entities(text: &[u8]) -> Vec<OddQuoteEntity> {
+    let mut entities = Vec::new();
+    let mut current = None;
     let mut quote_count = 0;
-    let mut candidate = None;
-    let mut candidate_entity_start = None;
     let mut offset = 0;
+    let mut finish = |current: Option<OddQuoteEntity>, quote_count: usize| {
+        if quote_count % 2 == 1 {
+            entities.extend(current);
+        }
+    };
     while offset < text.len() {
         if is_entity_start(text, offset) {
-            if quote_count % 2 == 1 {
-                candidate = first_quote;
-                candidate_entity_start = entity_start;
-            }
-            entity_start = Some(offset);
-            first_quote = None;
+            finish(current.take(), quote_count);
+            current = Some(OddQuoteEntity {
+                start: offset,
+                first_quote: usize::MAX,
+                last_quote: usize::MAX,
+            });
             quote_count = 0;
         }
         if text[offset..].starts_with(b"/*") {
@@ -262,7 +302,12 @@ fn unclosed_string_start(text: &[u8], error_start: usize) -> Option<usize> {
             if text.get(offset + 1) == Some(&b'\'') {
                 offset += 2;
             } else {
-                first_quote.get_or_insert(offset);
+                if let Some(entity) = &mut current {
+                    if quote_count == 0 {
+                        entity.first_quote = offset;
+                    }
+                    entity.last_quote = offset;
+                }
                 quote_count += 1;
                 offset += 1;
             }
@@ -274,11 +319,38 @@ fn unclosed_string_start(text: &[u8], error_start: usize) -> Option<usize> {
                 memchr::memchr3(b'\n', b'\'', b'/', &text[offset..]).unwrap_or(text.len() - offset);
         }
     }
-    if quote_count % 2 == 1 {
-        candidate = first_quote;
-        candidate_entity_start = entity_start;
+    finish(current, quote_count);
+    entities
+}
+
+/// The entities in `odd_quotes` whose unclosed string can explain an error starting at
+/// `error_start`: the nearest entity starting at or before it, and the earlier ones whose string
+/// swallows text up to it.
+fn causing_strings(
+    text: &[u8],
+    odd_quotes: &[OddQuoteEntity],
+    error_start: usize,
+) -> std::ops::Range<usize> {
+    let last = odd_quotes.partition_point(|entity| entity.start <= error_start);
+    let mut first = last;
+    while first > 0 && swallowed_end(text, &odd_quotes[first - 1]) >= error_start {
+        first -= 1;
     }
-    candidate.filter(|_| candidate_entity_start.is_some_and(|entity| entity <= error_start))
+    first..last
+}
+
+/// End of the line where the string opened by the entity's last quote is closed by the next
+/// quote in the document.
+fn swallowed_end(text: &[u8], entity: &OddQuoteEntity) -> usize {
+    let mut offset = entity.last_quote + 1;
+    while let Some(found) = memchr::memchr(b'\'', &text[offset..]) {
+        offset += found;
+        if text.get(offset + 1) != Some(&b'\'') {
+            return line_end(text, offset);
+        }
+        offset += 2;
+    }
+    line_end(text, entity.last_quote)
 }
 
 fn is_entity_start(text: &[u8], offset: usize) -> bool {
@@ -301,37 +373,33 @@ mod tests {
     use crate::diagnostics::{DiagnosticSnapshot, syntax};
     use crate::document::{Document, build_entity_instances};
 
+    fn unclosed_quotes(text: &[u8], error_start: usize) -> Vec<usize> {
+        let odd_quotes = odd_quote_entities(text);
+        odd_quotes[causing_strings(text, &odd_quotes, error_start)]
+            .iter()
+            .map(|entity| entity.first_quote)
+            .collect()
+    }
+
     #[test]
     fn finds_the_opening_quote_of_an_unclosed_string() {
-        assert_eq!(
-            unclosed_string_start(b"#1=IFCWALL('Anna's wall');", 0),
-            Some(11)
-        );
-        assert_eq!(unclosed_string_start(b"#1=IFCWALL('line\none');", 0), None);
-        assert_eq!(
-            unclosed_string_start(b"#1=IFCWALL('escaped '' quote');", 0),
-            None
-        );
-        assert_eq!(
-            unclosed_string_start(b"#1=X('a/b');\n#2=X('c);", 14),
-            Some(18)
-        );
-        assert_eq!(
-            unclosed_string_start(b"/* it's\n#9=X(' */\n#1=X('a');", 0),
-            None
-        );
-        assert_eq!(
-            unclosed_string_start(b"/* it's\n#9=X(' */\n#1=X('a);", 30),
-            Some(23)
-        );
-        assert_eq!(
-            unclosed_string_start(b"#1=X('a' /x/ 'b);\n#2=X('');", 0),
-            Some(5)
-        );
-        assert_eq!(
-            unclosed_string_start(b"#1=X('a);\n/* x */#2=X('b');", 0),
-            Some(5)
-        );
+        assert_eq!(unclosed_quotes(b"#1=IFCWALL('Anna's wall');", 0), [11]);
+        assert!(unclosed_quotes(b"#1=IFCWALL('line\none');", 0).is_empty());
+        assert!(unclosed_quotes(b"#1=IFCWALL('escaped '' quote');", 0).is_empty());
+        assert_eq!(unclosed_quotes(b"#1=X('a/b');\n#2=X('c);", 14), [18]);
+        assert!(unclosed_quotes(b"/* it's\n#9=X(' */\n#1=X('a');", 0).is_empty());
+        assert_eq!(unclosed_quotes(b"/* it's\n#9=X(' */\n#1=X('a);", 25), [23]);
+        assert_eq!(unclosed_quotes(b"#1=X('a' /x/ 'b);\n#2=X('');", 0), [5]);
+        assert_eq!(unclosed_quotes(b"#1=X('a);\n/* x */#2=X('b');", 0), [5]);
+    }
+
+    #[test]
+    fn finds_every_unclosed_string_that_explains_an_error() {
+        let text = b"#1=X('a);\n#2=X(1);\n#3=X('b);\n";
+        assert_eq!(unclosed_quotes(text, 0), [5]);
+        assert_eq!(unclosed_quotes(text, 25), [5, 24]);
+        let far = b"#1=X('a);\n#2=X(1);\n#3=X(2)\n#4=X(3);\n";
+        assert!(unclosed_quotes(far, 27).is_empty());
     }
 
     #[test]

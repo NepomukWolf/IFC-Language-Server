@@ -1419,7 +1419,7 @@ mod tests {
         let mut parser = Parser::new();
         let mut document = parse_document(invalid);
         assert_eq!(
-            node_spans(document.tree.as_ref().unwrap().structured.as_ref().unwrap()),
+            node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
             structured_spans(invalid)
         );
 
@@ -1445,7 +1445,7 @@ mod tests {
             .unwrap();
         assert_eq!(document.text.as_str(), invalid);
         assert_eq!(
-            node_spans(document.tree.as_ref().unwrap().structured.as_ref().unwrap()),
+            node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
             structured_spans(invalid)
         );
     }
