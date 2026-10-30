@@ -298,13 +298,34 @@ impl Document {
         let lazy = self.lazy.as_deref()?;
         let index = lazy
             .statements
-            .iter()
-            .position(|statement| statement.span.start as usize == definition_offset)?;
+            .partition_point(|statement| (statement.span.start as usize) < definition_offset);
+        (lazy.statements.get(index)?.span.start as usize == definition_offset).then_some(())?;
+        self.decode_statement(lazy, index)
+    }
+
+    /// The statement whose span contains `offset`, decoded.
+    pub fn entity_instance_at_offset(&self, offset: usize) -> Option<EntityInstanceInfo> {
+        let lazy = self.lazy.as_deref()?;
+        let index = lazy
+            .statements
+            .partition_point(|statement| statement.span.start as usize <= offset)
+            .checked_sub(1)?;
+        (offset < lazy.statements[index].span.end as usize).then_some(())?;
+        self.decode_statement(lazy, index)
+    }
+
+    fn decode_statement(
+        &self,
+        lazy: &handwritten::Document,
+        index: usize,
+    ) -> Option<EntityInstanceInfo> {
+        let start = lazy.statements[index].span.start as usize;
+        let row = self.line_offsets.partition_point(|&line| line <= start) - 1;
         let mut points = LinePoints {
             text: self.text.as_bytes(),
-            offset: 0,
-            row: 0,
-            line_start: 0,
+            offset: self.line_offsets[row],
+            row,
+            line_start: self.line_offsets[row],
         };
         lazy_entity_instance(lazy, &self.text, index, &mut points)
     }
@@ -632,12 +653,19 @@ pub(crate) fn positions_of(text: &str, offsets: impl IntoIterator<Item = usize>)
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DECODED_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn lazy_entity_instance(
     lazy: &handwritten::Document,
     text: &str,
     index: usize,
     points: &mut LinePoints<'_>,
 ) -> Option<EntityInstanceInfo> {
+    #[cfg(test)]
+    DECODED_STATEMENTS.with(|count| count.set(count.get() + 1));
     let statement = lazy.statements[index];
     let span = statement.span.range();
     let first_error = lazy

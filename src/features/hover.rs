@@ -6,9 +6,7 @@
 
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Range};
 
-use crate::document::{
-    Document, EntityInstanceInfo, ParameterValue, for_each_lazy_entity_instance,
-};
+use crate::document::{Document, EntityInstanceInfo, ParameterValue};
 use crate::schema::{
     EntityAttributeDoc, EntityDoc, EnumerationTypeDef, NamedTypeKind, PrimitiveType, SchemaDoc,
     SchemaDocCollection, TypeDoc, TypeRef,
@@ -198,41 +196,13 @@ fn render_header_keyword_hover(keyword: &str) -> Option<&'static str> {
     }
 }
 
-/// Enumerates instances through the handwritten index. Small documents do not retain that index,
-/// so construct the same lightweight index on demand rather than consulting tree-sitter.
-fn for_each_entity_instance(document: &Document, visit: impl FnMut(EntityInstanceInfo)) {
-    if let Some(lazy) = document.lazy.as_deref() {
-        for_each_lazy_entity_instance(lazy, &document.text, visit);
-    } else {
-        let lazy = crate::handwritten::Document::parse(document.text.as_bytes(), false);
-        for_each_lazy_entity_instance(&lazy, &document.text, visit);
-    }
-}
-
 fn parameter_at_offset(document: &Document, offset: usize) -> Option<(EntityInstanceInfo, usize)> {
-    let mut result = None;
-    for_each_entity_instance(document, |instance| {
-        if result.is_some() {
-            return;
-        }
-        for (index, parameter) in instance.parameters.iter().enumerate() {
-            if parameter_contains_offset(document, parameter, offset) {
-                result = Some((instance, index));
-                return;
-            }
-        }
-    });
-    result
-}
-
-fn entity_instance_by_id(document: &Document, id: u32) -> Option<EntityInstanceInfo> {
-    let mut result = None;
-    for_each_entity_instance(document, |instance| {
-        if instance.id == Some(id) {
-            result = Some(instance);
-        }
-    });
-    result
+    let instance = document.entity_instance_at_offset(offset)?;
+    let index = instance
+        .parameters
+        .iter()
+        .position(|parameter| parameter_contains_offset(document, parameter, offset))?;
+    Some((instance, index))
 }
 
 fn parameter_contains_offset(
@@ -483,7 +453,7 @@ fn derived_value_hover(
 }
 
 fn ifc_si_unit_dimensions_hover(document: &Document, instance_id: u32) -> String {
-    let instance = entity_instance_by_id(document, instance_id);
+    let instance = document.entity_instance_by_id(instance_id);
     let dimensions = instance
         .as_ref()
         .and_then(|instance| instance.parameters.get(3))
@@ -522,7 +492,7 @@ fn subcontext_inherited_attribute_hover(
     };
     let unresolved = || format!("{attribute_name}: derived value");
 
-    let Some(instance) = entity_instance_by_id(document, instance_id) else {
+    let Some(instance) = document.entity_instance_by_id(instance_id) else {
         return unresolved();
     };
     let Some(parent_id) = instance.parameters.get(6).and_then(|value| match value {
@@ -531,7 +501,7 @@ fn subcontext_inherited_attribute_hover(
     }) else {
         return unresolved();
     };
-    let Some(parent) = entity_instance_by_id(document, parent_id) else {
+    let Some(parent) = document.entity_instance_by_id(parent_id) else {
         return unresolved();
     };
     let Some(parent_value) = parent.parameters.get(parameter_index) else {
@@ -637,6 +607,28 @@ mod tests {
             .map(|(_, tail)| tail.len() as u32)
             .unwrap_or(offset);
         Position::new(line, column)
+    }
+
+    #[test]
+    fn hover_decodes_only_the_statements_it_reads() {
+        let mut text = String::from("DATA;\n");
+        for id in 1..=2000 {
+            text.push_str(&format!(
+                "#{id}=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n"
+            ));
+        }
+        let document = parse_document(&text);
+        let star = text.find("#1000=").unwrap() + "#1000=IFCSIUNIT(".len();
+        let position = document.offset_to_position(star).unwrap();
+        crate::document::DECODED_STATEMENTS.with(|count| count.set(0));
+
+        let value = hover_text(
+            hover(&document, position, &empty_schema_docs(), None).expect("hover exists"),
+        );
+
+        assert!(value.contains("IfcDimensionalExponents(1, 0, 0, 0, 0, 0, 0)"));
+        let decoded = crate::document::DECODED_STATEMENTS.with(|count| count.get());
+        assert!(decoded <= 4, "decoded {decoded} statements");
     }
 
     /// Helper function to extract the hover text from a hover response.
