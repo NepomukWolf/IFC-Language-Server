@@ -3,6 +3,8 @@
 //! full tree-sitter parse. Shared by inlay hints and related-entity navigation, which both only
 //! need argument boundaries, enclosing entity names, and referenced ids within a bounded region.
 
+use std::collections::HashMap;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ScannedInstance {
     pub(crate) entity_name: String,
@@ -20,6 +22,7 @@ pub(crate) struct EntityArgumentContext {
 /// Locates the positional argument containing `cursor_offset` without requiring an AST.
 pub(crate) fn entity_argument_context(
     text: &str,
+    definitions: &HashMap<u32, usize>,
     cursor_offset: usize,
 ) -> Option<EntityArgumentContext> {
     if cursor_offset > text.len() || !text.is_char_boundary(cursor_offset) {
@@ -27,7 +30,7 @@ pub(crate) fn entity_argument_context(
     }
 
     let bytes = text.as_bytes();
-    let mut offset = statement_start_before_cursor(text, cursor_offset);
+    let mut offset = statement_start_before_cursor(text, definitions, cursor_offset);
     offset = skip_trivia(bytes, offset, bytes.len());
     let (_, next) = scan_instance_id(bytes, offset, bytes.len())?;
     offset = skip_trivia(bytes, next, bytes.len());
@@ -91,10 +94,35 @@ pub(crate) fn entity_argument_context(
     })
 }
 
-fn statement_start_before_cursor(text: &str, cursor_offset: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut offset = 0;
-    let mut statement_start = 0;
+fn statement_start_before_cursor(
+    text: &str,
+    definitions: &HashMap<u32, usize>,
+    cursor_offset: usize,
+) -> usize {
+    let mut nearest = None;
+    let mut second_nearest = None;
+    for &offset in definitions.values() {
+        if offset >= cursor_offset {
+            continue;
+        }
+        if nearest.is_none_or(|nearest| offset > nearest) {
+            second_nearest = nearest;
+            nearest = Some(offset);
+        } else if second_nearest.is_none_or(|second| offset > second) {
+            second_nearest = Some(offset);
+        }
+    }
+
+    // Indexed definitions lie outside strings and comments, so a scan starting at one sees the
+    // same statement terminators as a scan from the start of the text.
+    second_nearest
+        .and_then(|anchor| last_statement_end(text.as_bytes(), anchor, cursor_offset))
+        .or_else(|| last_statement_end(text.as_bytes(), 0, cursor_offset))
+        .unwrap_or(0)
+}
+
+fn last_statement_end(bytes: &[u8], mut offset: usize, cursor_offset: usize) -> Option<usize> {
+    let mut statement_start = None;
 
     while offset < cursor_offset {
         match bytes[offset] {
@@ -104,7 +132,7 @@ fn statement_start_before_cursor(text: &str, cursor_offset: usize) -> usize {
             }
             b';' => {
                 offset += 1;
-                statement_start = offset;
+                statement_start = Some(offset);
             }
             _ => offset += 1,
         }
@@ -349,16 +377,36 @@ mod tests {
     #[test]
     fn argument_context_rejects_statement_without_leading_hash() {
         let text = "12=IFCWALL(";
-        assert!(entity_argument_context(text, text.len()).is_none());
+        assert!(entity_argument_context(text, &HashMap::new(), text.len()).is_none());
     }
 
     #[test]
     fn argument_context_skips_leading_comments() {
         let text = "#1=IFCWALL($, /* explanation */ .SO";
-        let context = entity_argument_context(text, text.len()).expect("expected argument context");
+        let context = entity_argument_context(text, &HashMap::new(), text.len())
+            .expect("expected argument context");
 
         assert_eq!(context.active_parameter, 1);
         assert_eq!(&text[context.value_start..], " .SO");
+    }
+
+    #[test]
+    fn argument_context_from_indexed_definitions_matches_scan_from_start() {
+        let text = "ISO-10303-21;\nHEADER;FILE_SCHEMA(('IFC4'));ENDSEC;\nDATA;\n\
+            #1=IFCWALL('a;b', /* #9=X(; */ #2, $);\n\
+            #2 = IFCSLAB('#3=IFCBEAM(', (#1, #4));junk #4=IFCBEAM('it''s;', .T.);\n\
+            #5=IFCROOF($, 'multi\nline; #6=IFCX(', (#1,\n#2));\n\
+            #1=IFCWALL(#4, /* open; comment";
+        let definitions = crate::document_index::scan_text(text).definitions;
+        assert!(definitions.len() >= 4);
+
+        for cursor in 0..=text.len() {
+            assert_eq!(
+                entity_argument_context(text, &definitions, cursor),
+                entity_argument_context(text, &HashMap::new(), cursor),
+                "cursor {cursor}"
+            );
+        }
     }
 
     #[test]
