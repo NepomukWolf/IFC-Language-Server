@@ -574,6 +574,7 @@ impl EntityTypeIndex {
 #[derive(Default)]
 pub struct EntityInstanceCache {
     entry: Mutex<Option<CachedEntityInstances>>,
+    build: Mutex<()>,
 }
 
 struct CachedEntityInstances {
@@ -588,8 +589,23 @@ impl EntityInstanceCache {
         tree: Option<&DocumentTree>,
         text: &Arc<String>,
     ) -> Arc<EntityInstanceCollection> {
-        let slot = self.slot(tree.is_some(), text);
-        Arc::clone(slot.get_or_init(|| Arc::new(build_entity_instances(tree, text))))
+        self.get_or_build_with(tree.is_some(), text, || build_entity_instances(tree, text))
+    }
+
+    fn get_or_build_with(
+        &self,
+        has_tree: bool,
+        text: &Arc<String>,
+        build: impl FnOnce() -> EntityInstanceCollection,
+    ) -> Arc<EntityInstanceCollection> {
+        let slot = self.slot(has_tree, text);
+        Arc::clone(slot.get_or_init(|| {
+            let _permit = self
+                .build
+                .lock()
+                .expect("entity instance build lock should not be poisoned");
+            Arc::new(build())
+        }))
     }
 
     pub fn clear(&self) {
@@ -1151,6 +1167,34 @@ mod tests {
         assert_eq!(first.instances[0].entity_name, "IFCWALL");
         assert_eq!(edited.instances[0].entity_name, "IFCDOOR");
         assert!(without_tree.instances.is_empty());
+    }
+
+    #[test]
+    fn instance_cache_builds_for_different_texts_never_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = EntityInstanceCache::default();
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let texts: Vec<Arc<String>> = (0..4)
+            .map(|i| Arc::new(format!("#{i}=IFCWALL($);")))
+            .collect();
+
+        std::thread::scope(|scope| {
+            for text in &texts {
+                scope.spawn(|| {
+                    cache.get_or_build_with(true, text, || {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        EntityInstanceCollection::new(Vec::new())
+                    });
+                });
+            }
+        });
+
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     #[test]
