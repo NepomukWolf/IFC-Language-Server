@@ -117,19 +117,15 @@ mod tests {
         assert!(Arc::ptr_eq(&snapshot.text, &document.text));
 
         document
-            .apply_content_changes(
-                &mut parser,
-                &[tower_lsp::lsp_types::TextDocumentContentChangeEvent {
-                    range: Some(tower_lsp::lsp_types::Range::new(
-                        tower_lsp::lsp_types::Position::new(0, 6),
-                        tower_lsp::lsp_types::Position::new(0, 10),
-                    )),
-                    range_length: None,
-                    text: "DOOR".to_string(),
-                }],
-                crate::document::DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-            )
-            .expect("replacement should parse");
+            .apply_content_changes(&[tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                range: Some(tower_lsp::lsp_types::Range::new(
+                    tower_lsp::lsp_types::Position::new(0, 6),
+                    tower_lsp::lsp_types::Position::new(0, 10),
+                )),
+                range_length: None,
+                text: "DOOR".to_string(),
+            }])
+            .expect("replacement should apply");
 
         assert_eq!(snapshot.text(), "#1=IFCWALL($);");
         assert_eq!(document.text.as_str(), "#1=IFCDOOR($);");
