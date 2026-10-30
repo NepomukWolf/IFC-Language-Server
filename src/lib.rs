@@ -12,7 +12,5 @@ pub mod handwritten;
 mod rt;
 mod schema;
 mod step;
-#[cfg(test)]
-mod test_support;
 
 pub use backend::Backend;

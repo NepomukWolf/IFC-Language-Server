@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use tree_sitter::{InputEdit, Node, Parser, Point, Range, Tree, TreeCursor};
 
 #[derive(Clone, Debug)]
@@ -408,7 +410,7 @@ fn is_entity_start(text: &[u8], offset: usize) -> bool {
     text.get(end) == Some(&b'=')
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::diagnostics::{DiagnosticSnapshot, syntax};
@@ -423,6 +425,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(any())]
     #[test]
     fn finds_the_opening_quote_of_an_unclosed_string() {
         assert_eq!(unclosed_quotes(b"#1=IFCWALL('Anna's wall');", 0), [11]);

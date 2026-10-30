@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Values inside a `compact_parameter_list` token. The grammar only emits that token for a
 //! well-formed parameter list whose parameters are atoms, typed atoms such as `IFCLABEL('x')`,
 //! or lists of those nested one level deep, so the scanner below never sees malformed input.
