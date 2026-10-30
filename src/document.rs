@@ -1373,6 +1373,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lowercase_names_are_accepted_only_for_typed_values() {
+        let document =
+            parse_document("DATA;#1=IFCX(ifclabel('a'),ifcCountMeasure(3),_typed(.T.));ENDSEC;");
+        assert!(!document.tree.as_ref().unwrap().root_node().has_error());
+        let collection = instances(&document);
+        let names: Vec<_> = collection.instances[0]
+            .parameters
+            .iter()
+            .map(|value| match value {
+                ParameterValue::Typed { type_name, .. } => type_name.as_str(),
+                other => panic!("expected typed value, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["IFCLABEL", "IFCCOUNTMEASURE", "_TYPED"]);
+        for text in ["DATA;#1=x(1.);ENDSEC;", "DATA;#1=X(.lower.);ENDSEC;"] {
+            let rejected = parse_document(text);
+            assert!(rejected.tree.as_ref().unwrap().root_node().has_error());
+        }
+    }
+
     fn node_spans(tree: &Tree) -> Vec<(String, usize, usize)> {
         fn visit(node: Node<'_>, spans: &mut Vec<(String, usize, usize)>) {
             spans.push((node.kind().to_string(), node.start_byte(), node.end_byte()));
