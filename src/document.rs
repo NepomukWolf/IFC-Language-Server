@@ -260,6 +260,7 @@ impl Document {
                     .line_offsets
                     .iter_mut()
                     .chain(self.definitions.values_mut())
+                    .chain(self.definitions_by_id.iter_mut().map(|(_, offset)| offset))
                     .chain(self.references.values_mut().flatten())
                 {
                     if *offset >= old_end_byte {
@@ -1329,6 +1330,9 @@ mod tests {
             "#5=IFCX(IFCBOOLEAN~(.T.),IFCINTEGER(-3),(IFCLABEL ( '' ),*));",
             "#6=IFCX(~);",
             "#7=IFCX(((1.,2.),(3.,\n4.)),((#1),('a',IFCLABEL('b'),*),()),~$);",
+            "#8=ifcpropertysinglevalue('Name',$,ifcLabel~('it''s'),*);",
+            "#9=IfcSiUnit(*,.lengthunit.,$,.Metre.~);",
+            "#10=_entity(_typed~(.mixed_Case.),ifcInteger(-3));",
         ];
         let texts = cases.iter().flat_map(|case| {
             [
@@ -1639,6 +1643,11 @@ mod tests {
             document.text
         );
         assert_eq!(document.definitions, fresh.definitions, "{}", document.text);
+        assert_eq!(
+            document.definitions_by_id, fresh.definitions_by_id,
+            "{}",
+            document.text
+        );
         assert_eq!(document.references, fresh.references, "{}", document.text);
         assert_eq!(document.schema_name, fresh.schema_name, "{}", document.text);
         assert_eq!(document.schema_end, fresh.schema_end, "{}", document.text);

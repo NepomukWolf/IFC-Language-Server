@@ -31,12 +31,7 @@ impl DiagnosticScheduler {
         let notify = Arc::new(Notify::new());
         let instance_cache = Arc::new(EntityInstanceCache::default());
 
-        crate::rt::spawn(run_worker(
-            client,
-            Arc::clone(&state),
-            Arc::clone(&notify),
-            Arc::clone(&instance_cache),
-        ));
+        crate::rt::spawn(run_worker(client, Arc::clone(&state), Arc::clone(&notify)));
 
         Self {
             state,
@@ -242,12 +237,7 @@ struct DiagnosticJob {
     schema: Option<(String, Arc<SchemaDoc>)>,
 }
 
-async fn run_worker(
-    client: Client,
-    state: Arc<Mutex<SchedulerState>>,
-    notify: Arc<Notify>,
-    instance_cache: Arc<EntityInstanceCache>,
-) {
+async fn run_worker(client: Client, state: Arc<Mutex<SchedulerState>>, notify: Arc<Notify>) {
     loop {
         let next_job = state.lock().await.take_next_job();
         let Some(job) = next_job else {
@@ -262,15 +252,13 @@ async fn run_worker(
 
         let uri = job.uri.clone();
         let generation = job.generation;
-        let job_instance_cache = Arc::clone(&instance_cache);
-        let diagnostics =
-            match crate::rt::spawn_blocking(move || collect(job, &job_instance_cache)).await {
-                Ok(diagnostics) => diagnostics,
-                Err(error) => {
-                    warn!(uri = %uri, generation, %error, "diagnostics job failed");
-                    continue;
-                }
-            };
+        let diagnostics = match crate::rt::spawn_blocking(move || collect(job)).await {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                warn!(uri = %uri, generation, %error, "diagnostics job failed");
+                continue;
+            }
+        };
 
         let state = state.lock().await;
         if !state.is_current(&uri, generation) {
@@ -283,16 +271,13 @@ async fn run_worker(
     }
 }
 
-fn collect(
-    job: DiagnosticJob,
-    instance_cache: &EntityInstanceCache,
-) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+fn collect(job: DiagnosticJob) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let schema = job
         .schema
         .as_ref()
         .map(|(schema_name, schema)| (schema_name.as_str(), schema.as_ref()));
 
-    diagnostics::collect(&job.snapshot, schema, instance_cache)
+    diagnostics::collect(&job.snapshot, schema)
 }
 
 #[cfg(test)]

@@ -163,7 +163,7 @@ impl Scanner<'_> {
                 self.pos += 1;
                 CompactKind::Omitted
             }
-            b'A'..=b'Z' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
                 self.skip_while(is_name_byte);
                 let name_end = self.pos;
                 self.skip_whitespace();
@@ -230,5 +230,5 @@ impl Scanner<'_> {
 }
 
 fn is_name_byte(byte: u8) -> bool {
-    byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }

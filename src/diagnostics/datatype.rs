@@ -356,7 +356,7 @@ fn validate_select<'a>(
 /// An inline typed value can only match the defined type it names, so differently named aliases
 /// and enumerations are rejected without validating the payload; nested selects are searched.
 fn select_option_accepts<'a>(
-    instances: &'a EntityInstanceCollection,
+    instances: &'a impl EntityReferenceLookup,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     option: &'a TypeRef,

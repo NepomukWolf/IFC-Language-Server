@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Diagnostic;
 
-use crate::document::{Document, EntityInstanceCache};
+use crate::document::Document;
 use crate::document_tree::DocumentTree;
 use crate::schema::SchemaDoc;
 
@@ -51,7 +51,6 @@ impl DiagnosticSnapshot {
 pub fn collect(
     snapshot: &DiagnosticSnapshot,
     schema: Option<(&str, &SchemaDoc)>,
-    _instance_cache: &EntityInstanceCache,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
     if let Some((schema_name, schema)) = schema {
@@ -85,14 +84,14 @@ mod tests {
     fn syntax_errors_are_reported_without_a_schema() {
         let snapshot = snapshot_of("FILE_SCHEMA(('IFC4X3'));\n#10=IFCWALL((;\n");
 
-        assert!(!collect(&snapshot, None, &EntityInstanceCache::default()).is_empty());
+        assert!(!collect(&snapshot, None).is_empty());
     }
 
     #[test]
     fn valid_file_without_a_schema_has_no_diagnostics() {
         let snapshot = snapshot_of("#10=IFCWALL('gid');\n");
 
-        assert!(collect(&snapshot, None, &EntityInstanceCache::default()).is_empty());
+        assert!(collect(&snapshot, None).is_empty());
     }
 
     #[test]
