@@ -31,6 +31,53 @@ impl CompactValue {
     }
 }
 
+/// Byte spans of a whole-entity token `#ID=NAME(...);`.
+pub struct CompactEntity {
+    pub id: (usize, usize),
+    pub name: (usize, usize),
+    pub parameters: (usize, usize),
+}
+
+/// A leaf `entity_instance` is a whole-entity token; structured instances always have children.
+pub fn is_compact_entity(node: tree_sitter::Node<'_>) -> bool {
+    node.kind() == "entity_instance" && node.child_count() == 0
+}
+
+pub fn entity(text: &str, start: usize) -> CompactEntity {
+    let mut scanner = Scanner {
+        bytes: text.as_bytes(),
+        pos: start + 1,
+    };
+    scanner.skip_while(|byte| byte.is_ascii_digit());
+    let id = (start, scanner.pos);
+    scanner.skip_whitespace();
+    scanner.pos += 1;
+    scanner.skip_whitespace();
+    let name_start = scanner.pos;
+    scanner.skip_while(is_name_byte);
+    let name = (name_start, scanner.pos);
+    scanner.skip_whitespace();
+    let parameters_start = scanner.pos;
+    scanner.sequence();
+    CompactEntity {
+        id,
+        name,
+        parameters: (parameters_start, scanner.pos),
+    }
+}
+
+/// Start of the compact parameter list held by `node`, which is either that token or a
+/// whole-entity token.
+pub fn parameters_start(node: tree_sitter::Node<'_>, text: &str) -> Option<usize> {
+    if node.kind() == "compact_parameter_list" {
+        Some(node.start_byte())
+    } else if is_compact_entity(node) {
+        Some(entity(text, node.start_byte()).parameters.0)
+    } else {
+        None
+    }
+}
+
 /// Top-level parameters of the token starting at `start`.
 pub fn parameters(text: &str, start: usize) -> Vec<CompactValue> {
     Scanner {

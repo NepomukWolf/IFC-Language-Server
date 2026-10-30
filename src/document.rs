@@ -661,6 +661,9 @@ fn visit_entity_nodes<'a>(cursor: &mut TreeCursor<'a>, visit: &mut impl FnMut(No
 }
 
 pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+    if compact::is_compact_entity(node) {
+        return Some(parse_compact_entity(node, text, true));
+    }
     let mut instance = parse_entity_header(node, text)?;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -676,6 +679,9 @@ pub(crate) fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<Entity
 }
 
 fn parse_entity_header(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+    if compact::is_compact_entity(node) {
+        return Some(parse_compact_entity(node, text, false));
+    }
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
@@ -728,6 +734,44 @@ fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
         .filter(|child| child.kind() == "parameter")
         .map(|parameter| parse_parameter(parameter, text))
         .collect()
+}
+
+fn parse_compact_entity(node: Node<'_>, text: &str, with_parameters: bool) -> EntityInstanceInfo {
+    let entity = compact::entity(text, node.start_byte());
+    let mut points = PointCursor {
+        text: text.as_bytes(),
+        offset: node.start_byte(),
+        point: node.start_position(),
+    };
+    let id_range = Range {
+        start: points.position(entity.id.0),
+        end: points.position(entity.id.1),
+    };
+    let entity_name_range = Range {
+        start: points.position(entity.name.0),
+        end: points.position(entity.name.1),
+    };
+    let parameters_start = points.position(entity.parameters.0);
+    let parameters = if with_parameters {
+        compact::parameters(text, entity.parameters.0)
+            .iter()
+            .map(|value| compact_parameter_value(value, text, &mut points))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    EntityInstanceInfo {
+        id: text[entity.id.0 + 1..entity.id.1].parse::<u32>().ok(),
+        id_range: Some(id_range),
+        entity_name: text[entity.name.0..entity.name.1].to_ascii_uppercase(),
+        entity_name_range,
+        entity_range: node_range(&node),
+        parameter_list_range: Some(Range {
+            start: parameters_start,
+            end: points.position(entity.parameters.1),
+        }),
+        parameters,
+    }
 }
 
 fn parse_compact_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
@@ -1105,11 +1149,10 @@ mod tests {
         assert_eq!(node.utf8_text(document.text.as_bytes()).ok(), Some("#2"));
     }
 
-    fn contains_kind(node: Node<'_>, kind: &str) -> bool {
-        node.kind() == kind
-            || node
-                .children(&mut node.walk())
-                .any(|child| contains_kind(child, kind))
+    fn contains_compact(node: Node<'_>) -> bool {
+        node.kind() == "compact_parameter_list"
+            || compact::is_compact_entity(node)
+            || node.children(&mut node.walk()).any(contains_compact)
     }
 
     #[test]
@@ -1125,19 +1168,19 @@ mod tests {
             "#6=IFCX(~);",
             "#7=IFCX(((1.,2.),(3.,\n4.)),((#1),('a',IFCLABEL('b'),*),()),~$);",
         ];
-        for case in cases {
+        let texts = cases.iter().flat_map(|case| {
+            [
+                case.to_string(),
+                format!("DATA;\n{case}\n{case}\nENDSEC;\n"),
+            ]
+        });
+        for case in texts {
             let compact = parse_document(&case.replace('~', " "));
             let structured = parse_document(&case.replace('~', "\u{c}"));
             let compact_root = compact.tree.as_ref().unwrap().root_node();
             let structured_root = structured.tree.as_ref().unwrap().root_node();
-            assert!(
-                contains_kind(compact_root, "compact_parameter_list"),
-                "{case}"
-            );
-            assert!(
-                !contains_kind(structured_root, "compact_parameter_list"),
-                "{case}"
-            );
+            assert!(contains_compact(compact_root), "{case}");
+            assert!(!contains_compact(structured_root), "{case}");
             assert!(
                 !compact_root.has_error() && !structured_root.has_error(),
                 "{case}"
@@ -1203,7 +1246,7 @@ mod tests {
             .unwrap();
         let root = document.tree.as_ref().unwrap().root_node();
         assert!(!root.has_error());
-        assert!(contains_kind(root, "compact_parameter_list"));
+        assert!(contains_compact(root));
 
         document
             .apply_content_changes(

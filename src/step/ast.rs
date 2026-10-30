@@ -16,8 +16,8 @@ pub fn parameter_context(
     text: &str,
 ) -> Option<ParameterContext> {
     let entity_instance = ancestor_with_kind(node, "entity_instance")?;
-    let parameter_index = if node.kind() == "compact_parameter_list" {
-        compact::parameters(text, node.start_byte())
+    let parameter_index = if let Some(start) = compact::parameters_start(node, text) {
+        compact::parameters(text, start)
             .iter()
             .position(|parameter| parameter.start <= offset && offset < parameter.end)?
     } else {
@@ -41,15 +41,12 @@ pub fn omitted_value_span(
     offset: usize,
     text: &str,
 ) -> Option<(usize, usize)> {
-    match node.kind() {
-        "omitted_value" => Some((node.start_byte(), node.end_byte())),
-        "compact_parameter_list" => {
-            let parameters = compact::parameters(text, node.start_byte());
-            let value = *compact::values_at(&parameters, offset).last()?;
-            (value.kind == CompactKind::Omitted).then_some((value.start, value.end))
-        }
-        _ => None,
+    if node.kind() == "omitted_value" {
+        return Some((node.start_byte(), node.end_byte()));
     }
+    let parameters = compact::parameters(text, compact::parameters_start(node, text)?);
+    let value = *compact::values_at(&parameters, offset).last()?;
+    (value.kind == CompactKind::Omitted).then_some((value.start, value.end))
 }
 
 /// Byte span of a typed value's type name (`IFCLABEL` in `IFCLABEL('x')`) when `offset`, looked
@@ -59,8 +56,8 @@ pub fn typed_value_name_span(
     offset: usize,
     text: &str,
 ) -> Option<(usize, usize)> {
-    let (start, end) = if node.kind() == "compact_parameter_list" {
-        let parameters = compact::parameters(text, node.start_byte());
+    let (start, end) = if let Some(parameters_start) = compact::parameters_start(node, text) {
+        let parameters = compact::parameters(text, parameters_start);
         compact::values_at(&parameters, offset)
             .into_iter()
             .rev()
@@ -100,15 +97,29 @@ fn child_with_kind<'tree>(
 }
 
 fn parse_instance_id(node: tree_sitter::Node<'_>, text: &str) -> Option<u32> {
-    child_with_kind(node, "instance_id")
-        .and_then(|child| child.utf8_text(text.as_bytes()).ok())
+    header_text(node, "instance_id", text)
         .and_then(|value| value.trim_start_matches('#').parse::<u32>().ok())
 }
 
 fn parse_entity_name(node: tree_sitter::Node<'_>, text: &str) -> Option<String> {
-    child_with_kind(node, "entity_name")
-        .and_then(|child| child.utf8_text(text.as_bytes()).ok())
-        .map(|value| value.to_ascii_uppercase())
+    header_text(node, "entity_name", text).map(|value| value.to_ascii_uppercase())
+}
+
+fn header_text<'a>(
+    entity_instance: tree_sitter::Node<'_>,
+    kind: &str,
+    text: &'a str,
+) -> Option<&'a str> {
+    if compact::is_compact_entity(entity_instance) {
+        let entity = compact::entity(text, entity_instance.start_byte());
+        let (start, end) = if kind == "instance_id" {
+            entity.id
+        } else {
+            entity.name
+        };
+        return text.get(start..end);
+    }
+    child_with_kind(entity_instance, kind).and_then(|child| child.utf8_text(text.as_bytes()).ok())
 }
 
 fn entity_parameter_sequence(
