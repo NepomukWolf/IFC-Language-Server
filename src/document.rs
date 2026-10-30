@@ -1717,7 +1717,6 @@ mod tests {
             "", "x", "9", "_", " ", "\t", "\n", "'", "''", "/*", "*/", "#12=", ";", "😀", "\\X2\\",
         ];
         let mut parser = Parser::new();
-        let mut count = 0;
         let mut fast = 0;
         for text in fixtures {
             let original = Document::new_unloaded(text.to_string());
@@ -1753,13 +1752,11 @@ mod tests {
                             )
                             .unwrap();
                         assert_fresh_index(&document);
-                        count += 1;
                     }
                 }
             }
         }
         assert!(fast > 100);
-        eprintln!("boundary property: {count} edits, {fast} fast");
     }
 
     #[test]
@@ -1770,7 +1767,6 @@ mod tests {
             "/*", "*/", "😀", "\\X2\\",
         ];
         let mut parser = Parser::new();
-        let mut count = 0;
         let mut fast = 0;
         for seed in 1..=128u64 {
             let mut state = seed;
@@ -1815,7 +1811,6 @@ mod tests {
                         .unwrap();
                     assert_fresh_index(&document);
                     changes.push(event);
-                    count += 1;
                 }
                 let mut batched = Document::new_unloaded(before);
                 batched
@@ -1826,7 +1821,6 @@ mod tests {
             }
         }
         assert!(fast > 100);
-        eprintln!("sequence property: {count} edits, {fast} fast; 16384 multi-change messages");
     }
 
     #[test]
@@ -1866,6 +1860,8 @@ mod tests {
             })
             .collect();
 
+        // Known limitation: the stray quote after `g` opens a string that is never closed, so
+        // #8 and #9 are not discovered.
         assert_eq!(
             discovered,
             [
