@@ -911,7 +911,8 @@ impl LanguageServer for Backend {
         };
         let result = crate::rt::spawn_blocking(move || {
             let _permit = permit;
-            let instances = crate::document::build_entity_instances(tree.as_ref(), &text);
+            let instances =
+                document_symbols::outline_instances(tree.as_ref(), &text, schema.as_deref());
             document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
         })
         .await

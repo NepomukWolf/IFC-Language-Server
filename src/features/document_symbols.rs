@@ -2,9 +2,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{
+    EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_entity_instance,
+};
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
+use tree_sitter::Tree;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
@@ -35,6 +38,42 @@ struct Edge {
 enum ProductRenderMode {
     Direct,
     GroupMultiOnly,
+}
+
+/// Keeps only what the outline reads: relationships with all their parameters, and instances
+/// `classify` places in the outline with nothing but a string Name at index 2. `schema` must be
+/// the one later passed to `document_symbols`.
+pub fn outline_instances(
+    tree: Option<&Tree>,
+    text: &str,
+    schema: Option<&SchemaDoc>,
+) -> EntityInstanceCollection {
+    let mut instances = Vec::new();
+    for_each_entity_instance(
+        tree,
+        text,
+        |entity_name| {
+            if relationship_attributes(entity_name).is_some() {
+                Some(usize::MAX)
+            } else {
+                classify(entity_name, schema).map(|_| 3)
+            }
+        },
+        |mut instance| {
+            if relationship_attributes(&instance.entity_name).is_none() {
+                if matches!(
+                    instance.parameters.get(2),
+                    Some(ParameterValue::String { .. })
+                ) {
+                    instance.parameters.shrink_to_fit();
+                } else {
+                    instance.parameters = Vec::new();
+                }
+            }
+            instances.push(instance);
+        },
+    );
+    EntityInstanceCollection::new(instances)
 }
 
 pub fn document_symbols(
@@ -87,7 +126,7 @@ pub fn document_symbols(
     let declared_classes: Vec<Option<Class>> = instances
         .instances
         .iter()
-        .map(|item| classify(item, schema))
+        .map(|item| classify(&item.entity_name, schema))
         .collect();
     let classes = resolve_classes(&declared_classes, &edges);
     let relevant: HashSet<usize> = classes
@@ -182,23 +221,23 @@ pub fn document_symbols(
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
-fn classify(item: &EntityInstanceInfo, schema: Option<&SchemaDoc>) -> Option<Class> {
-    if item.entity_name == "IFCPROJECT" {
+fn classify(entity_name: &str, schema: Option<&SchemaDoc>) -> Option<Class> {
+    if entity_name == "IFCPROJECT" {
         return Some(Class::Project);
     }
     let core = matches!(
-        item.entity_name.as_str(),
+        entity_name,
         "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE"
     );
     if core
         || schema.is_some_and(|s| {
-            s.is_entity_compatible(&item.entity_name, "IFCSPATIALELEMENT")
-                || s.is_entity_compatible(&item.entity_name, "IFCSPATIALSTRUCTUREELEMENT")
+            s.is_entity_compatible(entity_name, "IFCSPATIALELEMENT")
+                || s.is_entity_compatible(entity_name, "IFCSPATIALSTRUCTUREELEMENT")
         })
     {
         return Some(Class::Spatial);
     }
-    if schema.is_some_and(|s| s.is_entity_compatible(&item.entity_name, "IFCPRODUCT")) {
+    if schema.is_some_and(|s| s.is_entity_compatible(entity_name, "IFCPRODUCT")) {
         Some(Class::Product)
     } else {
         None
@@ -241,50 +280,56 @@ fn resolve_classes(declared: &[Option<Class>], edges: &[Edge]) -> Vec<Option<Cla
         .collect()
 }
 
+fn relationship_attributes(
+    entity_name: &str,
+) -> Option<(&'static str, &'static str, usize, usize, EdgeKind)> {
+    Some(match entity_name {
+        "IFCRELAGGREGATES" => (
+            "RELATINGOBJECT",
+            "RELATEDOBJECTS",
+            4,
+            5,
+            EdgeKind::Aggregate,
+        ),
+        "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
+        "IFCRELVOIDSELEMENT" => (
+            "RELATINGBUILDINGELEMENT",
+            "RELATEDOPENINGELEMENT",
+            4,
+            5,
+            EdgeKind::Void,
+        ),
+        "IFCRELFILLSELEMENT" => (
+            "RELATINGOPENINGELEMENT",
+            "RELATEDBUILDINGELEMENT",
+            4,
+            5,
+            EdgeKind::Fill,
+        ),
+        "IFCRELCONNECTSPORTTOELEMENT" => (
+            "RELATEDELEMENT",
+            "RELATINGPORT",
+            5,
+            4,
+            EdgeKind::PortContainment,
+        ),
+        "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
+            "RELATINGSTRUCTURE",
+            "RELATEDELEMENTS",
+            5,
+            4,
+            EdgeKind::Containment,
+        ),
+        _ => return None,
+    })
+}
+
 fn relationship_parameters<'a>(
     item: &'a EntityInstanceInfo,
     schema: Option<&SchemaDoc>,
 ) -> Option<(&'a ParameterValue, &'a ParameterValue, EdgeKind)> {
     let (parent_name, children_name, parent_fallback, children_fallback, kind) =
-        match item.entity_name.as_str() {
-            "IFCRELAGGREGATES" => (
-                "RELATINGOBJECT",
-                "RELATEDOBJECTS",
-                4,
-                5,
-                EdgeKind::Aggregate,
-            ),
-            "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
-            "IFCRELVOIDSELEMENT" => (
-                "RELATINGBUILDINGELEMENT",
-                "RELATEDOPENINGELEMENT",
-                4,
-                5,
-                EdgeKind::Void,
-            ),
-            "IFCRELFILLSELEMENT" => (
-                "RELATINGOPENINGELEMENT",
-                "RELATEDBUILDINGELEMENT",
-                4,
-                5,
-                EdgeKind::Fill,
-            ),
-            "IFCRELCONNECTSPORTTOELEMENT" => (
-                "RELATEDELEMENT",
-                "RELATINGPORT",
-                5,
-                4,
-                EdgeKind::PortContainment,
-            ),
-            "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
-                "RELATINGSTRUCTURE",
-                "RELATEDELEMENTS",
-                5,
-                4,
-                EdgeKind::Containment,
-            ),
-            _ => return None,
-        };
+        relationship_attributes(&item.entity_name)?;
     let attribute_index = |name: &str, fallback| {
         schema
             .and_then(|s| s.entity(&item.entity_name))

@@ -134,7 +134,7 @@ fn nested_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 }
 
 fn symbols(doc: &Document, schema: Option<&SchemaDoc>) -> Option<DocumentSymbolResponse> {
-    let instances = build_entity_instances(doc.tree.as_ref(), &doc.text);
+    let instances = outline_instances(doc.tree.as_ref(), &doc.text, schema);
     document_symbols(&doc.text, &instances, doc.ast_skipped, schema)
 }
 
@@ -471,5 +471,54 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
     );
     for symbol in &symbols {
         verify(symbol);
+    }
+}
+
+#[test]
+fn outline_instances_keep_only_what_the_outline_reads() {
+    let doc = parse(
+        "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#3=IFCBUILDINGSTOREY('g',$,$,$,$,$,$,$,$);\n#4=IFCWALL('g',$,'W',$,#20,$,$,$,$);\n#5=IFCOPENINGELEMENT('g',$,'O',$,$,$,$,$,$);\n#6=IFCDOOR('g',$,'D',$,$,$,$,$,$);\n#7=IFCDISTRIBUTIONELEMENT('g',$,'E',$,$,$,$,$,$);\n#8=IFCDISTRIBUTIONPORT('g',$,'Port',$,$,$,$,$,$);\n#9=IFCELEMENTASSEMBLY('g',$,'A',$,$,$,$,$,$);\n#10=IFCWALL('g',$,'Loose',$,$,$,$,$,$);\n#20=IFCCARTESIANPOINT((0.,0.,0.));\n#30=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\n#31=IFCRELAGGREGATES('g',$,$,$,#2,(#3));\n#32=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#4,#7,#9,#20),#3);\n#33=IFCRELVOIDSELEMENT('g',$,$,$,#4,#5);\n#34=IFCRELFILLSELEMENT('g',$,$,$,#5,#6);\n#35=IFCRELCONNECTSPORTTOELEMENT('g',$,$,$,#8,#7);\n#36=IFCRELNESTS('g',$,$,$,#9,(#4));\nENDSEC;",
+    );
+    let full = build_entity_instances(doc.tree.as_ref(), &doc.text);
+    let parameter_counts = |schema: Option<&SchemaDoc>| -> Vec<(u32, usize)> {
+        outline_instances(doc.tree.as_ref(), &doc.text, schema)
+            .instances
+            .iter()
+            .map(|i| (i.id.unwrap(), i.parameters.len()))
+            .collect()
+    };
+    let relationships = [
+        (30, 6),
+        (31, 6),
+        (32, 6),
+        (33, 6),
+        (34, 6),
+        (35, 6),
+        (36, 6),
+    ];
+
+    let mut with_schema = vec![
+        (1, 3),
+        (2, 3),
+        (3, 0),
+        (4, 3),
+        (5, 3),
+        (6, 3),
+        (7, 3),
+        (8, 3),
+        (9, 3),
+        (10, 3),
+    ];
+    with_schema.extend(relationships);
+    let mut without_schema = vec![(1, 3), (2, 3), (3, 0)];
+    without_schema.extend(relationships);
+    assert_eq!(parameter_counts(Some(&schema())), with_schema);
+    assert_eq!(parameter_counts(None), without_schema);
+    for schema in [Some(schema()), None] {
+        let slim = outline_instances(doc.tree.as_ref(), &doc.text, schema.as_ref());
+        assert_eq!(
+            document_symbols(&doc.text, &slim, false, schema.as_ref()),
+            document_symbols(&doc.text, &full, false, schema.as_ref())
+        );
     }
 }
