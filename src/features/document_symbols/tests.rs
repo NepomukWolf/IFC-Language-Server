@@ -134,7 +134,7 @@ fn nested_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 }
 
 fn symbols(doc: &Document, schema: Option<&SchemaDoc>) -> Option<DocumentSymbolResponse> {
-    let instances = outline_instances(doc.lazy.as_deref(), &doc.text);
+    let instances = outline_instances(doc.lazy.as_deref(), &doc.text, schema);
     document_symbols(&doc.text, &instances, doc.ast_skipped, schema)
 }
 
@@ -475,15 +475,19 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
 }
 
 #[test]
-fn outline_instances_keep_only_relationship_parameters_and_string_names() {
+fn outline_instances_keep_only_what_the_outline_reads() {
     let doc = parse(
         "DATA;\n#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#3=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;",
     );
     let full = crate::test_support::build_entity_instances(doc.lazy.as_deref(), &doc.text);
-    let lean = outline_instances(doc.lazy.as_deref(), &doc.text);
+    let lean = outline_instances(doc.lazy.as_deref(), &doc.text, Some(&schema()));
 
-    let counts: Vec<usize> = lean.instances.iter().map(|i| i.parameters.len()).collect();
-    assert_eq!(counts, vec![0, 3, 6]);
+    let kept: Vec<(&str, usize)> = lean
+        .instances
+        .iter()
+        .map(|i| (i.entity_name.as_str(), i.parameters.len()))
+        .collect();
+    assert_eq!(kept, vec![("IFCWALL", 3), ("IFCRELAGGREGATES", 6)]);
     assert_eq!(
         document_symbols(&doc.text, &lean, false, Some(&schema())),
         document_symbols(&doc.text, &full, false, Some(&schema()))

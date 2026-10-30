@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::document::{
-    EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_lazy_entity_instance,
+    EntityInstanceCollection, EntityInstanceInfo, ParameterValue,
+    for_each_lazy_entity_instance_named,
 };
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
@@ -39,28 +40,39 @@ enum ProductRenderMode {
     GroupMultiOnly,
 }
 
-/// Keeps only the parameters the outline reads: every relationship parameter and, for other
-/// instances, a string Name at index 2.
+/// Keeps only what the outline reads: relationships with all their parameters, and instances
+/// `classify` places in the outline with nothing but a string Name at index 2. Other statements
+/// are skipped before they are decoded. `schema` must be the one later passed to
+/// `document_symbols`.
 pub fn outline_instances(
     lazy: Option<&crate::handwritten::Document>,
     text: &str,
+    schema: Option<&SchemaDoc>,
 ) -> EntityInstanceCollection {
     let mut instances = Vec::new();
     if let Some(lazy) = lazy {
-        for_each_lazy_entity_instance(lazy, text, |mut instance| {
-            if relationship_attributes(&instance.entity_name).is_none() {
-                if matches!(
-                    instance.parameters.get(2),
-                    Some(ParameterValue::String { .. })
-                ) {
-                    instance.parameters.truncate(3);
-                } else {
-                    instance.parameters.clear();
+        for_each_lazy_entity_instance_named(
+            lazy,
+            text,
+            |entity_name| {
+                relationship_attributes(entity_name).is_some()
+                    || classify(entity_name, schema).is_some()
+            },
+            |mut instance| {
+                if relationship_attributes(&instance.entity_name).is_none() {
+                    if matches!(
+                        instance.parameters.get(2),
+                        Some(ParameterValue::String { .. })
+                    ) {
+                        instance.parameters.truncate(3);
+                    } else {
+                        instance.parameters.clear();
+                    }
+                    instance.parameters.shrink_to_fit();
                 }
-                instance.parameters.shrink_to_fit();
-            }
-            instances.push(instance);
-        });
+                instances.push(instance);
+            },
+        );
     }
     EntityInstanceCollection { instances }
 }
@@ -115,7 +127,7 @@ pub fn document_symbols(
     let declared_classes: Vec<Option<Class>> = instances
         .instances
         .iter()
-        .map(|item| classify(item, schema))
+        .map(|item| classify(&item.entity_name, schema))
         .collect();
     let classes = resolve_classes(&declared_classes, &edges);
     let relevant: HashSet<usize> = classes
@@ -210,23 +222,23 @@ pub fn document_symbols(
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
-fn classify(item: &EntityInstanceInfo, schema: Option<&SchemaDoc>) -> Option<Class> {
-    if item.entity_name == "IFCPROJECT" {
+fn classify(entity_name: &str, schema: Option<&SchemaDoc>) -> Option<Class> {
+    if entity_name == "IFCPROJECT" {
         return Some(Class::Project);
     }
     let core = matches!(
-        item.entity_name.as_str(),
+        entity_name,
         "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE"
     );
     if core
         || schema.is_some_and(|s| {
-            s.is_entity_compatible(&item.entity_name, "IFCSPATIALELEMENT")
-                || s.is_entity_compatible(&item.entity_name, "IFCSPATIALSTRUCTUREELEMENT")
+            s.is_entity_compatible(entity_name, "IFCSPATIALELEMENT")
+                || s.is_entity_compatible(entity_name, "IFCSPATIALSTRUCTUREELEMENT")
         })
     {
         return Some(Class::Spatial);
     }
-    if schema.is_some_and(|s| s.is_entity_compatible(&item.entity_name, "IFCPRODUCT")) {
+    if schema.is_some_and(|s| s.is_entity_compatible(entity_name, "IFCPRODUCT")) {
         Some(Class::Product)
     } else {
         None

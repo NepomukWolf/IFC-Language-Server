@@ -900,8 +900,8 @@ impl LanguageServer for Backend {
         };
         let instance_cache = Arc::clone(&self.instance_cache);
         let result = crate::rt::spawn_blocking(move || {
-            let instances = instance_cache.get_or_build_with(lazy.is_some(), &text, || {
-                document_symbols::outline_instances(lazy.as_deref(), &text)
+            let instances = instance_cache.get_or_build_with(schema.as_ref(), &text, || {
+                document_symbols::outline_instances(lazy.as_deref(), &text, schema.as_deref())
             });
             document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
         })
@@ -1418,7 +1418,7 @@ mod tests {
     fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
         let document = Document::parse(&mut new_parser(), text.to_string());
         let instances =
-            document_symbols::outline_instances(document.lazy.as_deref(), &document.text);
+            document_symbols::outline_instances(document.lazy.as_deref(), &document.text, None);
         document_symbols::document_symbols(&document.text, &instances, document.ast_skipped, None)
     }
 

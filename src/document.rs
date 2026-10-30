@@ -12,6 +12,7 @@ use crate::diagnostics::incremental::{LazyEdits, ValidationCache};
 use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
 use crate::document_tree::DocumentTree;
 use crate::handwritten;
+use crate::schema::SchemaDoc;
 use crate::step::compact::{self, CompactKind, CompactValue};
 
 pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
@@ -628,6 +629,17 @@ pub fn lazy_entity_type_index<'a>(
 pub(crate) fn for_each_lazy_entity_instance(
     lazy: &handwritten::Document,
     text: &str,
+    visit: impl FnMut(EntityInstanceInfo),
+) {
+    for_each_lazy_entity_instance_named(lazy, text, |_| true, visit);
+}
+
+/// Like `for_each_lazy_entity_instance`, but decodes only instances whose uppercase entity name
+/// `keep` accepts.
+pub(crate) fn for_each_lazy_entity_instance_named(
+    lazy: &handwritten::Document,
+    text: &str,
+    mut keep: impl FnMut(&str) -> bool,
     mut visit: impl FnMut(EntityInstanceInfo),
 ) {
     let mut points = LinePoints {
@@ -636,8 +648,20 @@ pub(crate) fn for_each_lazy_entity_instance(
         row: 0,
         line_start: 0,
     };
+    let mut name = String::new();
     for index in 0..lazy.statements.len() {
-        if let Some(instance) = lazy_entity_instance(lazy, text, index, &mut points) {
+        let indexed_name = lazy.statements[index].name;
+        if indexed_name.end != 0 {
+            name.clear();
+            name.push_str(&text[indexed_name.range()]);
+            name.make_ascii_uppercase();
+            if !keep(&name) {
+                continue;
+            }
+        }
+        if let Some(instance) = lazy_entity_instance(lazy, text, index, &mut points)
+            && keep(&instance.entity_name)
+        {
             visit(instance);
         }
     }
@@ -871,7 +895,7 @@ impl EntityTypeIndex<'_> {
     }
 }
 
-/// The weak text key prevents address reuse without retaining an obsolete document.
+/// The weak text and schema keys prevent address reuse without retaining an obsolete document.
 #[derive(Default)]
 pub struct EntityInstanceCache {
     entry: Mutex<Option<CachedEntityInstances>>,
@@ -880,18 +904,18 @@ pub struct EntityInstanceCache {
 
 struct CachedEntityInstances {
     text: Weak<String>,
-    has_tree: bool,
+    schema: Option<Weak<SchemaDoc>>,
     instances: Arc<OnceLock<Arc<EntityInstanceCollection>>>,
 }
 
 impl EntityInstanceCache {
     pub fn get_or_build_with(
         &self,
-        has_tree: bool,
+        schema: Option<&Arc<SchemaDoc>>,
         text: &Arc<String>,
         build: impl FnOnce() -> EntityInstanceCollection,
     ) -> Arc<EntityInstanceCollection> {
-        let slot = self.slot(has_tree, text);
+        let slot = self.slot(schema, text);
         Arc::clone(slot.get_or_init(|| {
             let _permit = self
                 .build
@@ -922,20 +946,24 @@ impl EntityInstanceCache {
 
     fn slot(
         &self,
-        has_tree: bool,
+        schema: Option<&Arc<SchemaDoc>>,
         text: &Arc<String>,
     ) -> Arc<OnceLock<Arc<EntityInstanceCollection>>> {
         let mut entry = self.lock();
         if let Some(cached) = entry.as_ref()
-            && cached.has_tree == has_tree
             && std::ptr::eq(cached.text.as_ptr(), Arc::as_ptr(text))
+            && match (&cached.schema, schema) {
+                (None, None) => true,
+                (Some(cached), Some(schema)) => std::ptr::eq(cached.as_ptr(), Arc::as_ptr(schema)),
+                _ => false,
+            }
         {
             return Arc::clone(&cached.instances);
         }
         let slot = Arc::new(OnceLock::new());
         let previous = entry.replace(CachedEntityInstances {
             text: Arc::downgrade(text),
-            has_tree,
+            schema: schema.map(Arc::downgrade),
             instances: Arc::clone(&slot),
         });
         drop(entry);
@@ -1466,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_cache_reuses_instances_only_for_the_same_text_and_parse_state() {
+    fn instance_cache_reuses_instances_only_for_the_same_text_and_schema() {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_ifc::LANGUAGE.into())
@@ -1475,9 +1503,7 @@ mod tests {
         let cache = EntityInstanceCache::default();
 
         let build = |document: &Document| {
-            cache.get_or_build_with(document.is_parse_state_loaded(), &document.text, || {
-                instances(document)
-            })
+            cache.get_or_build_with(None, &document.text, || instances(document))
         };
         let first = build(&document);
         let repeated = build(&document);
@@ -1495,13 +1521,17 @@ mod tests {
             )
             .expect("replacement should parse");
         let edited = build(&document);
-        let without_tree = cache.get_or_build_with(false, &document.text, || {
+        let schema = Arc::new(SchemaDoc {
+            entities: HashMap::new(),
+            types: HashMap::new(),
+        });
+        let with_schema = cache.get_or_build_with(Some(&schema), &document.text, || {
             build_entity_instances(None, &document.text)
         });
 
         assert_eq!(first.instances[0].entity_name, "IFCWALL");
         assert_eq!(edited.instances[0].entity_name, "IFCDOOR");
-        assert!(without_tree.instances.is_empty());
+        assert!(with_schema.instances.is_empty());
     }
 
     #[tokio::test]
@@ -1510,17 +1540,17 @@ mod tests {
         let cached = Arc::new("#1=IFCWALL($);".to_string());
         let other = Arc::new("#1=IFCWALL($);".to_string());
         let build = || build_entity_instances(None, &cached);
-        let first = cache.get_or_build_with(false, &cached, build);
+        let first = cache.get_or_build_with(None, &cached, build);
 
         cache.forget(&other);
         assert!(Arc::ptr_eq(
             &first,
-            &cache.get_or_build_with(false, &cached, build)
+            &cache.get_or_build_with(None, &cached, build)
         ));
         cache.forget(&cached);
         assert!(!Arc::ptr_eq(
             &first,
-            &cache.get_or_build_with(false, &cached, build)
+            &cache.get_or_build_with(None, &cached, build)
         ));
     }
 
@@ -1538,7 +1568,7 @@ mod tests {
         std::thread::scope(|scope| {
             for text in &texts {
                 scope.spawn(|| {
-                    cache.get_or_build_with(true, text, || {
+                    cache.get_or_build_with(None, text, || {
                         let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(std::time::Duration::from_millis(50));
