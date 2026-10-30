@@ -60,11 +60,10 @@ fn report(label: &str, counter: &AtomicUsize) {
 }
 
 fn main() {
-    let path = std::env::args_os().nth(1).map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/Duplex_A_20110907-IFC2x3.ifc"),
-        PathBuf::from,
-    );
-    let model = Model::load(&path);
+    let model = match std::env::args_os().nth(1) {
+        Some(path) => Model::load(&PathBuf::from(path)),
+        None => Model::synthetic_properties(),
+    };
     let uri = model.uri();
     let mut session = Session::new();
     println!("model:              {}", model.name);
