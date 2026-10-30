@@ -3,6 +3,8 @@
 //! reports arity, reference, primitive, aggregate, enumeration, and select-type mismatches.
 //! General EXPRESS `WHERE` rules are intentionally out of scope for the current implementation.
 
+use std::fmt;
+
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::{
@@ -79,11 +81,11 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Some(message) = validate_value(instances, schema, value, attribute) {
+        if let Err(mismatch) = validate_value(instances, schema, value, attribute) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("{}: {}", attribute.name, message),
+                message: format!("{}: {}", attribute.name, mismatch),
                 ..Default::default()
             });
         }
@@ -109,41 +111,167 @@ fn unknown_entity_diagnostic(
     }
 }
 
-fn validate_value(
-    instances: &impl EntityReferenceLookup,
-    schema: &SchemaDoc,
-    value: &ParameterValue,
-    attribute: &EntityAttributeDoc,
-) -> Option<String> {
+enum Mismatch<'a> {
+    RequiredNull,
+    OmittedUnsupported,
+    TypedValueName {
+        expected: &'a str,
+        found: &'a str,
+    },
+    TypedValueArity {
+        type_name: &'a str,
+    },
+    NoSelectOption {
+        select: &'a str,
+    },
+    EnumerationItem {
+        items: &'a [String],
+        found: &'a str,
+    },
+    NotEnumeration {
+        found: &'static str,
+    },
+    NotAggregate {
+        kind: AggregateKind,
+        found: &'static str,
+    },
+    TooFewItems {
+        lower: u32,
+        found: usize,
+    },
+    TooManyItems {
+        upper: u32,
+        found: usize,
+    },
+    NotReference {
+        expected: &'a str,
+        found: &'static str,
+    },
+    UnresolvedReference {
+        id: u32,
+    },
+    IncompatibleReference {
+        expected: &'a str,
+        id: u32,
+        found: &'a str,
+    },
+    NotIntegerNumber,
+    NotInteger {
+        found: &'static str,
+    },
+    NotNumber {
+        found: &'static str,
+    },
+    NotString {
+        found: &'static str,
+    },
+    NotLogical {
+        found: &'static str,
+    },
+    NotBinary {
+        found: &'static str,
+    },
+}
+
+impl fmt::Display for Mismatch<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Mismatch::RequiredNull => write!(f, "attribute is required and does not allow `$`"),
+            Mismatch::OmittedUnsupported => write!(f, "`*` is not supported for this attribute"),
+            Mismatch::TypedValueName { expected, found } => write!(
+                f,
+                "expected typed value `{}` but found `{}`",
+                expected, found
+            ),
+            Mismatch::TypedValueArity { type_name } => write!(
+                f,
+                "typed value `{}` should contain exactly one argument",
+                type_name
+            ),
+            Mismatch::NoSelectOption { select } => {
+                write!(f, "value does not match any option of `{}`", select)
+            }
+            Mismatch::EnumerationItem { items, found } => {
+                write!(f, "expected one of {:?} but found `.{}.`", items, found)
+            }
+            Mismatch::NotEnumeration { found } => {
+                write!(f, "expected enumeration value but found {}", found)
+            }
+            Mismatch::NotAggregate { kind, found } => write!(
+                f,
+                "expected {} aggregate but found {}",
+                kind.as_str(),
+                found
+            ),
+            Mismatch::TooFewItems { lower, found } => {
+                write!(f, "expected at least {} items but found {}", lower, found)
+            }
+            Mismatch::TooManyItems { upper, found } => {
+                write!(f, "expected at most {} items but found {}", upper, found)
+            }
+            Mismatch::NotReference { expected, found } => write!(
+                f,
+                "expected reference to `{}` but found {}",
+                expected, found
+            ),
+            Mismatch::UnresolvedReference { id } => {
+                write!(f, "reference `#{}` does not resolve to a local entity", id)
+            }
+            Mismatch::IncompatibleReference {
+                expected,
+                id,
+                found,
+            } => write!(
+                f,
+                "expected reference to `{}` but `#{}` points to `{}`",
+                expected, id, found
+            ),
+            Mismatch::NotIntegerNumber => write!(f, "expected integer number"),
+            Mismatch::NotInteger { found } => write!(f, "expected integer but found {}", found),
+            Mismatch::NotNumber { found } => {
+                write!(f, "expected numeric value but found {}", found)
+            }
+            Mismatch::NotString { found } => write!(f, "expected string but found {}", found),
+            Mismatch::NotLogical { found } => write!(
+                f,
+                "expected logical/boolean enumeration but found {}",
+                found
+            ),
+            Mismatch::NotBinary { found } => {
+                write!(f, "expected binary literal but found {}", found)
+            }
+        }
+    }
+}
+
+type Validation<'a> = Result<(), Mismatch<'a>>;
+
+fn validate_value<'a>(
+    instances: &'a impl EntityReferenceLookup,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    attribute: &'a EntityAttributeDoc,
+) -> Validation<'a> {
     match value {
-        ParameterValue::Null { .. } => {
-            if attribute.optional {
-                None
-            } else {
-                Some("attribute is required and does not allow `$`".to_string())
-            }
+        ParameterValue::Null { .. } if !attribute.optional => Err(Mismatch::RequiredNull),
+        ParameterValue::Omitted { .. } if !attribute.allows_omitted => {
+            Err(Mismatch::OmittedUnsupported)
         }
-        ParameterValue::Omitted { .. } => {
-            if attribute.allows_omitted {
-                None
-            } else {
-                Some("`*` is not supported for this attribute".to_string())
-            }
-        }
+        ParameterValue::Null { .. } | ParameterValue::Omitted { .. } => Ok(()),
         _ => validate_non_null_value(instances, schema, value, &attribute.ty),
     }
 }
 
-fn validate_non_null_value(
-    instances: &impl EntityReferenceLookup,
-    schema: &SchemaDoc,
-    value: &ParameterValue,
-    expected: &TypeRef,
-) -> Option<String> {
+fn validate_non_null_value<'a>(
+    instances: &'a impl EntityReferenceLookup,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    expected: &'a TypeRef,
+) -> Validation<'a> {
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
         TypeRef::Aggregate(aggregate) => validate_aggregate(instances, schema, value, aggregate),
-        TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => None,
+        TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => Ok(()),
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
                 validate_entity_reference(instances, schema, value, &named.name)
@@ -155,33 +283,35 @@ fn validate_non_null_value(
     }
 }
 
-fn validate_named_type(
-    instances: &impl EntityReferenceLookup,
-    schema: &SchemaDoc,
-    value: &ParameterValue,
-    type_name: &str,
-) -> Option<String> {
-    let type_def = schema.type_decl(type_name)?;
+fn validate_named_type<'a>(
+    instances: &'a impl EntityReferenceLookup,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    type_name: &'a str,
+) -> Validation<'a> {
+    let Some(type_def) = schema.type_decl(type_name) else {
+        return Ok(());
+    };
     match type_def {
-        TypeDoc::Alias(alias) => match unwrap_inline_typed_value(value, type_name) {
-            Ok(value) => validate_non_null_value(instances, schema, value, &alias.target),
-            Err(message) => Some(message),
-        },
-        TypeDoc::Enumeration(enum_def) => match unwrap_inline_typed_value(value, type_name) {
-            Ok(value) => validate_enum_value(value, &enum_def.items),
-            Err(message) => Some(message),
-        },
+        TypeDoc::Alias(alias) => {
+            let value = unwrap_inline_typed_value(value, type_name)?;
+            validate_non_null_value(instances, schema, value, &alias.target)
+        }
+        TypeDoc::Enumeration(enum_def) => {
+            let value = unwrap_inline_typed_value(value, type_name)?;
+            validate_enum_value(value, &enum_def.items)
+        }
         TypeDoc::Select(select) => validate_select(instances, schema, value, select),
     }
 }
 
 /// Reduces an inline typed value such as `IFCLABEL('Name')` to the single payload that has to be
 /// checked against `type_name`'s underlying definition. Values that are not inline typed pass
-/// through unchanged; a wrong inline name or argument count yields the diagnostic message.
+/// through unchanged; a wrong inline name or argument count is a mismatch.
 fn unwrap_inline_typed_value<'a>(
     value: &'a ParameterValue,
-    type_name: &str,
-) -> Result<&'a ParameterValue, String> {
+    type_name: &'a str,
+) -> Result<&'a ParameterValue, Mismatch<'a>> {
     let ParameterValue::Typed {
         type_name: inline_name,
         inner,
@@ -192,132 +322,143 @@ fn unwrap_inline_typed_value<'a>(
     };
 
     if inline_name != type_name {
-        return Err(format!(
-            "expected typed value `{}` but found `{}`",
-            type_name, inline_name
-        ));
+        return Err(Mismatch::TypedValueName {
+            expected: type_name,
+            found: inline_name,
+        });
     }
 
     match inner.as_slice() {
         [single] => Ok(single),
-        _ => Err(format!(
-            "typed value `{}` should contain exactly one argument",
-            type_name
-        )),
+        _ => Err(Mismatch::TypedValueArity { type_name }),
     }
 }
 
-fn validate_select(
-    instances: &impl EntityReferenceLookup,
-    schema: &SchemaDoc,
-    value: &ParameterValue,
-    select: &SelectTypeDef,
-) -> Option<String> {
+fn validate_select<'a>(
+    instances: &'a impl EntityReferenceLookup,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    select: &'a SelectTypeDef,
+) -> Validation<'a> {
     if select
         .options
         .iter()
-        .any(|option| validate_non_null_value(instances, schema, value, option).is_none())
+        .any(|option| select_option_accepts(instances, schema, value, option))
     {
-        None
+        Ok(())
     } else {
-        Some(format!(
-            "value does not match any option of `{}`",
-            select.name
-        ))
+        Err(Mismatch::NoSelectOption {
+            select: &select.name,
+        })
     }
 }
 
-fn validate_enum_value(value: &ParameterValue, items: &[String]) -> Option<String> {
+/// An inline typed value can only match the defined type it names, so differently named aliases
+/// and enumerations are rejected without validating the payload; nested selects are searched.
+fn select_option_accepts<'a>(
+    instances: &'a EntityInstanceCollection,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    option: &'a TypeRef,
+) -> bool {
+    if let (ParameterValue::Typed { type_name, .. }, TypeRef::Named(named)) = (value, option)
+        && named.kind != NamedTypeKind::Entity
+        && named.name != *type_name
+    {
+        return match schema.type_decl(&named.name) {
+            Some(TypeDoc::Select(select)) => {
+                validate_select(instances, schema, value, select).is_ok()
+            }
+            Some(TypeDoc::Alias(_) | TypeDoc::Enumeration(_)) => false,
+            None => true,
+        };
+    }
+
+    validate_non_null_value(instances, schema, value, option).is_ok()
+}
+
+fn validate_enum_value<'a>(value: &'a ParameterValue, items: &'a [String]) -> Validation<'a> {
     match value {
         ParameterValue::Enumeration { value, .. } => {
             if items.contains(value) {
-                None
+                Ok(())
             } else {
-                Some(format!(
-                    "expected one of {:?} but found `.{}.`",
-                    items, value
-                ))
+                Err(Mismatch::EnumerationItem {
+                    items,
+                    found: value,
+                })
             }
         }
-        _ => Some(format!(
-            "expected enumeration value but found {}",
-            value.kind_name()
-        )),
+        _ => Err(Mismatch::NotEnumeration {
+            found: value.kind_name(),
+        }),
     }
 }
 
-fn validate_aggregate(
-    instances: &impl EntityReferenceLookup,
-    schema: &SchemaDoc,
-    value: &ParameterValue,
-    aggregate: &AggregateTypeRef,
-) -> Option<String> {
+fn validate_aggregate<'a>(
+    instances: &'a impl EntityReferenceLookup,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    aggregate: &'a AggregateTypeRef,
+) -> Validation<'a> {
     let ParameterValue::List { items, .. } = value else {
-        return Some(format!(
-            "expected {} aggregate but found {}",
-            aggregate.kind.as_str(),
-            value.kind_name()
-        ));
+        return Err(Mismatch::NotAggregate {
+            kind: aggregate.kind,
+            found: value.kind_name(),
+        });
     };
 
     if let Some(bounds) = &aggregate.bounds {
         if let BoundValue::Integer(lower) = bounds.lower
             && items.len() < lower as usize
         {
-            return Some(format!(
-                "expected at least {} items but found {}",
+            return Err(Mismatch::TooFewItems {
                 lower,
-                items.len()
-            ));
+                found: items.len(),
+            });
         }
         if let BoundValue::Integer(upper) = bounds.upper
             && items.len() > upper as usize
         {
-            return Some(format!(
-                "expected at most {} items but found {}",
+            return Err(Mismatch::TooManyItems {
                 upper,
-                items.len()
-            ));
+                found: items.len(),
+            });
         }
     }
 
     for item in items {
-        if let Some(message) = validate_non_null_value(instances, schema, item, &aggregate.item) {
-            return Some(message);
-        }
+        validate_non_null_value(instances, schema, item, &aggregate.item)?;
     }
 
-    None
+    Ok(())
 }
 
-fn validate_entity_reference(
-    instances: &impl EntityReferenceLookup,
-    schema: &SchemaDoc,
-    value: &ParameterValue,
-    expected_entity: &str,
-) -> Option<String> {
+fn validate_entity_reference<'a>(
+    instances: &'a impl EntityReferenceLookup,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    expected_entity: &'a str,
+) -> Validation<'a> {
     let ParameterValue::Reference { id, .. } = value else {
-        return Some(format!(
-            "expected reference to `{}` but found {}",
-            expected_entity,
-            value.kind_name()
-        ));
+        return Err(Mismatch::NotReference {
+            expected: expected_entity,
+            found: value.kind_name(),
+        });
     };
 
     let Some(entity_name) = instances.entity_name_by_id(*id) else {
-        return Some(format!(
-            "reference `#{}` does not resolve to a local entity",
-            id
-        ));
+        return Err(Mismatch::UnresolvedReference { id: *id });
     };
 
     if schema.is_entity_compatible(entity_name, expected_entity) {
-        None
+        Ok(())
     } else {
-        Some(format!(
-            "expected reference to `{}` but `#{}` points to `{}`",
-            expected_entity, id, entity_name
-        ))
+        Err(Mismatch::IncompatibleReference {
+            expected: expected_entity,
+            id: *id,
+            found: entity_name,
+        })
     }
 }
 
@@ -338,23 +479,21 @@ impl EntityReferenceLookup for EntityTypeIndex {
     }
 }
 
-fn validate_primitive(value: &ParameterValue, primitive: &PrimitiveType) -> Option<String> {
+fn validate_primitive<'a>(value: &'a ParameterValue, primitive: &PrimitiveType) -> Validation<'a> {
+    let found = value.kind_name();
     match primitive {
         PrimitiveType::Integer => match value {
-            ParameterValue::Number { text, .. } if is_integer(text) => None,
-            ParameterValue::Number { .. } => Some("expected integer number".to_string()),
-            _ => Some(format!("expected integer but found {}", value.kind_name())),
+            ParameterValue::Number { text, .. } if is_integer(text) => Ok(()),
+            ParameterValue::Number { .. } => Err(Mismatch::NotIntegerNumber),
+            _ => Err(Mismatch::NotInteger { found }),
         },
         PrimitiveType::Real | PrimitiveType::Number => match value {
-            ParameterValue::Number { .. } => None,
-            _ => Some(format!(
-                "expected numeric value but found {}",
-                value.kind_name()
-            )),
+            ParameterValue::Number { .. } => Ok(()),
+            _ => Err(Mismatch::NotNumber { found }),
         },
         PrimitiveType::String { .. } => match value {
-            ParameterValue::String { .. } => None,
-            _ => Some(format!("expected string but found {}", value.kind_name())),
+            ParameterValue::String { .. } => Ok(()),
+            _ => Err(Mismatch::NotString { found }),
         },
         PrimitiveType::Logical | PrimitiveType::Boolean => match value {
             ParameterValue::Enumeration { value, .. }
@@ -363,19 +502,13 @@ fn validate_primitive(value: &ParameterValue, primitive: &PrimitiveType) -> Opti
                     "TRUE" | "FALSE" | "UNKNOWN" | "T" | "F" | "U"
                 ) =>
             {
-                None
+                Ok(())
             }
-            _ => Some(format!(
-                "expected logical/boolean enumeration but found {}",
-                value.kind_name()
-            )),
+            _ => Err(Mismatch::NotLogical { found }),
         },
         PrimitiveType::Binary { .. } => match value {
-            ParameterValue::String { .. } => None,
-            _ => Some(format!(
-                "expected binary literal but found {}",
-                value.kind_name()
-            )),
+            ParameterValue::String { .. } => Ok(()),
+            _ => Err(Mismatch::NotBinary { found }),
         },
     }
 }
