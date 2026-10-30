@@ -566,15 +566,18 @@ const TEXT_HEADROOM: usize = 64 * 1024;
 
 fn replace_text(text: &mut Arc<String>, range: std::ops::Range<usize>, replacement: &str) {
     let len = text.len() - range.len() + replacement.len();
-    match Arc::get_mut(text) {
-        Some(owned) if owned.capacity() >= len => owned.replace_range(range, replacement),
-        _ => {
-            let mut edited = String::with_capacity(len + TEXT_HEADROOM);
-            edited.push_str(&text[..range.start]);
-            edited.push_str(replacement);
-            edited.push_str(&text[range.end..]);
-            *text = Arc::new(edited);
+    if Arc::strong_count(text) == 1 {
+        let owned = Arc::make_mut(text);
+        if owned.capacity() < len {
+            owned.reserve_exact(len - owned.len() + TEXT_HEADROOM);
         }
+        owned.replace_range(range, replacement);
+    } else {
+        let mut edited = String::with_capacity(len + TEXT_HEADROOM);
+        edited.push_str(&text[..range.start]);
+        edited.push_str(replacement);
+        edited.push_str(&text[range.end..]);
+        *text = Arc::new(edited);
     }
 }
 
@@ -1409,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn an_insertion_into_a_full_text_reserves_bounded_headroom() {
+    fn insertions_reserve_bounded_headroom_and_edit_unshared_text_in_place() {
         let mut parser = Parser::new();
         let text = format!("DATA;\n{}ENDSEC;\n", "#1=IFCWALL($);\n".repeat(100_000));
         let mut document = Document::new_unloaded(text.clone());
@@ -1433,6 +1436,21 @@ mod tests {
             let spare = document.text.capacity() - document.text.len();
             assert!(spare <= TEXT_HEADROOM, "{spare} bytes spare");
         }
+
+        let cache_key = Arc::downgrade(&document.text);
+        let data = document.text.as_ptr();
+        document
+            .apply_content_changes(
+                &mut parser,
+                &[change(
+                    Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
+                    "y",
+                )],
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .unwrap();
+        assert_eq!(document.text.as_ptr(), data, "the edit copied the text");
+        drop(cache_key);
     }
 
     fn instances(document: &Document) -> EntityInstanceCollection {
