@@ -189,11 +189,7 @@ impl Document {
                     Err(error) => {
                         self.reload_text_index();
                         let old_tree = self.tree.take();
-                        self.parse_current_text(
-                            parser,
-                            old_tree.as_ref(),
-                            ast_file_size_limit_bytes,
-                        );
+                        self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
                         return Err(error);
                     }
                 }
@@ -211,7 +207,7 @@ impl Document {
             self.reload_text_index();
         }
         let old_tree = self.tree.take();
-        self.parse_current_text(parser, old_tree.as_ref(), ast_file_size_limit_bytes);
+        self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
         Ok(())
     }
 
@@ -321,7 +317,7 @@ impl Document {
     fn parse_current_text(
         &mut self,
         parser: &mut Parser,
-        old_tree: Option<&DocumentTree>,
+        old_tree: Option<DocumentTree>,
         ast_file_size_limit_bytes: usize,
     ) {
         self.ast_skipped = false;

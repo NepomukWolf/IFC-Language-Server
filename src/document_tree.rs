@@ -9,12 +9,13 @@ pub struct DocumentTree {
 }
 
 impl DocumentTree {
-    pub fn parse(parser: &mut Parser, text: &[u8], old: Option<&Self>) -> Option<Self> {
+    pub fn parse(parser: &mut Parser, text: &[u8], old: Option<Self>) -> Option<Self> {
         parser.set_included_ranges(&[]).expect("whole document");
         parser
             .set_language(&tree_sitter_ifc::LANGUAGE.into())
             .expect("IFC ABI");
-        let compact = parser.parse(text, old.map(|tree| &tree.compact))?;
+        let compact = parser.parse(text, old.as_ref().map(|tree| &tree.compact))?;
+        drop(old);
         let mut result = Self {
             compact,
             structured: None,
