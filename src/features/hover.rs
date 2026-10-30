@@ -1,17 +1,18 @@
 //! Hover feature logic.
 //! Resolves text tokens under the cursor and renders schema-backed entity information or local
 //! reference previews from the current document. Derived `*` hover is limited to `IfcSIUnit` and
-//! `IfcGeometricRepresentationSubContext` and uses tree-sitter context.
+//! `IfcGeometricRepresentationSubContext`.
 //! Hover stays synchronous by reading only the in-memory document and schema collections.
 
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Range};
 
-use crate::document::{Document, ParameterValue};
+use crate::document::{
+    Document, EntityInstanceInfo, ParameterValue, for_each_lazy_entity_instance,
+};
 use crate::schema::{
     EntityAttributeDoc, EntityDoc, EnumerationTypeDef, NamedTypeKind, PrimitiveType, SchemaDoc,
     SchemaDocCollection, TypeDoc, TypeRef,
 };
-use crate::step::ast;
 
 const FILE_DESCRIPTION_HOVER: &str = include_str!("hover/static/file_description.md");
 const FILE_NAME_HOVER: &str = include_str!("hover/static/file_name.md");
@@ -89,13 +90,22 @@ pub fn hover(
         });
     }
 
-    if let Some(node) = document.node_at_position(position)
-        && let Some(offset) = document.position_to_offset(position)
-        && let Some((start, end)) = ast::omitted_value_span(node, offset, &document.text)
+    if let Some(offset) = document.position_to_offset(position)
+        && let Some((instance, parameter_index)) = parameter_at_offset(document, offset)
+        && let Some(value) = instance.parameters.get(parameter_index)
+        && matches!(value, ParameterValue::Omitted { .. })
     {
-        let context = ast::parameter_context(node, offset, &document.text)?;
-        let value = derived_value_hover(document, &context)?;
-        let range = document.range_for_offsets(start, end)?;
+        let omitted_range = value.range();
+        let value = derived_value_hover(
+            document,
+            instance.id?,
+            &instance.entity_name,
+            parameter_index,
+        )?;
+        let range = document.range_for_offsets(
+            range_offset(document, omitted_range)?.0,
+            range_offset(document, omitted_range)?.1,
+        )?;
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -188,20 +198,88 @@ fn render_header_keyword_hover(keyword: &str) -> Option<&'static str> {
     }
 }
 
+/// Enumerates instances through the handwritten index. Small documents do not retain that index,
+/// so construct the same lightweight index on demand rather than consulting tree-sitter.
+fn for_each_entity_instance(document: &Document, visit: impl FnMut(EntityInstanceInfo)) {
+    if let Some(lazy) = document.lazy.as_deref() {
+        for_each_lazy_entity_instance(lazy, &document.text, visit);
+    } else {
+        let lazy = crate::handwritten::Document::parse(document.text.as_bytes(), false);
+        for_each_lazy_entity_instance(&lazy, &document.text, visit);
+    }
+}
+
+fn parameter_at_offset(document: &Document, offset: usize) -> Option<(EntityInstanceInfo, usize)> {
+    let mut result = None;
+    for_each_entity_instance(document, |instance| {
+        if result.is_some() {
+            return;
+        }
+        for (index, parameter) in instance.parameters.iter().enumerate() {
+            if parameter_contains_offset(document, parameter, offset) {
+                result = Some((instance, index));
+                return;
+            }
+        }
+    });
+    result
+}
+
+fn entity_instance_by_id(document: &Document, id: u32) -> Option<EntityInstanceInfo> {
+    let mut result = None;
+    for_each_entity_instance(document, |instance| {
+        if instance.id == Some(id) {
+            result = Some(instance);
+        }
+    });
+    result
+}
+
+fn parameter_contains_offset(
+    document: &Document,
+    parameter: &ParameterValue,
+    offset: usize,
+) -> bool {
+    range_offset(document, parameter.range())
+        .is_some_and(|(start, end)| start <= offset && offset < end)
+}
+
+fn typed_value_name_span(
+    document: &Document,
+    parameter: &ParameterValue,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    match parameter {
+        ParameterValue::Typed { inner, range, .. } => {
+            let (start, end) = range_offset(document, *range)?;
+            let open = document.text.get(start..end)?.find('(')? + start;
+            if start <= offset && offset < open {
+                Some((start, open))
+            } else {
+                inner
+                    .iter()
+                    .find_map(|item| typed_value_name_span(document, item, offset))
+            }
+        }
+        ParameterValue::List { items, .. } => items
+            .iter()
+            .find_map(|item| typed_value_name_span(document, item, offset)),
+        _ => None,
+    }
+}
+
 fn enum_value_at_position<'a>(
     document: &'a Document,
     schema: &'a SchemaDoc,
     position: Position,
 ) -> Option<(Range, &'a EntityAttributeDoc, &'a EnumerationTypeDef)> {
-    let node = document.node_at_position(position)?;
     let offset = document.position_to_offset(position)?;
-    let context = ast::parameter_context(node, offset, &document.text)?;
-    let instance = document.entity_instance_by_id(context.instance_id)?;
-    let parameter = instance.parameters.get(context.parameter_index)?;
+    let (instance, parameter_index) = parameter_at_offset(document, offset)?;
+    let parameter = instance.parameters.get(parameter_index)?;
     let attribute = schema
-        .entity(&context.entity_name)?
+        .entity(&instance.entity_name)?
         .attributes
-        .get(context.parameter_index)?;
+        .get(parameter_index)?;
     let enum_value = enum_value_in_parameter(document, parameter, offset)?;
     let enum_def = enum_value
         .typed_name
@@ -223,7 +301,7 @@ fn enum_value_in_parameter<'a>(
     parameter: &'a ParameterValue,
     offset: usize,
 ) -> Option<EnumValueAtPosition<'a>> {
-    let (start_offset, end_offset) = tree_sitter_range_offsets(document, parameter.range())?;
+    let (start_offset, end_offset) = range_offset(document, parameter.range())?;
     if offset < start_offset || offset >= end_offset {
         return None;
     }
@@ -249,7 +327,7 @@ fn enum_value_in_parameter<'a>(
     }
 }
 
-fn tree_sitter_range_offsets(document: &Document, range: Range) -> Option<(usize, usize)> {
+fn range_offset(document: &Document, range: Range) -> Option<(usize, usize)> {
     let start = document
         .line_offsets
         .get(range.start.line as usize)?
@@ -332,8 +410,9 @@ fn typed_value_name_at_position(
     position: Position,
 ) -> Option<(String, tower_lsp::lsp_types::Range)> {
     let offset = document.position_to_offset(position)?;
-    let node = document.node_at_position(position)?;
-    let (start, end) = ast::typed_value_name_span(node, offset, &document.text)?;
+    let (instance, parameter_index) = parameter_at_offset(document, offset)?;
+    let parameter = instance.parameters.get(parameter_index)?;
+    let (start, end) = typed_value_name_span(document, parameter, offset)?;
     Some((
         document.text[start..end].to_ascii_uppercase(),
         document.range_for_offsets(start, end)?,
@@ -388,18 +467,23 @@ fn format_width_type(name: &str, width: Option<usize>, fixed: bool) -> String {
     }
 }
 
-fn derived_value_hover(document: &Document, context: &ast::ParameterContext) -> Option<String> {
-    match (context.entity_name.as_str(), context.parameter_index) {
-        ("IFCSIUNIT", 0) => Some(ifc_si_unit_dimensions_hover(document, context.instance_id)),
+fn derived_value_hover(
+    document: &Document,
+    instance_id: u32,
+    entity_name: &str,
+    parameter_index: usize,
+) -> Option<String> {
+    match (entity_name, parameter_index) {
+        ("IFCSIUNIT", 0) => Some(ifc_si_unit_dimensions_hover(document, instance_id)),
         ("IFCGEOMETRICREPRESENTATIONSUBCONTEXT", parameter_index @ 2..=5) => Some(
-            subcontext_inherited_attribute_hover(document, context.instance_id, parameter_index),
+            subcontext_inherited_attribute_hover(document, instance_id, parameter_index),
         ),
         _ => None,
     }
 }
 
 fn ifc_si_unit_dimensions_hover(document: &Document, instance_id: u32) -> String {
-    let instance = document.entity_instance_by_id(instance_id);
+    let instance = entity_instance_by_id(document, instance_id);
     let dimensions = instance
         .as_ref()
         .and_then(|instance| instance.parameters.get(3))
@@ -438,7 +522,7 @@ fn subcontext_inherited_attribute_hover(
     };
     let unresolved = || format!("{attribute_name}: derived value");
 
-    let Some(instance) = document.entity_instance_by_id(instance_id) else {
+    let Some(instance) = entity_instance_by_id(document, instance_id) else {
         return unresolved();
     };
     let Some(parent_id) = instance.parameters.get(6).and_then(|value| match value {
@@ -447,7 +531,7 @@ fn subcontext_inherited_attribute_hover(
     }) else {
         return unresolved();
     };
-    let Some(parent) = document.entity_instance_by_id(parent_id) else {
+    let Some(parent) = entity_instance_by_id(document, parent_id) else {
         return unresolved();
     };
     let Some(parent_value) = parent.parameters.get(parameter_index) else {
@@ -764,22 +848,18 @@ mod tests {
         assert!(typed_value_name_at_position(&document, position_at(text, "IFCWALL")).is_none());
     }
 
-    /// Test that hover returns definition preview for references to definitions.
+    /// Test that omitted values resolve through the handwritten parameter index.
     #[test]
-    fn omitted_value_context_uses_ast_to_find_instance_and_parameter() {
+    fn omitted_value_context_finds_instance_and_parameter() {
         let text = "#15=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);";
         let document = parse_document(text);
-        let node = document
-            .node_at_position(position_at(text, "*"))
-            .expect("omitted value node should exist");
-
         let offset = document.position_to_offset(position_at(text, "*")).unwrap();
-        let context = crate::step::ast::parameter_context(node, offset, &document.text)
-            .expect("context should resolve from AST");
+        let (instance, parameter_index) =
+            parameter_at_offset(&document, offset).expect("context should resolve from index");
 
-        assert_eq!(context.instance_id, 15);
-        assert_eq!(context.entity_name, "IFCSIUNIT");
-        assert_eq!(context.parameter_index, 0);
+        assert_eq!(instance.id, Some(15));
+        assert_eq!(instance.entity_name, "IFCSIUNIT");
+        assert_eq!(parameter_index, 0);
     }
 
     #[test]
@@ -937,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_returns_none_for_enum_value_without_a_syntax_tree() {
+    fn hover_returns_enum_value_without_a_syntax_tree() {
         let text = "#1=IFCWALL($,.USERDEFINED.);";
         let document = Document::new_unloaded(text.to_string());
 
@@ -948,7 +1028,8 @@ mod tests {
             Some("IFC4"),
         );
 
-        assert!(hover.is_none());
+        let value = hover_text(hover.expect("handwritten index should resolve enum context"));
+        assert!(value.contains("# IfcWallTypeEnum"));
     }
 
     /// Test that the markdown rendering for entity hover includes inherited and direct attribute tables.
