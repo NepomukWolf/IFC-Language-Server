@@ -8,6 +8,7 @@ use std::collections::HashMap;
 pub struct TextIndex {
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
+    pub definitions_by_id: Vec<(u32, usize)>,
     pub references: HashMap<u32, Vec<usize>>,
     pub schema_name: Option<String>,
 }
@@ -17,6 +18,7 @@ pub fn scan_text(text: &str) -> TextIndex {
     let mut index = TextIndex {
         line_offsets: vec![0],
         definitions: HashMap::new(),
+        definitions_by_id: Vec::new(),
         references: HashMap::new(),
         schema_name: None,
     };
@@ -37,6 +39,7 @@ pub fn scan_text(text: &str) -> TextIndex {
                     index.references.entry(id).or_default().push(offset);
                     if is_definition(bytes, end) {
                         index.definitions.insert(id, offset);
+                        index.definitions_by_id.push((id, offset));
                     }
                     offset = end;
                 } else {
@@ -59,6 +62,14 @@ pub fn scan_text(text: &str) -> TextIndex {
         }
     }
 
+    index.definitions_by_id.sort_by_key(|&(id, _)| id);
+    index.definitions_by_id.dedup_by(|later, earlier| {
+        let duplicate = later.0 == earlier.0;
+        if duplicate {
+            *earlier = *later;
+        }
+        duplicate
+    });
     index
 }
 
@@ -224,5 +235,21 @@ mod tests {
         assert_eq!(index.references.get(&1), Some(&vec![0, 50]));
         assert!(!index.references.contains_key(&2));
         assert!(!index.references.contains_key(&3));
+    }
+
+    #[test]
+    fn lists_definitions_by_id_with_the_offsets_of_the_map() {
+        let text = "#10=A();\n#2=B();\n#10=C();\n#1=D('#3=E();');\n#2=F();\n";
+
+        let index = scan_text(text);
+
+        let mut from_map = index
+            .definitions
+            .iter()
+            .map(|(&id, &offset)| (id, offset))
+            .collect::<Vec<_>>();
+        from_map.sort();
+        assert_eq!(index.definitions_by_id, from_map);
+        assert_eq!(index.definitions_by_id, vec![(1, 26), (2, 43), (10, 17)]);
     }
 }
