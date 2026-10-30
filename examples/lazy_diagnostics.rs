@@ -3,7 +3,8 @@
 //! `generate <mb> <out>` writes the synthetic property model.
 //! `equiv <file>...` prints diagnostics that differ between the two paths.
 //! `mutate <file>` does the same for single-statement mutations at sampled statements.
-//! `measure <ast|lazy> <file> <valid|syntax|quote|id>` prints one JSON record; with
+//! `measure <ast|lazy> <file> <valid|syntax|quote|id|star|slash>` prints one JSON record, timing
+//! the edit and then definition, references and completion at a reference after it; with
 //! `LAZY_DIAG_SPANS` set it also logs the server's span timings to stderr.
 
 #[allow(dead_code)]
@@ -14,7 +15,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tower_lsp::lsp_types::{Diagnostic, Range};
+use tower_lsp::LanguageServer;
+use tower_lsp::lsp_types::{
+    CompletionParams, CompletionResponse, Diagnostic, GotoDefinitionParams,
+    GotoDefinitionResponse, Range, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
+    TextDocumentPositionParams, Url,
+};
 
 use lsp_session::{Model, Session};
 
@@ -267,7 +273,26 @@ fn measure(mode: &str, path: &Path, edit: &str) {
         "syntax" => (open, 1, "X"),
         "quote" => (close_quote, 1, ""),
         "id" => (statement + 1, id_len, "999999999"),
-        _ => panic!("edit is valid, syntax, quote or id"),
+        "star" => (close_quote, 0, "*"),
+        "slash" => (close_quote, 0, "/"),
+        _ => panic!("edit is valid, syntax, quote, id, star or slash"),
+    };
+    let mut edited_text = model.text.clone();
+    edited_text.replace_range(start..start + deleted, replacement);
+    let target = if edit == "id" {
+        model.text[statement + 1..statement + 1 + id_len].to_string()
+    } else {
+        let line_end = model.text[open..].find('\n').map_or(model.text.len(), |n| open + n);
+        let reference = model.text[open..line_end].find('#').map(|n| open + n + 1);
+        reference.map_or_else(
+            || "1".to_string(),
+            |at| {
+                model.text[at..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect()
+            },
+        )
     };
     let range = Range::new(model.position(start), model.position(start + deleted));
     let mut session = Session::new(json!({ "astFileSizeLimitMb": limit(mode) }));
@@ -285,6 +310,7 @@ fn measure(mode: &str, path: &Path, edit: &str) {
     let edit_ms = clock.elapsed().as_secs_f64() * 1000.0;
     std::thread::sleep(Duration::from_secs(2));
     let footprint_edit = footprint();
+    let navigation = navigate(&session, &uri, &edited_text, &target);
 
     println!(
         "{}",
@@ -302,8 +328,108 @@ fn measure(mode: &str, path: &Path, edit: &str) {
             "footprint_mib_after_open": footprint_open.0,
             "footprint_mib_after_edit": footprint_edit.0,
             "lifetime_peak_footprint_mib": footprint_edit.1,
+            "navigation": navigation,
         })
     );
+}
+
+/// Offsets of `#<id>` tokens in `text` (not followed by a digit), each with whether it defines.
+fn occurrences(text: &str, id: &str) -> Vec<(usize, bool)> {
+    let needle = format!("#{id}");
+    let bytes = text.as_bytes();
+    text.match_indices(&needle)
+        .map(|(at, _)| at)
+        .filter(|&at| !bytes.get(at + needle.len()).is_some_and(u8::is_ascii_digit))
+        .map(|at| {
+            let rest = text[at + needle.len()..].trim_start();
+            (at, rest.starts_with('='))
+        })
+        .collect()
+}
+
+/// Times definition, references and completion at the first non-defining `#<target>` of the
+/// edited text and checks them against a plain search of that text.
+fn navigate(session: &Session, uri: &Url, text: &str, target: &str) -> serde_json::Value {
+    let position_of = |offset: usize| {
+        let line_start = text[..offset].rfind('\n').map_or(0, |n| n + 1);
+        tower_lsp::lsp_types::Position::new(
+            text[..line_start].matches('\n').count() as u32,
+            text[line_start..offset].encode_utf16().count() as u32,
+        )
+    };
+    let found = occurrences(text, target);
+    let Some(&(at, _)) = found.iter().find(|(_, definition)| !definition) else {
+        return json!({ "target": target, "skipped": "no reference" });
+    };
+    let expected_definition_line = found
+        .iter()
+        .rev()
+        .find(|(_, definition)| *definition)
+        .map(|&(offset, _)| position_of(offset).line);
+    let document_position = TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        position: position_of(at),
+    };
+    let backend = session.backend();
+
+    let clock = Instant::now();
+    let definition = session
+        .block_on(backend.goto_definition(GotoDefinitionParams {
+            text_document_position_params: document_position.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }))
+        .expect("definition succeeds");
+    let definition_ms = clock.elapsed().as_secs_f64() * 1000.0;
+    let definition_line = match definition {
+        Some(GotoDefinitionResponse::Scalar(location)) => Some(location.range.start.line),
+        _ => None,
+    };
+
+    let clock = Instant::now();
+    let references = session
+        .block_on(backend.references(ReferenceParams {
+            text_document_position: document_position.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        }))
+        .expect("references succeed")
+        .unwrap_or_default();
+    let references_ms = clock.elapsed().as_secs_f64() * 1000.0;
+
+    let mut completion_position = document_position;
+    completion_position.position.character += 1 + target.len() as u32;
+    let clock = Instant::now();
+    let completion = session
+        .block_on(backend.completion(CompletionParams {
+            text_document_position: completion_position,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        }))
+        .expect("completion succeeds");
+    let completion_ms = clock.elapsed().as_secs_f64() * 1000.0;
+    let label = format!("#{target}");
+    let items = match completion {
+        Some(CompletionResponse::List(list)) => list.items,
+        Some(CompletionResponse::Array(items)) => items,
+        None => Vec::new(),
+    };
+
+    json!({
+        "target": target,
+        "definition_ms": definition_ms,
+        "definition_correct": definition_line == expected_definition_line,
+        "references_ms": references_ms,
+        "references": references.len(),
+        "references_correct": references.len() == found.len(),
+        "completion_ms": completion_ms,
+        "completion_items": items.len(),
+        "completion_has_target": items.iter().any(|item| item.label == label),
+    })
 }
 
 /// Current and lifetime-peak physical footprint of this process in MiB.

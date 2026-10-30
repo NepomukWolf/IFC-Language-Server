@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
 
 use crate::diagnostics::incremental::{LazyEdits, ValidationCache};
-use crate::document_index::{TextIndex, index_neutral_edit, rescan_text, scan_text};
+use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
 use crate::document_tree::DocumentTree;
 use crate::handwritten;
 use crate::step::compact::{self, CompactKind, CompactValue};
@@ -156,7 +156,11 @@ impl Document {
 
     #[tracing::instrument(skip_all)]
     pub fn reload_text_index(&mut self) {
-        let previous = TextIndex {
+        self.with_text_index(|index, text| *index = rescan_text(text, std::mem::take(index)));
+    }
+
+    fn with_text_index<R>(&mut self, update: impl FnOnce(&mut TextIndex, &str) -> R) -> R {
+        let mut index = TextIndex {
             line_offsets: std::mem::take(&mut self.line_offsets),
             definitions: std::mem::take(&mut self.definitions),
             definitions_by_id: std::mem::take(&mut self.definitions_by_id),
@@ -164,21 +168,14 @@ impl Document {
             schema_name: self.schema_name.take(),
             schema_end: self.schema_end.take(),
         };
-        let TextIndex {
-            line_offsets,
-            definitions,
-            definitions_by_id,
-            references,
-            schema_name,
-            schema_end,
-        } = rescan_text(&self.text, previous);
-
-        self.line_offsets = line_offsets;
-        self.definitions = definitions;
-        self.definitions_by_id = definitions_by_id;
-        self.references = references;
-        self.schema_name = schema_name;
-        self.schema_end = schema_end;
+        let result = update(&mut index, &self.text);
+        self.line_offsets = index.line_offsets;
+        self.definitions = index.definitions;
+        self.definitions_by_id = index.definitions_by_id;
+        self.references = index.references;
+        self.schema_name = index.schema_name;
+        self.schema_end = index.schema_end;
+        result
     }
 
     pub fn unload_parse_state(&mut self) {
@@ -200,32 +197,21 @@ impl Document {
         changes: &[TextDocumentContentChangeEvent],
         ast_file_size_limit_bytes: usize,
     ) -> Result<(), ApplyChangeError> {
-        let mut index_valid = true;
-        for (index, change) in changes.iter().enumerate() {
+        for change in changes {
             if let Some(range) = change.range {
-                match self.apply_ranged_change(range, &change.text, index_valid) {
-                    Ok(kept_index) => index_valid = kept_index,
-                    Err(error) => {
-                        self.reload_text_index();
-                        let old_tree = self.tree.take();
-                        self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
-                        return Err(error);
-                    }
+                if let Err(error) = self.apply_ranged_change(range, &change.text) {
+                    let old_tree = self.tree.take();
+                    self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
+                    return Err(error);
                 }
             } else {
                 self.text = Arc::new(change.text.clone());
                 self.tree = None;
                 self.lazy = None;
-                index_valid = false;
-            }
-            if !index_valid && index + 1 < changes.len() {
-                self.reload_line_offsets();
+                self.reload_text_index();
             }
         }
 
-        if !index_valid {
-            self.reload_text_index();
-        }
         let old_tree = self.tree.take();
         self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
         Ok(())
@@ -236,8 +222,7 @@ impl Document {
         &mut self,
         range: Range,
         replacement: &str,
-        index_valid: bool,
-    ) -> Result<bool, ApplyChangeError> {
+    ) -> Result<(), ApplyChangeError> {
         let start_byte = self
             .position_to_offset(range.start)
             .ok_or(ApplyChangeError::InvalidRange(range))?;
@@ -248,8 +233,6 @@ impl Document {
             return Err(ApplyChangeError::InvalidRange(range));
         }
 
-        let keep_index =
-            index_valid && self.can_keep_text_index(range, start_byte, old_end_byte, replacement);
         let start_position = self
             .point_at_offset(range.start.line as usize, start_byte)
             .ok_or(ApplyChangeError::InvalidRange(range))?;
@@ -269,12 +252,9 @@ impl Document {
         if let Some(tree) = self.tree.as_mut() {
             tree.edit(&edit);
         }
-        let removed = self
-            .lazy
-            .is_some()
-            .then(|| self.text.as_bytes()[start_byte..old_end_byte].to_vec());
+        let removed = self.text.as_bytes()[start_byte..old_end_byte].to_vec();
         Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
-        if let (Some(lazy), Some(removed)) = (self.lazy.as_mut(), removed) {
+        if let Some(lazy) = self.lazy.as_mut() {
             let outcome = Arc::make_mut(lazy).edit(
                 &removed,
                 self.text.as_bytes(),
@@ -286,61 +266,13 @@ impl Document {
             );
             self.lazy_edits.record(outcome);
         }
-        if keep_index {
-            let delta = replacement.len() as isize - (old_end_byte - start_byte) as isize;
-            if delta != 0 {
-                for offset in self
-                    .line_offsets
-                    .iter_mut()
-                    .chain(self.definitions.values_mut())
-                    .chain(self.definitions_by_id.iter_mut().map(|(_, offset)| offset))
-                    .chain(self.references.values_mut().flatten())
-                {
-                    if *offset >= old_end_byte {
-                        *offset = offset.checked_add_signed(delta).expect("offset shift fits");
-                    }
-                }
-            }
+        let edited = self.with_text_index(|index, text| {
+            edit_text_index(index, text, start_byte, &removed, replacement.len())
+        });
+        if !edited {
+            self.reload_text_index();
         }
-        Ok(keep_index)
-    }
-
-    fn reload_line_offsets(&mut self) {
-        self.line_offsets.clear();
-        self.line_offsets.push(0);
-        self.line_offsets.extend(
-            self.text
-                .bytes()
-                .enumerate()
-                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
-        );
-    }
-
-    fn can_keep_text_index(
-        &self,
-        range: Range,
-        start: usize,
-        end: usize,
-        replacement: &str,
-    ) -> bool {
-        if range.start.line != range.end.line || self.schema_end.is_none_or(|offset| start < offset)
-        {
-            return false;
-        }
-        let line_start = self.line_offsets[range.start.line as usize];
-        let line = &self.text[line_start..];
-        let prefix = line.len() - line.trim_start_matches([' ', '\t']).len();
-        let anchor = line_start + prefix;
-        let Some(digits) = self.text[anchor..].strip_prefix('#') else {
-            return false;
-        };
-        let length = digits.bytes().take_while(u8::is_ascii_digit).count();
-        let Ok(id) = digits[..length].parse::<u32>() else {
-            return false;
-        };
-        // A matching indexed definition certifies the scanner's lexical state at this byte.
-        self.definitions.get(&id) == Some(&anchor)
-            && index_neutral_edit(&self.text, anchor, start, end, replacement)
+        Ok(())
     }
 
     fn point_at_offset(&self, line: usize, offset: usize) -> Option<Point> {
@@ -373,6 +305,19 @@ impl Document {
 
         self.lazy = None;
         self.tree = DocumentTree::parse(parser, self.text.as_bytes(), old_tree);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_text_index_matches_scan(&self) {
+        let index = TextIndex {
+            line_offsets: self.line_offsets.clone(),
+            definitions: self.definitions.clone(),
+            definitions_by_id: self.definitions_by_id.clone(),
+            references: self.references.clone(),
+            schema_name: self.schema_name.clone(),
+            schema_end: self.schema_end,
+        };
+        assert!(index == scan_text(&self.text), "text index differs from a fresh scan");
     }
 
     #[cfg(test)]
@@ -1978,26 +1923,27 @@ mod tests {
         assert!(document.has_ast());
     }
 
-    fn assert_fresh_index(document: &Document) {
-        let fresh = scan_text(&document.text);
-        assert_eq!(
-            document.line_offsets, fresh.line_offsets,
-            "{}",
-            document.text
+    /// Whether `edit_text_index` handled the edit without a full rescan; asserts that its result
+    /// equals one when it did.
+    fn local_edit_matches_scan(text: &str, start: usize, end: usize, replacement: &str) -> bool {
+        let mut index = scan_text(text);
+        let mut edited = text.to_string();
+        edited.replace_range(start..end, replacement);
+        let local = edit_text_index(
+            &mut index,
+            &edited,
+            start,
+            &text.as_bytes()[start..end],
+            replacement.len(),
         );
-        assert_eq!(document.definitions, fresh.definitions, "{}", document.text);
-        assert_eq!(
-            document.definitions_by_id, fresh.definitions_by_id,
-            "{}",
-            document.text
-        );
-        assert_eq!(document.references, fresh.references, "{}", document.text);
-        assert_eq!(document.schema_name, fresh.schema_name, "{}", document.text);
-        assert_eq!(document.schema_end, fresh.schema_end, "{}", document.text);
+        if local {
+            assert_eq!(index, scan_text(&edited), "{text:?} {start}..{end} {replacement:?}");
+        }
+        local
     }
 
     #[test]
-    fn index_neutral_edits_match_full_scan_at_token_boundaries() {
+    fn edits_match_full_scan_at_token_boundaries() {
         let fixtures = [
             "FILE_SCHEMA(('IFC4'));\r\n#1 = IFCWALL('a''b😀\\X2\\00E4\\X0\\',12.34,#2); /* ab */\r\n#2=IFCDOOR(#1);",
             "FILE_SCHEMA /* x; */ (('IFC''4'));\n#1=ABC(#42949672960,1ABC,1FILE_SCHEMA,'a');#2=X(#1);",
@@ -2034,8 +1980,8 @@ mod tests {
                     }
                     for replacement in replacements {
                         let mut document = Document::new_unloaded(text.to_string());
-                        fast += usize::from(document.can_keep_text_index(
-                            range,
+                        fast += usize::from(local_edit_matches_scan(
+                            &document.text,
                             start,
                             end,
                             replacement,
@@ -2047,7 +1993,7 @@ mod tests {
                                 0,
                             )
                             .unwrap();
-                        assert_fresh_index(&document);
+                        document.assert_text_index_matches_scan();
                     }
                 }
             }
@@ -2100,12 +2046,12 @@ mod tests {
                     }
                     let replacement = replacements[random(replacements.len())];
                     fast +=
-                        usize::from(document.can_keep_text_index(range, start, end, replacement));
+                        usize::from(local_edit_matches_scan(&document.text, start, end, replacement));
                     let event = change(Some(range), replacement);
                     document
                         .apply_content_changes(&mut parser, std::slice::from_ref(&event), 0)
                         .unwrap();
-                    assert_fresh_index(&document);
+                    document.assert_text_index_matches_scan();
                     changes.push(event);
                 }
                 let mut batched = Document::new_unloaded(before);
@@ -2113,7 +2059,7 @@ mod tests {
                     .apply_content_changes(&mut parser, &changes, 0)
                     .unwrap();
                 assert_eq!(batched.text, document.text, "seed {seed}");
-                assert_fresh_index(&batched);
+                batched.assert_text_index_matches_scan();
             }
         }
         assert!(fast > 100);

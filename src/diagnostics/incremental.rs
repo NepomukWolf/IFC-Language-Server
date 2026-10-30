@@ -270,6 +270,7 @@ fn absolute(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -292,8 +293,10 @@ mod tests {
         }
     }
 
-    const EDITS: [&str; 10] = [
+    const EDITS: [&str; 12] = [
         "valid",
+        "comment",
+        "omitted",
         "syntax",
         "quote",
         "id",
@@ -422,6 +425,18 @@ mod tests {
             }
             "delete" => (start, (end + 1).min(text.len()), String::new()),
             "join" => (end, (end + 1).min(text.len()), String::new()),
+            "comment" => {
+                let at = match random.below(3) {
+                    0 => pick(random, b'\'')? + 1,
+                    1 => pick(random, b',').or_else(|| pick(random, b'('))? + 1,
+                    _ => end,
+                };
+                (at, at, ["*", "/", "/*", "*/"][random.below(4)].into())
+            }
+            "omitted" => {
+                let at = pick(random, b'$')?;
+                (at, at + 1, "*".into())
+            }
             "split" => {
                 let at = pick(random, b',')?;
                 (at + 1, at + 1, "\n  ".into())
@@ -432,7 +447,13 @@ mod tests {
 
     /// Applies `steps` random edits, sometimes several before collecting and sometimes as one
     /// multi-change event, and compares incremental diagnostics with a full revalidation.
-    fn check_random_edits(path: &Path, steps: usize, seed: u64) -> (usize, usize) {
+    /// Returns the incremental and other collections, and per edit kind applied alone how often
+    /// it was applied and how often it rebuilt the statement index.
+    fn check_random_edits(
+        path: &Path,
+        steps: usize,
+        seed: u64,
+    ) -> (usize, usize, BTreeMap<&'static str, (usize, usize)>) {
         let text = std::fs::read_to_string(path).expect("sample should be readable");
         let mut parser = parser();
         let mut document = Document::new_unloaded(text);
@@ -448,6 +469,7 @@ mod tests {
         document.reload_parse_state(&mut parser, 1);
         let mut random = Random(seed);
         let (mut incremental, mut fallbacks) = (0, 0);
+        let mut rebuilds = BTreeMap::<&'static str, (usize, usize)>::new();
         let mut collect = |document: &Document, step: &str| {
             let snapshot = DiagnosticSnapshot::from_document(document);
             let lazy = snapshot.lazy().expect("forced lazy path");
@@ -465,6 +487,12 @@ mod tests {
                 _ => fallbacks += 1,
             }
             diagnostics.extend(datatype);
+            document.assert_text_index_matches_scan();
+            assert!(
+                *lazy == handwritten::Document::parse(snapshot.text().as_bytes(), false),
+                "{} seed {seed} {step}: statement index differs from a fresh parse",
+                path.display()
+            );
             assert_eq!(
                 diagnostics,
                 full(&document.text, &schema, &schema_name),
@@ -505,9 +533,13 @@ mod tests {
                         .apply_content_changes(&mut parser, &std::mem::take(&mut changes), 1)
                         .expect("change should be valid");
                 } else {
+                    let generation = document.lazy_edits.generation;
                     document
                         .apply_content_changes(&mut parser, &[change], 1)
                         .expect("change should be valid");
+                    let entry = rebuilds.entry(kind).or_default();
+                    entry.0 += 1;
+                    entry.1 += usize::from(document.lazy_edits.generation != generation);
                 }
                 if random.below(5) == 0 {
                     stale = Some(DiagnosticSnapshot::from_document(&document));
@@ -536,7 +568,7 @@ mod tests {
                 assert_eq!(diagnostics, full(stale.text(), &schema, &schema_name));
             }
         }
-        (incremental, fallbacks)
+        (incremental, fallbacks, rebuilds)
     }
 
     fn lazy_document(text: &str) -> Document {
@@ -660,7 +692,7 @@ mod tests {
     fn random_edits_match_full_revalidation_on_samples() {
         for path in samples() {
             for seed in 1..=2 {
-                let (incremental, _) = check_random_edits(&path, 25, seed);
+                let (incremental, _, _) = check_random_edits(&path, 25, seed);
                 assert!(
                     incremental > 0,
                     "{} never took the incremental path",
@@ -684,9 +716,12 @@ mod tests {
         let files = std::env::var("IFC_INCREMENTAL_FILES").expect("IFC_INCREMENTAL_FILES");
         for path in files.split(':') {
             for seed in 1..=env("IFC_INCREMENTAL_SEEDS", 2) as u64 {
-                let (incremental, fallbacks) =
+                let (incremental, fallbacks, rebuilds) =
                     check_random_edits(Path::new(path), env("IFC_INCREMENTAL_STEPS", 50), seed);
-                eprintln!("{path} seed {seed}: incremental {incremental} other {fallbacks}");
+                eprintln!(
+                    "{path} seed {seed}: incremental {incremental} other {fallbacks} \
+                     single edits (applied, rebuilt) {rebuilds:?}"
+                );
             }
         }
     }

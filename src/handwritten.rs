@@ -259,14 +259,8 @@ impl Document {
             .partition_point(|s| s.span.start as usize <= edit.start + edit.delete_len)
             + 1)
         .min(self.statements.len());
-        let changed = removed;
-        let inserted = &new[edit.start..edit.start + edit.insert_len];
         if first >= last
             || edit.start < self.statements[first].span.start as usize
-            || changed.contains(&b'/')
-            || inserted.contains(&b'/')
-            || changed.contains(&b'*')
-            || inserted.contains(&b'*')
             || edit.start + edit.delete_len > self.statements[last - 1].span.end as usize
         {
             *self = Self::parse(new, self.retain);
@@ -286,7 +280,11 @@ impl Document {
         };
         let mut p = start;
         while p < end {
-            p = trivia(new, p, end);
+            let Some(after_trivia) = closed_trivia(new, p, end) else {
+                *self = Self::parse(new, self.retain);
+                return EditOutcome::Rebuilt;
+            };
+            p = after_trivia;
             if p == end {
                 break;
             }
@@ -330,10 +328,11 @@ impl Document {
         self.params.splice(a as usize..b as usize, local.params);
         let new_len = local.statements.len();
         self.statements.splice(first..last, local.statements);
+        // A replaced statement's error can end at `old_end` but never past it.
         self.errors
-            .retain(|e| e.span.end as usize <= start || e.span.start as usize > old_end);
+            .retain(|e| e.span.end as usize <= start || e.span.end as usize > old_end);
         for error in &mut self.errors {
-            if error.span.start as usize > old_end {
+            if error.span.end as usize > old_end {
                 error.span.shift(delta);
             }
         }
@@ -625,6 +624,20 @@ fn trivia(text: &[u8], mut p: usize, end: usize) -> usize {
     p
 }
 
+/// `trivia` up to `end`, or `None` when a comment that opens before `end` doesn't close before it.
+fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Option<usize> {
+    while p < end {
+        if text[p].is_ascii_whitespace() {
+            p += 1;
+        } else if text.get(p..p + 2) == Some(b"/*") {
+            p = p + 4 + text.get(p + 2..end)?.windows(2).position(|w| w == b"*/")?;
+        } else {
+            break;
+        }
+    }
+    Some(p)
+}
+
 fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
     if text.get(p) != Some(&b'#') {
         return false;
@@ -698,6 +711,8 @@ mod tests {
         for original in [
             b"DATA;\n#1=X(1);\n#2=Y('hello',(#1,3));\n#3=Z(3);\nENDSEC;".as_slice(),
             b"DATA;\n#1=X(1);\n#2=Y(2,\n#3=Z(3);\n#4=W(4);\nENDSEC;",
+            b"DATA;\n#1=X(1);\n#2=Y(2);/\n#3=Z(3);\n#4=W(4);\nENDSEC;",
+            b"DATA;\n#1=X(1);/* a */\n#2=Y('b/*',*,'*/c');\n/*\n#3=Z(3);\n*/#4=W(4);\nENDSEC;",
         ] {
             edits_match_full_parse(original);
         }
@@ -706,7 +721,7 @@ mod tests {
     fn edits_match_full_parse(original: &[u8]) {
         for retain in [true, false] {
             for start in 6..original.len() - 8 {
-                for insert in [b" ".as_slice(), b"X", b"'", b";", b"", b"/*"] {
+                for insert in [b" ".as_slice(), b"X", b"'", b";", b"", b"/*", b"*/", b"*", b"/"] {
                     let mut text = original.to_vec();
                     text.splice(start..start + 1, insert.iter().copied());
                     let mut doc = Document::parse(original, retain);
@@ -732,6 +747,44 @@ mod tests {
                     assert_eq!(doc, Document::parse(original, retain));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn only_comments_reaching_past_the_reparsed_statements_rebuild() {
+        let original = b"DATA;\n#1=X(1);\n#2=Y('a',$);\n#3=Z(3);\n#4=W(4);\nENDSEC;";
+        let string = original.iter().position(|b| *b == b'a').unwrap();
+        let dollar = original.iter().position(|b| *b == b'$').unwrap();
+        let after_two = string + 6;
+        for (start, delete_len, insert, local) in [
+            (string, 0, b"*".as_slice(), true),
+            (string, 0, b"/", true),
+            (string, 0, b"/*", true),
+            (string, 0, b"*/", true),
+            (dollar, 1, b"*", true),
+            (after_two, 0, b"/* c */", true),
+            (after_two, 0, b"/*", false),
+            (dollar, 1, b"*/*", false),
+        ] {
+            let mut text = original.to_vec();
+            text.splice(start..start + delete_len, insert.iter().copied());
+            let mut doc = Document::parse(original, false);
+            let outcome = doc.edit(
+                &original[start..start + delete_len],
+                &text,
+                Edit {
+                    start,
+                    delete_len,
+                    insert_len: insert.len(),
+                },
+            );
+            assert_eq!(
+                matches!(outcome, EditOutcome::Local { .. }),
+                local,
+                "{:?}",
+                std::str::from_utf8(&text)
+            );
+            assert_eq!(doc, Document::parse(&text, false));
         }
     }
 
