@@ -381,7 +381,7 @@ mod tests {
     fn parse_document(text: &str) -> Document {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
         Document::parse(&mut parser, text.to_string())
     }
@@ -560,6 +560,8 @@ mod tests {
                 "Unknown IFC entity `IFCDIRECTION` in the selected schema",
                 "IfcWall expects 0 attributes but found 2",
                 "Unknown IFC entity `IFCCARTESIANPOINT` in the selected schema",
+                "IfcWall expects 0 attributes but found 5",
+                "Unknown IFC entity `IFCDIRECTION` in the selected schema",
             ]
         );
     }
