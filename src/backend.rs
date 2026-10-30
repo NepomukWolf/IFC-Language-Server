@@ -1599,9 +1599,28 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn superseded_edits_never_publish_diagnostics() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    type ClientOutput = tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>;
+
+    async fn read_message(output: &mut ClientOutput) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let mut header = String::new();
+        output.read_line(&mut header).await.unwrap();
+        let length: usize = header
+            .trim()
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        header.clear();
+        output.read_line(&mut header).await.unwrap();
+        let mut body = vec![0; length];
+        output.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Serves a backend over an in-memory transport and completes the `initialize` exchange.
+    async fn serve_initialized() -> (Backend, ClientOutput, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncWriteExt, BufReader};
         let (service, socket) = LspService::new(Backend::new);
         let backend = service.inner().clone();
         let (client_io, server_io) = tokio::io::duplex(8192);
@@ -1618,25 +1637,13 @@ mod tests {
             )
             .await
             .unwrap();
-
-        async fn read_message(
-            output: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-        ) -> serde_json::Value {
-            let mut header = String::new();
-            output.read_line(&mut header).await.unwrap();
-            let length: usize = header
-                .trim()
-                .strip_prefix("Content-Length: ")
-                .unwrap()
-                .parse()
-                .unwrap();
-            header.clear();
-            output.read_line(&mut header).await.unwrap();
-            let mut body = vec![0; length];
-            output.read_exact(&mut body).await.unwrap();
-            serde_json::from_slice(&body).unwrap()
-        }
         assert_eq!(read_message(&mut output).await["id"], 1);
+        (backend, output, server)
+    }
+
+    #[tokio::test]
+    async fn superseded_edits_never_publish_diagnostics() {
+        let (backend, mut output, server) = serve_initialized().await;
         let uri = Url::parse("file:///tmp/superseded.ifc").unwrap();
         let permit = backend
             .diagnostic_scheduler
