@@ -22,7 +22,7 @@ fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnost
                 .partition_point(|statement| statement.span.start as usize <= start);
             let statement = statement_index.checked_sub(1).and_then(|index| {
                 let statement = lazy.statements[index];
-                (start <= statement.span.end as usize).then_some(statement)
+                (start < statement.span.end as usize).then_some(statement)
             });
             if let Some(statement) = statement {
                 if let Some(offset) = unclosed_quote(text.as_bytes(), statement.span.range()) {
@@ -50,6 +50,14 @@ fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnost
                 ) {
                     let mut diagnostics = Vec::new();
                     collect_error_nodes(tree.root_node(), &mut diagnostics);
+                    // A reparse in isolation that rejects the statement from its first byte
+                    // has lost where it went wrong; the statement index knows.
+                    if let [diagnostic] = diagnostics.as_mut_slice()
+                        && diagnostic.range.start == points[0]
+                        && start > span.start
+                    {
+                        diagnostic.range.start = crate::document::positions_of(text, [start])[0];
+                    }
                     return diagnostics;
                 }
             }
@@ -127,19 +135,27 @@ fn utf16_len(text: &str) -> u32 {
         .sum()
 }
 
+/// From the opening quote to the end of its line, before any `\r`.
 fn unclosed_string_diagnostic(
     text: &str,
     line: u32,
     line_start: usize,
     offset: usize,
 ) -> Diagnostic {
-    let column = text[line_start..offset]
-        .chars()
-        .map(|character| character.len_utf16() as u32)
-        .sum::<u32>();
+    let column = utf16_len(&text[line_start..offset]);
+    let line_end = memchr::memchr(b'\n', &text.as_bytes()[offset..])
+        .map_or(text.len(), |newline| offset + newline);
+    let line_end = if text[..line_end].ends_with('\r') {
+        line_end - 1
+    } else {
+        line_end
+    };
 
     Diagnostic {
-        range: Range::new(Position::new(line, column), Position::new(line, column + 1)),
+        range: Range::new(
+            Position::new(line, column),
+            Position::new(line, column + utf16_len(&text[offset..line_end])),
+        ),
         severity: Some(DiagnosticSeverity::ERROR),
         message: "Unclosed string; expected `'`".to_string(),
         ..Default::default()
@@ -273,9 +289,61 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].range,
-            Range::new(Position::new(0, 11), Position::new(0, 12))
+            Range::new(Position::new(0, 11), Position::new(0, 26))
         );
         assert_eq!(diagnostics[0].message, "Unclosed string; expected `'`");
+    }
+
+    #[test]
+    fn unclosed_string_range_counts_utf16_units_and_stops_before_crlf() {
+        let doc = parse_document("#1=X('y😀z,$);\r\n#2=IFCWALL('next');\r\n");
+        let ranges: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            ranges,
+            [(
+                Range::new(Position::new(0, 5), Position::new(0, 14)),
+                "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_a_stray_token_right_after_a_statement() {
+        let doc = parse_document("DATA;\n#1=IFCWALL($);q\r\n#2=IFCWALL($);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(1, 14), Position::new(1, 15)),
+                "Invalid IFC STEP syntax".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_statement_rejected_as_a_whole_is_reported_from_where_it_went_wrong() {
+        let doc =
+            parse_document("DATA;\n#4=IFCAXIS2PLACEMENT3DX#8,$,$);\n#8=IFCWALL($);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(1, 23), Position::new(1, 30)),
+                "Invalid IFC STEP syntax".to_string()
+            )]
+        );
     }
 
     #[test]
