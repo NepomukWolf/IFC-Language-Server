@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn node_at_position_finds_reference() {
-        let text = "#1=IFCWALL(#2,((#3)));";
+        let text = "#1=IFCWALL(#2,/* structured */$);";
         let document = parse_document(text);
 
         let node = document
@@ -1086,6 +1086,7 @@ mod tests {
             "#4=IFCX(\n  'a\nb',\n~#5,\n  (1,\n2), ( .A. , $ )\n);",
             "#5=IFCX(IFCBOOLEAN~(.T.),IFCINTEGER(-3),(IFCLABEL ( '' ),*));",
             "#6=IFCX(~);",
+            "#7=IFCX(((1.,2.),(3.,\n4.)),((#1),('a',IFCLABEL('b'),*),()),~$);",
         ];
         for case in cases {
             let compact = parse_document(&case.replace('~', " "));
