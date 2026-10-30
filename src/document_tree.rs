@@ -5,13 +5,23 @@ pub struct DocumentTree {
     compact: Tree,
     structured: Option<Tree>,
     omitted: Vec<Range>,
+    pub(crate) unclosed_strings: Vec<UnclosedString>,
+}
+
+/// A string whose closing quote is missing, reported at `quote`. Errors from `quote` to `end`
+/// follow from the text it swallowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnclosedString {
+    pub(crate) quote: usize,
+    pub(crate) end: usize,
 }
 
 impl DocumentTree {
     /// Parses with the compact grammar and, when that tree has errors, reparses only the text
     /// around them with the structured grammar, keeping error-free compact entities elsewhere.
     ///
-    /// Each error is widened by two `;`-terminated statements on each side. A structured error,
+    /// An error caused by an unclosed string is bounded to the lines of that string; any other
+    /// error is widened by two `;`-terminated statements on each side. A structured error,
     /// string, comment or entity that crosses a kept compact entity drops that entity and the
     /// reparse is repeated. The third attempt keeps no compact entities, so the worst case is
     /// two partial structured parses followed by one of the whole document.
@@ -26,6 +36,7 @@ impl DocumentTree {
             compact,
             structured: None,
             omitted: Vec::new(),
+            unclosed_strings: Vec::new(),
         };
         if !result.compact.root_node().has_error() {
             return Some(result);
@@ -39,7 +50,21 @@ impl DocumentTree {
             &mut errors,
             &mut entities,
         );
+        let odd_quotes = odd_quote_entities(text);
         for (start, end) in &mut errors {
+            let causing = causing_strings(text, &odd_quotes, *start);
+            let causes = &odd_quotes[causing.clone()];
+            if let (Some(first), Some(last)) = (causes.first(), causes.last()) {
+                result
+                    .unclosed_strings
+                    .extend(causing.clone().map(|index| UnclosedString {
+                        quote: odd_quotes[index].first_quote,
+                        end: swallowed_end(text, &odd_quotes, index),
+                    }));
+                *start = first.first_quote;
+                *end = line_end(text, last.last_quote);
+                continue;
+            }
             for _ in 0..2 {
                 *start = text[..*start]
                     .iter()
@@ -51,6 +76,10 @@ impl DocumentTree {
                     .map_or(text.len(), |offset| *end + offset + 1);
             }
         }
+        result
+            .unclosed_strings
+            .sort_unstable_by_key(|string| string.quote);
+        result.unclosed_strings.dedup();
         let errors = SortedSpans::new(errors);
         for node in entities {
             if !errors.any_touching(node.start_byte(), node.end_byte()) {
@@ -266,12 +295,174 @@ fn crossing_spans(node: Node<'_>, spans: &mut Vec<(usize, usize)>) {
     }
 }
 
+fn line_end(text: &[u8], start: usize) -> usize {
+    text[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(text.len(), |offset| start + offset)
+}
+
+/// An entity line whose quotes do not pair up.
+struct OddQuoteEntity {
+    start: usize,
+    first_quote: usize,
+    last_quote: usize,
+}
+
+fn odd_quote_entities(text: &[u8]) -> Vec<OddQuoteEntity> {
+    let mut entities = Vec::new();
+    let mut current = None;
+    let mut quote_count = 0;
+    let mut offset = 0;
+    let mut finish = |current: Option<OddQuoteEntity>, quote_count: usize| {
+        if quote_count % 2 == 1 {
+            entities.extend(current);
+        }
+    };
+    while offset < text.len() {
+        if is_entity_start(text, offset) {
+            finish(current.take(), quote_count);
+            current = Some(OddQuoteEntity {
+                start: offset,
+                first_quote: usize::MAX,
+                last_quote: usize::MAX,
+            });
+            quote_count = 0;
+        }
+        if quote_count % 2 == 0 && text[offset..].starts_with(b"/*") {
+            offset = memchr::memmem::find(&text[offset + 2..], b"*/")
+                .map_or(text.len(), |end| offset + end + 4);
+        } else if text[offset] == b'\'' {
+            if text.get(offset + 1) == Some(&b'\'') {
+                offset += 2;
+            } else {
+                if let Some(entity) = &mut current {
+                    if quote_count == 0 {
+                        entity.first_quote = offset;
+                    }
+                    entity.last_quote = offset;
+                }
+                quote_count += 1;
+                offset += 1;
+            }
+        } else if text[offset] == b'\n' {
+            offset += 1;
+        } else {
+            offset += 1;
+            offset +=
+                memchr::memchr3(b'\n', b'\'', b'/', &text[offset..]).unwrap_or(text.len() - offset);
+        }
+    }
+    finish(current, quote_count);
+    entities
+}
+
+/// The entities in `odd_quotes` whose unclosed string can explain an error starting at
+/// `error_start`: the nearest entity starting at or before it, and the earlier ones whose string
+/// swallows text up to it.
+fn causing_strings(
+    text: &[u8],
+    odd_quotes: &[OddQuoteEntity],
+    error_start: usize,
+) -> std::ops::Range<usize> {
+    let last = odd_quotes.partition_point(|entity| entity.start <= error_start);
+    let mut first = last;
+    while first > 0 && swallowed_end(text, odd_quotes, first - 1) >= error_start {
+        first -= 1;
+    }
+    first..last
+}
+
+/// End of the text affected by the unclosed string of the entity at `index`. Each entity in
+/// `odd_quotes` flips which quotes open strings, so the text from an entity at an even index to
+/// the end of the next one's line is read out of phase; with no next one, everything up to the
+/// last quote is. Error recovery resumes only after the statement that follows.
+fn swallowed_end(text: &[u8], odd_quotes: &[OddQuoteEntity], index: usize) -> usize {
+    let entity = &odd_quotes[index];
+    let last_quote = if index % 2 == 1 {
+        entity.last_quote
+    } else if let Some(next) = odd_quotes.get(index + 1) {
+        next.last_quote
+    } else {
+        entity.last_quote
+            + memchr::memrchr(b'\'', &text[entity.last_quote..])
+                .expect("the entity's own last quote")
+    };
+    let out_of_phase = line_end(text, last_quote);
+    memchr::memchr(b';', &text[out_of_phase..]).map_or(text.len(), |semicolon| {
+        line_end(text, out_of_phase + semicolon)
+    })
+}
+
+fn is_entity_start(text: &[u8], offset: usize) -> bool {
+    if offset > 0 && text[offset - 1] != b'\n' {
+        return false;
+    }
+    if text.get(offset) != Some(&b'#') {
+        return false;
+    }
+    let mut end = offset + 1;
+    while text.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    text.get(end) == Some(&b'=')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diagnostics::{DiagnosticSnapshot, syntax};
     use crate::document::Document;
     use crate::document::build_entity_instances;
+
+    fn unclosed_quotes(text: &[u8], error_start: usize) -> Vec<usize> {
+        let odd_quotes = odd_quote_entities(text);
+        odd_quotes[causing_strings(text, &odd_quotes, error_start)]
+            .iter()
+            .map(|entity| entity.first_quote)
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_opening_quote_of_an_unclosed_string() {
+        assert_eq!(unclosed_quotes(b"#1=IFCWALL('Anna's wall');", 0), [11]);
+        assert!(unclosed_quotes(b"#1=IFCWALL('line\none');", 0).is_empty());
+        assert!(unclosed_quotes(b"#1=IFCWALL('escaped '' quote');", 0).is_empty());
+        assert_eq!(unclosed_quotes(b"#1=X('a/b');\n#2=X('c);", 14), [18]);
+        assert!(unclosed_quotes(b"/* it's\n#9=X(' */\n#1=X('a');", 0).is_empty());
+        assert_eq!(unclosed_quotes(b"/* it's\n#9=X(' */\n#1=X('a);", 25), [23]);
+        assert_eq!(unclosed_quotes(b"#1=X('a' /x/ 'b);\n#2=X('');", 0), [5]);
+        assert_eq!(unclosed_quotes(b"#1=X('a);\n/* x */#2=X('b');", 0), [5]);
+        assert_eq!(unclosed_quotes(b"#1=X('a /* b');\n#2=X('c);", 22), [21]);
+    }
+
+    #[test]
+    fn a_comment_opener_inside_a_string_does_not_hide_quotes_up_to_a_later_closer() {
+        let text = b"#1=X('a /* b');\n#2=X('c);\n#3=X('d */');\n";
+        assert_eq!(unclosed_quotes(text, 21), [21]);
+    }
+
+    #[test]
+    fn finds_every_unclosed_string_that_explains_an_error() {
+        let text = b"#1=X('a);\n#2=X(1);\n#3=X('b);\n";
+        assert_eq!(unclosed_quotes(text, 0), [5]);
+        assert_eq!(unclosed_quotes(text, 25), [5, 24]);
+        let far = b"#1=X('a);\n#2=X(1);\n#3=X(2)\n#4=X(3);\n";
+        assert!(unclosed_quotes(far, 27).is_empty());
+    }
+
+    #[test]
+    fn an_unclosed_string_affects_text_up_to_the_statement_after_the_next_one() {
+        let text = "#1=X('a);\n#2=X('b','c');\n#3=X('d');\n#4=X('e);\n#5=X(1);\n#6=X('f');\n";
+        let odd_quotes = odd_quote_entities(text.as_bytes());
+        let ends: Vec<_> = (0..odd_quotes.len())
+            .map(|index| swallowed_end(text.as_bytes(), &odd_quotes, index))
+            .collect();
+        let line_end = |entity: &str| {
+            text.find(entity).unwrap() + text[text.find(entity).unwrap()..].find('\n').unwrap()
+        };
+        assert_eq!(ends, [line_end("#5="), line_end("#5=")]);
+    }
 
     #[test]
     fn recovery_collects_only_outermost_errors_and_error_free_entities() {
@@ -352,12 +543,22 @@ mod tests {
                 compact: parser.parse(text.as_bytes(), None).unwrap(),
                 structured: None,
                 omitted: Vec::new(),
+                unclosed_strings: Vec::new(),
             });
-            assert_eq!(
-                syntax::collect(&DiagnosticSnapshot::from_document(&local)),
-                syntax::collect(&DiagnosticSnapshot::from_document(&whole)),
-                "{broken}"
-            );
+            let local_diagnostics = syntax::collect(&DiagnosticSnapshot::from_document(&local));
+            if broken.contains("unclosed") || broken.contains("Anna") {
+                assert_eq!(local_diagnostics.len(), 1, "{local_diagnostics:?}");
+                assert_eq!(
+                    local_diagnostics[0].message,
+                    "Unclosed string; expected `'`"
+                );
+            } else {
+                assert_eq!(
+                    local_diagnostics,
+                    syntax::collect(&DiagnosticSnapshot::from_document(&whole)),
+                    "{broken}"
+                );
+            }
             assert_eq!(
                 build_entity_instances(local.tree.as_ref(), &text).instances,
                 build_entity_instances(whole.tree.as_ref(), &text).instances,
