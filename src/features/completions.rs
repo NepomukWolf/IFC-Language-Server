@@ -77,7 +77,7 @@ fn next_id_completion(
     position: Position,
     offset: usize,
 ) -> Option<CompletionItem> {
-    if entity_argument_context(&document.text, offset).is_some() {
+    if entity_argument_context(&document.text, &document.definitions, offset).is_some() {
         return None;
     }
 
@@ -240,7 +240,8 @@ fn argument_completions(
     snippet_supported: bool,
     eager_documentation: bool,
 ) -> CompletionResults {
-    let Some(context) = entity_argument_context(&document.text, offset) else {
+    let Some(context) = entity_argument_context(&document.text, &document.definitions, offset)
+    else {
         return empty_results();
     };
     let Some(entity) = schema.entity(&context.entity_name) else {
