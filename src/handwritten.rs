@@ -142,7 +142,14 @@ impl Document {
                         depth: 0,
                     };
                     let result = reader.list(Kind::List).and_then(|()| reader.expect(b';'));
-                    if let Err(error) = result {
+                    if let Err(mut error) = result {
+                        if error.message == "expected (" {
+                            error.span = Span {
+                                start: start as u32,
+                                end: word_end.max(start + 1) as u32,
+                            };
+                            error.message = "unexpected token";
+                        }
                         doc.errors.push(error);
                     }
                     doc.params.truncate(saved);
@@ -207,6 +214,10 @@ impl Document {
                 start: name_start as u32,
                 end: r.p as u32,
             };
+            if text[name_start..r.p].iter().any(u8::is_ascii_lowercase) {
+                r.p = name_start;
+                return Err(r.error("expected entity name"));
+            }
             r.list(Kind::List)?;
             r.expect(b';')?;
             if trivia(text, r.p, end) != end {
@@ -415,15 +426,23 @@ impl Reader<'_, '_> {
         }
     }
     fn expect(&mut self, byte: u8) -> Result<(), ParseError> {
+        let before_trivia = self.p;
         self.p = trivia(self.text, self.p, self.end);
         if self.p >= self.end || self.text[self.p] != byte {
-            return Err(self.error(match byte {
+            let mut error = self.error(match byte {
                 b'(' => "expected (",
                 b')' => "expected )",
                 b';' => "expected ;",
                 b'=' => "expected =",
                 _ => "expected delimiter",
-            }));
+            });
+            if byte == b';' {
+                error.span.start = before_trivia as u32;
+                error.span.end = before_trivia as u32;
+            } else if byte == b')' && self.text.get(self.p) == Some(&b';') {
+                error.span.end = error.span.start;
+            }
+            return Err(error);
         }
         self.p += 1;
         Ok(())
@@ -516,6 +535,15 @@ impl Reader<'_, '_> {
                 if quote == b'\'' {
                     Kind::String
                 } else {
+                    let content = &self.text[start + 1..self.p - 1];
+                    if content
+                        .first()
+                        .is_none_or(|byte| !matches!(byte, b'0'..=b'3'))
+                        || !content[1..].iter().all(u8::is_ascii_hexdigit)
+                    {
+                        self.p = start;
+                        return Err(self.error("invalid binary"));
+                    }
                     Kind::Binary
                 }
             }
@@ -545,6 +573,13 @@ impl Reader<'_, '_> {
             {
                 self.p += 1;
                 self.name()?;
+                if self.text[start + 1..self.p]
+                    .iter()
+                    .any(u8::is_ascii_lowercase)
+                {
+                    self.p = start;
+                    return Err(self.error("invalid enumeration"));
+                }
                 if self.text.get(self.p) != Some(&b'.') {
                     return Err(self.error("unclosed enumeration"));
                 }

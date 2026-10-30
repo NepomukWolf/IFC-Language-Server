@@ -410,12 +410,9 @@ fn is_entity_start(text: &[u8], offset: usize) -> bool {
     text.get(end) == Some(&b'=')
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostics::{DiagnosticSnapshot, syntax};
-    use crate::document::Document;
-    use crate::test_support::build_entity_instances;
 
     fn unclosed_quotes(text: &[u8], error_start: usize) -> Vec<usize> {
         let odd_quotes = odd_quote_entities(text);
@@ -425,7 +422,6 @@ mod tests {
             .collect()
     }
 
-    #[cfg(any())]
     #[test]
     fn finds_the_opening_quote_of_an_unclosed_string() {
         assert_eq!(unclosed_quotes(b"#1=IFCWALL('Anna's wall');", 0), [11]);
@@ -531,18 +527,17 @@ mod tests {
                     .collect::<String>()
             );
             let mut parser = Parser::new();
-            let local = Document::parse(&mut parser, text.clone());
+            let local = DocumentTree::parse(&mut parser, text.as_bytes(), None).unwrap();
             parser
                 .set_language(&tree_sitter_ifc::LANGUAGE_STRUCTURED.into())
                 .unwrap();
-            let mut whole = Document::new_unloaded(text.clone());
-            whole.tree = Some(DocumentTree {
+            let whole = DocumentTree {
                 compact: parser.parse(text.as_bytes(), None).unwrap(),
                 structured: None,
                 omitted: Vec::new(),
                 unclosed_strings: Vec::new(),
-            });
-            let local_diagnostics = syntax::collect(&DiagnosticSnapshot::from_document(&local));
+            };
+            let local_diagnostics = crate::diagnostics::syntax::collect_tree_oracle(&local, &text);
             if broken.contains("unclosed") || broken.contains("Anna") {
                 assert_eq!(local_diagnostics.len(), 1, "{local_diagnostics:?}");
                 assert_eq!(
@@ -552,23 +547,21 @@ mod tests {
             } else {
                 assert_eq!(
                     local_diagnostics,
-                    syntax::collect(&DiagnosticSnapshot::from_document(&whole)),
+                    crate::diagnostics::syntax::collect_tree_oracle(&whole, &text),
                     "{broken}"
                 );
             }
-            assert_eq!(
-                build_entity_instances(local.tree.as_ref(), &text).instances,
-                build_entity_instances(whole.tree.as_ref(), &text).instances,
-                "{broken}"
-            );
+            let instances = |tree: &DocumentTree| {
+                let mut instances = Vec::new();
+                crate::document::for_each_entity_node(Some(tree), |node| {
+                    instances.extend(crate::document::parse_entity_instance(node, &text));
+                });
+                instances
+            };
+            assert_eq!(instances(&local), instances(&whole), "{broken}");
             for offset in (0..text.len()).filter(|&offset| text.is_char_boundary(offset)) {
-                let context = |document: &Document| {
-                    let node = document
-                        .tree
-                        .as_ref()
-                        .unwrap()
-                        .node_at_offset(offset)
-                        .unwrap();
+                let context = |tree: &DocumentTree| {
+                    let node = tree.node_at_offset(offset).unwrap();
                     (
                         crate::step::ast::parameter_context(node, offset, &text),
                         crate::step::ast::omitted_value_span(node, offset, &text),

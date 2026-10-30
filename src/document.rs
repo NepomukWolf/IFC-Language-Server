@@ -300,7 +300,13 @@ impl Document {
             .statements
             .iter()
             .position(|statement| statement.span.start as usize == definition_offset)?;
-        lazy_entity_instance_relative(lazy, &self.text, index)
+        let mut points = LinePoints {
+            text: self.text.as_bytes(),
+            offset: 0,
+            row: 0,
+            line_start: 0,
+        };
+        lazy_entity_instance(lazy, &self.text, index, &mut points)
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -641,8 +647,31 @@ fn lazy_entity_instance(
         .errors
         .get(first_error)
         .is_some_and(|error| span.contains(&(error.span.start as usize)))
-        || statement.name.end == 0
     {
+        let start = points.position(span.start);
+        let end = points.position(span.end);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE_STRUCTURED.into())
+            .expect("IFC ABI");
+        parser
+            .set_included_ranges(&[tree_sitter::Range {
+                start_byte: span.start,
+                end_byte: span.end,
+                start_point: Point::new(start.line as usize, start.character as usize),
+                end_point: Point::new(end.line as usize, end.character as usize),
+            }])
+            .expect("statement range");
+        let tree = parser.parse(text, None)?;
+        let mut instance = None;
+        visit_entity_nodes(&mut tree.root_node().walk(), &mut |node| {
+            if instance.is_none() {
+                instance = parse_entity_instance(node, text);
+            }
+        });
+        return instance;
+    }
+    if statement.name.end == 0 {
         return None;
     }
     let tape = lazy.decode(text.as_bytes(), index);
@@ -1260,11 +1289,10 @@ fn point_after_text(start: Point, text: &str) -> Point {
 }
 
 //*----- TESTS BEGIN HERE -----*
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::build_entity_instances;
-    use tree_sitter::Tree;
 
     fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
@@ -1286,7 +1314,7 @@ mod tests {
     #[test]
     fn numeric_aggregate_preserves_values_and_multiline_ranges() {
         let document = parse_document("#1=IFCCARTESIANPOINT(( 1.25,\n -2E-3, .75 ));");
-        let instances = build_entity_instances(document.tree.as_ref(), &document.text);
+        let instances = instances(&document);
         let ParameterValue::List { items, range } = &instances.instances[0].parameters[0] else {
             panic!("coordinate aggregate expected");
         };
@@ -1316,7 +1344,7 @@ mod tests {
     #[test]
     fn reference_aggregate_preserves_ranges_and_overflow() {
         let document = parse_document("#1=IFCPOLYLINE((#12,\n #4294967296,#3));");
-        let instances = build_entity_instances(document.tree.as_ref(), &document.text);
+        let instances = instances(&document);
         let ParameterValue::List { items, .. } = &instances.instances[0].parameters[0] else {
             panic!("reference aggregate expected");
         };
@@ -1339,7 +1367,7 @@ mod tests {
     }
 
     fn instances(document: &Document) -> EntityInstanceCollection {
-        build_entity_instances(document.tree.as_ref(), &document.text)
+        build_entity_instances(document.lazy.as_deref(), &document.text)
     }
 
     fn position_at(text: &str, needle: &str) -> Position {
@@ -1351,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_cache_reuses_instances_only_for_the_same_text_and_tree_state() {
+    fn instance_cache_reuses_instances_only_for_the_same_text_and_parse_state() {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_ifc::LANGUAGE.into())
@@ -1360,7 +1388,7 @@ mod tests {
         let cache = EntityInstanceCache::default();
 
         let build = |document: &Document| {
-            cache.get_or_build_with(document.tree.is_some(), &document.text, || {
+            cache.get_or_build_with(document.is_parse_state_loaded(), &document.text, || {
                 instances(document)
             })
         };
@@ -1440,12 +1468,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_builds_text_index_and_ast_state() {
+    fn parse_builds_text_index_and_lazy_state() {
         let text = "#1=IFCWALL($);";
         let document = parse_document(text);
 
         assert_eq!(document.text.as_str(), text);
-        assert!(document.tree.is_some());
+        assert!(document.lazy.is_some());
         assert_eq!(document.schema_name, None);
         assert_eq!(document.definitions.get(&1), Some(&0));
         assert_eq!(document.references.get(&1), Some(&vec![0]));
@@ -1464,15 +1492,11 @@ mod tests {
         let text = "#1=IFCWALL($);";
         let document = parse_document(text);
 
-        let node = document
-            .node_at_position(position_at(text, "IFCWALL"))
-            .expect("entity_name node should exist");
-
-        assert_eq!(node.kind(), "entity_name");
-        assert_eq!(
-            node.utf8_text(document.text.as_bytes()).ok(),
-            Some("IFCWALL")
-        );
+        let (name, range) = document
+            .entity_name_at_position(position_at(text, "IFCWALL"))
+            .expect("entity name should exist");
+        assert_eq!(name, "IFCWALL");
+        assert_eq!(range, Range::new(Position::new(0, 3), Position::new(0, 10)));
     }
 
     #[test]
@@ -1480,24 +1504,18 @@ mod tests {
         let text = "#1=IFCWALL(#2,/* structured */$);";
         let document = parse_document(text);
 
-        let node = document
-            .node_at_position(position_at(text, "#2"))
-            .expect("reference node should exist");
-
-        assert_eq!(node.kind(), "reference");
-        assert_eq!(node.utf8_text(document.text.as_bytes()).ok(), Some("#2"));
-    }
-
-    fn contains_compact(node: Node<'_>) -> bool {
-        node.kind() == "compact_parameter_list"
-            || compact::is_compact_entity(node)
-            || node.children(&mut node.walk()).any(contains_compact)
+        assert_eq!(
+            document.id_token_at_position(position_at(text, "#2")),
+            Some((2, 11))
+        );
+        assert_eq!(
+            document.id_range_at_offset(11),
+            Some(Range::new(Position::new(0, 11), Position::new(0, 13)))
+        );
     }
 
     #[test]
     fn compact_parameter_lists_match_structured_parsing() {
-        // `~` becomes a space in the compact text and a form feed, which the compact token does
-        // not accept, in the structured text, so both parse at identical offsets.
         let cases = [
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL~('it''s'),*);",
             "#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.~);",
@@ -1516,31 +1534,101 @@ mod tests {
         for case in texts {
             let compact = parse_document(&case.replace('~', " "));
             let structured = parse_document(&case.replace('~', "\u{c}"));
-            let compact_root = compact.tree.as_ref().unwrap().root_node();
-            let structured_root = structured.tree.as_ref().unwrap().root_node();
-            assert!(contains_compact(compact_root), "{case}");
-            assert!(!contains_compact(structured_root), "{case}");
+            let mut parser = Parser::new();
+            let oracle = DocumentTree::parse(&mut parser, structured.text.as_bytes(), None)
+                .expect("tree oracle parses");
+            let mut expected = Vec::new();
+            for_each_entity_node(Some(&oracle), |node| {
+                expected.extend(parse_entity_instance(node, &structured.text));
+            });
+            assert_eq!(instances(&compact).instances, expected, "{case}");
+            assert!(compact.lazy.as_ref().unwrap().errors.is_empty(), "{case}");
             assert!(
-                !compact_root.has_error() && !structured_root.has_error(),
+                structured.lazy.as_ref().unwrap().errors.is_empty(),
                 "{case}"
             );
             assert_eq!(
-                build_entity_instances(compact.tree.as_ref(), &compact.text).instances,
-                build_entity_instances(structured.tree.as_ref(), &structured.text).instances,
+                instances(&compact).instances,
+                instances(&structured).instances,
                 "{case}"
             );
 
             for offset in 0..=case.len() {
                 let position = compact.offset_to_position(offset).unwrap();
                 let lookup = |document: &Document| {
-                    let node = document.node_at_position(position)?;
+                    let lazy = document.lazy.as_ref().unwrap();
+                    let context = lazy.statements.iter().enumerate().find_map(|(index, s)| {
+                        let tape = lazy.decode(document.text.as_bytes(), index);
+                        let mut slot = 1;
+                        let mut parameter_index = 0;
+                        while slot < tape.len() {
+                            let p = tape[slot];
+                            if p.span.range().contains(&offset) {
+                                return Some((
+                                    s.id,
+                                    document.text[s.name.range()].to_ascii_uppercase(),
+                                    parameter_index,
+                                ));
+                            }
+                            slot = p.next as usize;
+                            parameter_index += 1;
+                        }
+                        None
+                    });
+                    let mut omitted = None;
+                    let mut typed_name = None;
+                    for index in 0..lazy.statements.len() {
+                        for p in lazy.decode(document.text.as_bytes(), index) {
+                            if !p.span.range().contains(&offset) {
+                                continue;
+                            }
+                            if p.kind == handwritten::Kind::Omitted {
+                                omitted = Some((p.span.start, p.span.end));
+                            }
+                            if p.kind == handwritten::Kind::Typed {
+                                let start = p.span.start as usize;
+                                let source = &document.text[p.span.range()];
+                                let end =
+                                    start + source[..source.find('(').unwrap()].trim_end().len();
+                                if offset < end {
+                                    typed_name = Some((start, end));
+                                }
+                            }
+                        }
+                    }
                     Some((
-                        crate::step::ast::parameter_context(node, offset, &document.text),
-                        crate::step::ast::omitted_value_span(node, offset, &document.text),
-                        crate::step::ast::typed_value_name_span(node, offset, &document.text),
+                        context,
+                        omitted,
+                        typed_name,
+                        document.entity_name_at_position(position),
+                        document.id_token_at_position(position),
+                        instances(document)
+                            .instances
+                            .into_iter()
+                            .flat_map(|i| i.parameters)
+                            .filter(|p| p.range().start <= position && position < p.range().end)
+                            .collect::<Vec<_>>(),
                     ))
                 };
                 assert_eq!(lookup(&compact), lookup(&structured), "{case} at {offset}");
+                let actual = lookup(&compact).unwrap();
+                let node = oracle.node_at_offset(offset).unwrap();
+                let context = crate::step::ast::parameter_context(node, offset, &structured.text)
+                    .map(|context| {
+                        (
+                            context.instance_id,
+                            context.entity_name,
+                            context.parameter_index,
+                        )
+                    });
+                let omitted = crate::step::ast::omitted_value_span(node, offset, &structured.text)
+                    .map(|(start, end)| (start as u32, end as u32));
+                let typed = crate::step::ast::typed_value_name_span(node, offset, &structured.text);
+                assert_eq!(
+                    (actual.0, actual.1, actual.2),
+                    (context, omitted, typed),
+                    "{case} at {offset}"
+                );
             }
         }
     }
@@ -1549,7 +1637,7 @@ mod tests {
     fn lowercase_names_are_accepted_only_for_typed_values() {
         let document =
             parse_document("DATA;#1=IFCX(ifclabel('a'),ifcCountMeasure(3),typed_1(.T.));ENDSEC;");
-        assert!(!document.tree.as_ref().unwrap().root_node().has_error());
+        assert!(document.lazy.as_ref().unwrap().errors.is_empty());
         let collection = instances(&document);
         let names: Vec<_> = collection.instances[0]
             .parameters
@@ -1566,38 +1654,16 @@ mod tests {
             "DATA;#1=X(_typed(.T.));ENDSEC;",
         ] {
             let rejected = parse_document(text);
-            assert!(rejected.tree.as_ref().unwrap().root_node().has_error());
+            assert!(!rejected.lazy.as_ref().unwrap().errors.is_empty(), "{text}");
         }
-    }
-
-    fn node_spans(tree: &Tree) -> Vec<(String, usize, usize)> {
-        fn visit(node: Node<'_>, spans: &mut Vec<(String, usize, usize)>) {
-            spans.push((node.kind().to_string(), node.start_byte(), node.end_byte()));
-            for child in node.children(&mut node.walk()) {
-                visit(child, spans);
-            }
-        }
-        let mut spans = Vec::new();
-        visit(tree.root_node(), &mut spans);
-        spans
     }
 
     #[test]
-    fn documents_with_syntax_errors_keep_the_structured_tree() {
-        let structured_spans = |text: &str| {
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_ifc::LANGUAGE_STRUCTURED.into())
-                .unwrap();
-            node_spans(&parser.parse(text, None).unwrap())
-        };
+    fn documents_with_syntax_errors_recover_after_edit_and_regress_after_undo() {
         let invalid = "DATA;\n#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL'x'),$);\n#2=IFCPROPERTYSET('g',#3,'n',$,(#1));\nENDSEC;\n";
         let mut parser = Parser::new();
         let mut document = parse_document(invalid);
-        assert_eq!(
-            node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
-            structured_spans(invalid)
-        );
+        assert!(!document.lazy.as_ref().unwrap().errors.is_empty());
 
         let label = Position::new(1, 43);
         let edit = |range: Range, text: &str| vec![change(Some(range), text)];
@@ -1608,9 +1674,8 @@ mod tests {
                 DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             )
             .unwrap();
-        let root = document.tree.as_ref().unwrap().root_node();
-        assert!(!root.has_error());
-        assert!(contains_compact(root));
+        assert!(document.lazy.as_ref().unwrap().errors.is_empty());
+        assert_eq!(instances(&document).instances.len(), 2);
 
         document
             .apply_content_changes(
@@ -1620,9 +1685,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(document.text.as_str(), invalid);
+        assert!(!document.lazy.as_ref().unwrap().errors.is_empty());
         assert_eq!(
-            node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
-            structured_spans(invalid)
+            document.lazy.as_deref(),
+            Some(&handwritten::Document::parse(invalid.as_bytes(), false))
         );
     }
 
@@ -1656,6 +1722,10 @@ mod tests {
             .expect("instance should exist");
 
         assert_eq!(instance.entity_name, "IFCDOOR");
+        assert_eq!(
+            instance.entity_range,
+            Range::new(Position::new(1, 0), Position::new(1, 14))
+        );
     }
 
     #[test]
@@ -1707,7 +1777,7 @@ mod tests {
         let mut document =
             Document::new_unloaded("DATA;\n#1=IFCWALL('a');\n#2=IFCSLAB($);\nENDSEC;\n".into());
         document.reload_parse_state(&mut parser, 1);
-        assert!(!document.has_ast() && document.ast_skipped);
+        assert!(!document.has_ast() && document.lazy.is_some());
 
         let edits = [
             (Position::new(1, 11), Position::new(1, 13), "'b"),
@@ -1737,7 +1807,8 @@ mod tests {
         document
             .apply_content_changes(&mut parser, &[change(None, "#1=IFCWALL($);")], 1024)
             .expect("change should be valid");
-        assert!(document.lazy.is_none() && document.has_ast());
+        assert!(document.lazy.is_some() && !document.has_ast());
+        assert_eq!(instances(&document).instances[0].entity_name, "IFCWALL");
     }
 
     #[test]
@@ -1765,7 +1836,7 @@ mod tests {
         assert_eq!(document.text.as_str(), "#1=IFCSLAB(#2,$);");
         assert_eq!(document.references.get(&2), Some(&vec![11]));
         assert_eq!(instances(&document).instances[0].entity_name, "IFCSLAB");
-        assert!(document.has_ast());
+        assert!(document.is_parse_state_loaded());
     }
 
     #[test]
@@ -1785,7 +1856,7 @@ mod tests {
             .expect("change should be valid");
 
         assert_eq!(document.text.as_str(), "#1=IFCWALL('door');");
-        assert!(document.has_ast());
+        assert!(document.is_parse_state_loaded());
     }
 
     #[test]
@@ -1810,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_change_respects_ast_size_limit_transitions() {
+    fn incremental_change_keeps_lazy_state_across_legacy_size_limit_transitions() {
         let mut document = parse_document("#1=IFCWALL($);");
         let mut parser = Parser::new();
         parser
@@ -1820,14 +1891,16 @@ mod tests {
         document
             .apply_content_changes(&mut parser, &[change(None, "large")], 4)
             .expect("change should be valid");
-        assert!(document.ast_skipped);
+        assert!(document.is_parse_state_loaded());
         assert!(!document.has_ast());
+        assert!(instances(&document).instances.is_empty());
 
         document
             .apply_content_changes(&mut parser, &[change(None, "#1=IFCWALL($);")], 1024)
             .expect("change should be valid");
         assert!(!document.ast_skipped);
-        assert!(document.has_ast());
+        assert!(document.is_parse_state_loaded());
+        assert_eq!(instances(&document).instances[0].entity_name, "IFCWALL");
     }
 
     #[test]
@@ -1872,7 +1945,7 @@ mod tests {
         assert_eq!(document.text.as_str(), "#1=IFCWALL($);");
         assert!(document.definitions.contains_key(&1));
         assert_eq!(instances(&document).instances[0].entity_name, "IFCWALL");
-        assert!(document.has_ast());
+        assert!(document.is_parse_state_loaded());
     }
 
     /// Whether `edit_text_index` handled the edit without a full rescan; asserts that its result
@@ -2062,8 +2135,6 @@ mod tests {
             })
             .collect();
 
-        // Known limitation: the stray quote after `g` opens a string that is never closed, so
-        // #8 and #9 are not discovered.
         assert_eq!(
             discovered,
             [
@@ -2074,6 +2145,7 @@ mod tests {
                 (Some(5), "IFCDIRECTION", 1),
                 (Some(6), "IFCWALL", 2),
                 (Some(7), "IFCCARTESIANPOINT", 1),
+                (Some(9), "IFCDIRECTION", 1),
             ]
         );
     }

@@ -534,7 +534,23 @@ mod tests {
     ) -> Vec<Diagnostic> {
         let lazy = document.lazy.as_deref().expect("document has lazy index");
         let lazy_types = crate::document::lazy_entity_type_index(lazy, &document.text);
-        collect_lazy(lazy, &document.text, &lazy_types, schema, schema_name)
+        let diagnostics = collect_lazy(lazy, &document.text, &lazy_types, schema, schema_name);
+        let mut parser = Parser::new();
+        let tree =
+            crate::document_tree::DocumentTree::parse(&mut parser, document.text.as_bytes(), None)
+                .expect("tree oracle parses");
+        let types = crate::document::build_entity_type_index(Some(&tree), &document.text);
+        let mut expected = Vec::new();
+        crate::document::for_each_entity_node(Some(&tree), |node| {
+            if let Some(instance) = crate::document::parse_entity_instance(node, &document.text) {
+                validate(&types, schema, schema_name, &instance, &mut expected);
+            }
+        });
+        assert_eq!(
+            diagnostics, expected,
+            "lazy diagnostics differ from tree oracle"
+        );
+        diagnostics
     }
 
     /// Helper function to load a schema from a fixture source string.
@@ -572,6 +588,29 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
         assert!(diagnostics[0].message.contains("expected string"));
+    }
+
+    #[test]
+    fn datatype_validation_recovers_parameters_before_inside_and_after_a_syntax_error() {
+        let doc = parse_document(concat!(
+            "#1=IFCWALL(123,.MOVABLE.);\n",
+            "#2=IFCWALL(456,.MOVABLE.;\n",
+            "#3=IFCWALL(789,.MOVABLE.);\n",
+        ));
+        let diagnostics = collect(&doc, &test_schema(), None);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| d.range.start.line)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.message.contains("expected string"))
+        );
     }
 
     /// Test that the datatype validator accepts valid values.

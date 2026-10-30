@@ -624,4 +624,5 @@ fn symbol_kind(class: Option<Class>) -> SymbolKind {
     }
 }
 
-// The previous tree-backed outline tests were removed with the document tree.
+#[cfg(test)]
+mod tests;

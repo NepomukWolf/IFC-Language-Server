@@ -124,7 +124,7 @@ mod tests {
                         tower_lsp::lsp_types::Position::new(2, 11),
                         tower_lsp::lsp_types::Position::new(2, 12),
                     ),
-                    "Invalid IFC STEP syntax; expected (",
+                    "Invalid IFC STEP syntax",
                 ),
             ]
         );

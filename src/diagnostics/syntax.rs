@@ -12,33 +12,76 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
 }
 
 fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnostic> {
-    let mut line = 0;
-    let mut line_start = 0;
     lazy.errors
         .iter()
         .map(|error| {
-            let offset = error.span.start as usize;
-            let scanned = line_start;
-            for newline in memchr::memchr_iter(b'\n', &text.as_bytes()[scanned..offset]) {
-                line += 1;
-                line_start = scanned + newline + 1;
-            }
-            if error.message == "unclosed string" {
+            let mut start = error.span.start as usize;
+            let mut end = error.span.end as usize;
+            let statement_index = lazy
+                .statements
+                .partition_point(|statement| statement.span.start as usize <= start);
+            let unclosed_quote = statement_index.checked_sub(1).and_then(|index| {
+                let statement = lazy.statements[index];
+                (start <= statement.span.end as usize)
+                    .then(|| unclosed_quote(text.as_bytes(), statement.span.range()))
+                    .flatten()
+            });
+            if let Some(offset) = unclosed_quote {
+                let line = memchr::memchr_iter(b'\n', &text.as_bytes()[..offset]).count() as u32;
+                let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
                 return unclosed_string_diagnostic(text, line, line_start, offset);
             }
-            let column = utf16_len(&text[line_start..offset]);
-            let width = utf16_len(&text[error.span.range()]);
+            if error.message == "expected parameter" && start > 0 {
+                let before = text[..start].trim_end();
+                if before.ends_with(',') {
+                    start = before.len() - 1;
+                }
+            }
+            let message = if error.message == "expected ;" {
+                "Missing `;`"
+            } else if error.message == "expected )" && start == end {
+                "Missing `)`"
+            } else {
+                "Invalid IFC STEP syntax"
+            };
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            let position = |offset| {
+                let line = memchr::memchr_iter(b'\n', &text.as_bytes()[..offset]).count() as u32;
+                let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
+                Position::new(line, utf16_len(&text[line_start..offset]))
+            };
             Diagnostic {
-                range: Range::new(
-                    Position::new(line, column),
-                    Position::new(line, column + width),
-                ),
+                range: Range::new(position(start), position(end)),
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Invalid IFC STEP syntax; {}", error.message),
+                message: message.to_string(),
                 ..Default::default()
             }
         })
         .collect()
+}
+
+fn unclosed_quote(text: &[u8], span: std::ops::Range<usize>) -> Option<usize> {
+    let mut offset = span.start;
+    let mut first = None;
+    let mut quoted = false;
+    while offset < span.end {
+        if text[offset] == b'\'' {
+            first.get_or_insert(offset);
+            quoted = !quoted;
+            offset += 1;
+        } else if !quoted && text[offset..span.end].starts_with(b"/*") {
+            offset = memchr::memmem::find(&text[offset + 2..span.end], b"*/")
+                .map_or(span.end, |end| offset + end + 4);
+        } else {
+            offset += 1;
+        }
+    }
+    quoted.then_some(first).flatten()
 }
 
 fn utf16_len(text: &str) -> u32 {
@@ -66,7 +109,60 @@ fn unclosed_string_diagnostic(
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
+pub(crate) fn collect_tree_oracle(
+    tree: &crate::document_tree::DocumentTree,
+    text: &str,
+) -> Vec<Diagnostic> {
+    fn visit(
+        node: tree_sitter::Node<'_>,
+        strings: &[crate::document_tree::UnclosedString],
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        let index = strings.partition_point(|string| string.quote <= node.start_byte());
+        if !(index > 0 && strings[index - 1].end >= node.start_byte()) {
+            let message = if node.is_error() {
+                Some("Invalid IFC STEP syntax".to_string())
+            } else if node.is_missing() {
+                Some(format!("Missing `{}`", node.kind()))
+            } else {
+                None
+            };
+            if let Some(message) = message {
+                let start = node.start_position();
+                let end = node.end_position();
+                diagnostics.push(Diagnostic {
+                    range: Range::new(
+                        Position::new(start.row as u32, start.column as u32),
+                        Position::new(end.row as u32, end.column as u32),
+                    ),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message,
+                    ..Default::default()
+                });
+            }
+        }
+        if !node.is_error() && node.has_error() {
+            for child in node.children(&mut node.walk()) {
+                visit(child, strings, diagnostics);
+            }
+        }
+    }
+    let mut diagnostics: Vec<_> = tree
+        .unclosed_strings
+        .iter()
+        .map(|string| {
+            let line = memchr::memchr_iter(b'\n', &text.as_bytes()[..string.quote]).count() as u32;
+            let start = text[..string.quote].rfind('\n').map_or(0, |n| n + 1);
+            unclosed_string_diagnostic(text, line, start, string.quote)
+        })
+        .collect();
+    visit(tree.root_node(), &tree.unclosed_strings, &mut diagnostics);
+    diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
+    diagnostics
+}
+
+#[cfg(test)]
 mod tests {
     use tower_lsp::lsp_types::Position;
     use tree_sitter::Parser;
