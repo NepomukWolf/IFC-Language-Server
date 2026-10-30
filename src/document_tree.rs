@@ -1,4 +1,4 @@
-use tree_sitter::{InputEdit, Node, Parser, Point, Range, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Range, Tree, TreeCursor};
 
 #[derive(Clone, Debug)]
 pub struct DocumentTree {
@@ -27,7 +27,13 @@ impl DocumentTree {
         }
 
         let mut errors = Vec::new();
-        error_spans(result.compact.root_node(), &mut errors);
+        let mut entities = Vec::new();
+        collect_recovery_nodes(
+            &mut result.compact.root_node().walk(),
+            false,
+            &mut errors,
+            &mut entities,
+        );
         for (start, end) in &mut errors {
             if let Some(quote) = unclosed_string_start(text, *start) {
                 if !result.unclosed_strings.contains(&quote) {
@@ -48,11 +54,10 @@ impl DocumentTree {
                     .map_or(text.len(), |offset| *end + offset + 1);
             }
         }
-        crate::document::visit_entity_nodes(&mut result.compact.root_node().walk(), &mut |node| {
-            if !node.has_error()
-                && !errors
-                    .iter()
-                    .any(|&(start, end)| node.start_byte() <= end && node.end_byte() >= start)
+        for node in entities {
+            if !errors
+                .iter()
+                .any(|&(start, end)| node.start_byte() <= end && node.end_byte() >= start)
             {
                 let range = node.range();
                 if let Some(previous) = result.omitted.last_mut()
@@ -66,7 +71,7 @@ impl DocumentTree {
                     result.omitted.push(range);
                 }
             }
-        });
+        }
         parser
             .set_language(&tree_sitter_ifc::LANGUAGE_STRUCTURED.into())
             .expect("IFC ABI");
@@ -185,12 +190,31 @@ impl DocumentTree {
     }
 }
 
-fn error_spans(node: Node<'_>, spans: &mut Vec<(usize, usize)>) {
-    if node.is_error() || node.is_missing() {
-        spans.push((node.start_byte(), node.end_byte()));
-    } else if node.has_error() {
-        for child in node.children(&mut node.walk()) {
-            error_spans(child, spans);
+/// Collects the outermost error and missing nodes and, in document order, the error-free entity
+/// instances.
+fn collect_recovery_nodes<'a>(
+    cursor: &mut TreeCursor<'a>,
+    inside_error: bool,
+    errors: &mut Vec<(usize, usize)>,
+    entities: &mut Vec<Node<'a>>,
+) {
+    loop {
+        let node = cursor.node();
+        let is_error = node.is_error() || node.is_missing();
+        if is_error && !inside_error {
+            errors.push((node.start_byte(), node.end_byte()));
+        }
+        let is_entity = node.kind() == "entity_instance";
+        let has_error = node.has_error();
+        if is_entity && !has_error {
+            entities.push(node);
+        }
+        if (!is_entity || has_error) && cursor.goto_first_child() {
+            collect_recovery_nodes(cursor, inside_error || is_error, errors, entities);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
         }
     }
 }
@@ -308,6 +332,49 @@ mod tests {
             unclosed_string_start(b"#1=X('a);\n/* x */#2=X('b');", 0),
             Some(5)
         );
+    }
+
+    #[test]
+    fn recovery_collects_only_outermost_errors_and_error_free_entities() {
+        fn outermost_errors(node: Node<'_>, spans: &mut Vec<(usize, usize)>) {
+            if node.is_error() || node.is_missing() {
+                spans.push((node.start_byte(), node.end_byte()));
+            } else {
+                for child in node.children(&mut node.walk()) {
+                    outermost_errors(child, spans);
+                }
+            }
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("IFC ABI");
+        for text in [
+            "DATA;\n#1=X((1,2);\n#2=Y('a);\nENDSEC;",
+            "DATA;\n#1=X('a',$,IFCLABEL'x'),$);\n#2=Y(1);\nENDSEC;",
+            "DATA;\n#1=X(#2=Y((1,2;\n#3=Z(1);\nENDSEC;",
+        ] {
+            let tree = parser.parse(text, None).expect("parse");
+            let mut errors = Vec::new();
+            let mut entities = Vec::new();
+            collect_recovery_nodes(
+                &mut tree.root_node().walk(),
+                false,
+                &mut errors,
+                &mut entities,
+            );
+
+            let mut expected_errors = Vec::new();
+            outermost_errors(tree.root_node(), &mut expected_errors);
+            let mut expected_entities = Vec::new();
+            crate::document::visit_entity_nodes(&mut tree.root_node().walk(), &mut |node| {
+                if !node.has_error() {
+                    expected_entities.push(node);
+                }
+            });
+            assert_eq!(errors, expected_errors, "{text}");
+            assert_eq!(entities, expected_entities, "{text}");
+        }
     }
 
     #[test]
