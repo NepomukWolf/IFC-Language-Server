@@ -99,25 +99,22 @@ fn statement_start_before_cursor(
     definitions: &HashMap<u32, usize>,
     cursor_offset: usize,
 ) -> usize {
-    let mut nearest = None;
-    let mut second_nearest = None;
-    for &offset in definitions.values() {
-        if offset >= cursor_offset {
-            continue;
-        }
-        if nearest.is_none_or(|nearest| offset > nearest) {
-            second_nearest = nearest;
-            nearest = Some(offset);
-        } else if second_nearest.is_none_or(|second| offset > second) {
-            second_nearest = Some(offset);
-        }
-    }
+    let bytes = text.as_bytes();
+    let second_nearest = memchr::memrchr_iter(b'\n', &bytes[..cursor_offset])
+        .map(|newline| newline + 1)
+        .chain(std::iter::once(0))
+        .filter(|&start| {
+            start < cursor_offset
+                && scan_instance_id(bytes, start, bytes.len())
+                    .is_some_and(|(id, _)| definitions.get(&id) == Some(&start))
+        })
+        .nth(1);
 
     // Indexed definitions lie outside strings and comments, so a scan starting at one sees the
     // same statement terminators as a scan from the start of the text.
     second_nearest
-        .and_then(|anchor| last_statement_end(text.as_bytes(), anchor, cursor_offset))
-        .or_else(|| last_statement_end(text.as_bytes(), 0, cursor_offset))
+        .and_then(|anchor| last_statement_end(bytes, anchor, cursor_offset))
+        .or_else(|| last_statement_end(bytes, 0, cursor_offset))
         .unwrap_or(0)
 }
 
