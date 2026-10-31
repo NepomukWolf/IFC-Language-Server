@@ -52,7 +52,7 @@ impl DocumentTree {
         );
         let odd_quotes = odd_quote_entities(text);
         for (start, end) in &mut errors {
-            let causing = causing_strings(text, &odd_quotes, *start);
+            let causing = causing_strings(text, &odd_quotes, (*start, *end));
             let causes = &odd_quotes[causing.clone()];
             if let (Some(first), Some(last)) = (causes.first(), causes.last()) {
                 result
@@ -357,15 +357,16 @@ fn odd_quote_entities(text: &[u8]) -> Vec<OddQuoteEntity> {
     entities
 }
 
-/// The entities in `odd_quotes` whose unclosed string can explain an error starting at
-/// `error_start`: the nearest entity starting at or before it, and the earlier ones whose string
-/// swallows text up to it.
+/// The entities in `odd_quotes` whose unclosed string can explain an error spanning
+/// `error_start..error_end`: those starting inside it, the nearest one starting at or before it,
+/// and the earlier ones whose string swallows text up to it.
 fn causing_strings(
     text: &[u8],
     odd_quotes: &[OddQuoteEntity],
-    error_start: usize,
+    (error_start, error_end): (usize, usize),
 ) -> std::ops::Range<usize> {
-    let last = odd_quotes.partition_point(|entity| entity.start <= error_start);
+    let reach = error_end.saturating_sub(1).max(error_start);
+    let last = odd_quotes.partition_point(|entity| entity.start <= reach);
     let mut first = last;
     while first > 0 && swallowed_end(text, odd_quotes, first - 1) >= error_start {
         first -= 1;
@@ -394,18 +395,23 @@ fn swallowed_end(text: &[u8], odd_quotes: &[OddQuoteEntity], index: usize) -> us
     })
 }
 
+/// Whether a data entity (`#1=`) or a header entity (`FILE_NAME(`) starts at `offset`.
 fn is_entity_start(text: &[u8], offset: usize) -> bool {
     if offset > 0 && text[offset - 1] != b'\n' {
         return false;
     }
-    if text.get(offset) != Some(&b'#') {
-        return false;
-    }
+    let (follower, continues): (u8, fn(&u8) -> bool) = match text.get(offset) {
+        Some(b'#') => (b'=', u8::is_ascii_digit),
+        Some(byte) if byte.is_ascii_uppercase() => (b'(', |byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_'
+        }),
+        _ => return false,
+    };
     let mut end = offset + 1;
-    while text.get(end).is_some_and(u8::is_ascii_digit) {
+    while text.get(end).is_some_and(continues) {
         end += 1;
     }
-    text.get(end) == Some(&b'=')
+    text.get(end) == Some(&follower)
 }
 
 #[cfg(test)]
@@ -417,7 +423,7 @@ mod tests {
 
     fn unclosed_quotes(text: &[u8], error_start: usize) -> Vec<usize> {
         let odd_quotes = odd_quote_entities(text);
-        odd_quotes[causing_strings(text, &odd_quotes, error_start)]
+        odd_quotes[causing_strings(text, &odd_quotes, (error_start, error_start))]
             .iter()
             .map(|entity| entity.first_quote)
             .collect()
