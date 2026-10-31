@@ -156,6 +156,16 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
     );
 }
 #[test]
+fn keeps_instances_whose_statement_has_a_syntax_error() {
+    let doc = parse(
+        "DATA;\n#1=IFCPROJECT(g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;",
+    );
+    assert_eq!(
+        structure(&nested_symbols(&doc)),
+        ["IFCPROJECT #1", "  IFCSITE #2"]
+    );
+}
+#[test]
 fn handles_duplicates_cycles_missing_refs_and_multiple_roots() {
     let doc = parse(
         "DATA;\n#1=IFCPROJECT('g',$,'A',$,$,$,$,$,$);\n#2=IFCPROJECT('g',$,'B',$,$,$,$,$,$);\n#3=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#4=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#3,#99,#3));\n#11=IFCRELAGGREGATES('g',$,$,$,#3,(#1));\nENDSEC;",

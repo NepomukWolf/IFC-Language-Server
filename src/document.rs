@@ -315,6 +315,7 @@ impl Document {
             line_start: self.line_offsets[row],
         };
         lazy_entity_instance(lazy, &self.text, index, &mut points)
+            .filter(|instance| instance.parameter_list_range.is_some())
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -592,13 +593,23 @@ pub fn lazy_entity_type_index<'a>(
 pub(crate) fn for_each_lazy_entity_instance(
     lazy: &handwritten::Document,
     text: &str,
-    visit: impl FnMut(EntityInstanceInfo),
+    mut visit: impl FnMut(EntityInstanceInfo),
 ) {
-    for_each_lazy_entity_instance_named(lazy, text, |_| true, visit);
+    for_each_lazy_entity_instance_named(
+        lazy,
+        text,
+        |_| true,
+        |instance| {
+            if instance.parameter_list_range.is_some() {
+                visit(instance);
+            }
+        },
+    );
 }
 
 /// Like `for_each_lazy_entity_instance`, but decodes only instances whose uppercase entity name
-/// `keep` accepts.
+/// `keep` accepts, and also visits statements whose parameters could not be read, with no
+/// parameters and no `parameter_list_range`.
 pub(crate) fn for_each_lazy_entity_instance_named(
     lazy: &handwritten::Document,
     text: &str,
@@ -645,6 +656,7 @@ pub(crate) fn lazy_entity_instance_relative(
         line_start: start,
     };
     lazy_entity_instance(lazy, text, index, &mut points)
+        .filter(|instance| instance.parameter_list_range.is_some())
 }
 
 /// Positions of `offsets`, which must be ascending.
@@ -680,7 +692,6 @@ fn lazy_entity_instance(
         return None;
     }
     let tape = lazy.decode(text.as_bytes(), index);
-    let list = tape.first()?;
     let id_range = Range {
         start: points.position(span.start),
         end: points.position(
@@ -697,11 +708,17 @@ fn lazy_entity_instance(
         start: points.position(name.start),
         end: points.position(name.end),
     };
-    let list_start = points.position(list.span.start as usize);
-    let parameters = lazy_parameter_values(&tape, 1, tape.len(), text, points);
-    let parameter_list_range = Range {
-        start: list_start,
-        end: points.position(list.span.end as usize),
+    let (parameters, parameter_list_range) = match tape.first() {
+        Some(list) => {
+            let list_start = points.position(list.span.start as usize);
+            let parameters = lazy_parameter_values(&tape, 1, tape.len(), text, points);
+            let range = Range {
+                start: list_start,
+                end: points.position(list.span.end as usize),
+            };
+            (parameters, Some(range))
+        }
+        None => (Vec::new(), None),
     };
     let entity_end = points.position(span.end);
     Some(EntityInstanceInfo {
@@ -713,7 +730,7 @@ fn lazy_entity_instance(
             start: id_range.start,
             end: entity_end,
         },
-        parameter_list_range: Some(parameter_list_range),
+        parameter_list_range,
         parameters,
     })
 }
