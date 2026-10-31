@@ -2,32 +2,43 @@
 //! Public types form the runtime `SchemaDoc` API; `pub(crate)` types are parser/resolver
 //! intermediates that should not leak into feature code.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone)]
 pub struct SchemaDoc {
-    pub entities: HashMap<String, EntityDoc>,
-    pub types: HashMap<String, TypeDoc>,
+    pub entities: FxHashMap<String, EntityDoc>,
+    pub types: FxHashMap<String, TypeDoc>,
 }
 
 impl SchemaDoc {
     pub fn entity(&self, name: &str) -> Option<&EntityDoc> {
-        self.entities.get(&normalize_name(name))
+        self.entities.get(&*normalized_key(name))
     }
 
     pub fn type_decl(&self, name: &str) -> Option<&TypeDoc> {
-        self.types.get(&normalize_name(name))
+        self.types.get(&*normalized_key(name))
     }
 
     pub fn is_entity_compatible(&self, actual: &str, expected: &str) -> bool {
-        let actual = normalize_name(actual);
-        let expected = normalize_name(expected);
+        let actual = normalized_key(actual);
+        let expected = normalized_key(expected);
 
         actual == expected
             || self
                 .entities
-                .get(&actual)
-                .is_some_and(|entity| entity.all_supertypes.contains(&expected))
+                .get(&*actual)
+                .is_some_and(|entity| entity.all_supertypes.contains(&*expected))
+    }
+}
+
+fn normalized_key(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        Cow::Owned(normalize_name(name))
+    } else {
+        Cow::Borrowed(name)
     }
 }
 
@@ -36,7 +47,7 @@ pub struct EntityDoc {
     pub name: String,
     pub attributes: Vec<EntityAttributeDoc>,
     pub url: String,
-    pub all_supertypes: HashSet<String>,
+    pub all_supertypes: FxHashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

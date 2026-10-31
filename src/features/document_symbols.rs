@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{
+    EntityInstanceCollection, EntityInstanceInfo, ParameterValue,
+    for_each_lazy_entity_instance_named,
+};
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
 
@@ -37,19 +40,48 @@ enum ProductRenderMode {
     GroupMultiOnly,
 }
 
+/// Keeps only what the outline reads: relationships with all their parameters, and instances
+/// `classify` places in the outline with nothing but a string Name at index 2. Other statements
+/// are skipped before they are decoded. `schema` must be the one later passed to
+/// `document_symbols`.
+pub fn outline_instances(
+    lazy: Option<&crate::step::Document>,
+    text: &str,
+    schema: Option<&SchemaDoc>,
+) -> EntityInstanceCollection {
+    let mut instances = Vec::new();
+    if let Some(lazy) = lazy {
+        for_each_lazy_entity_instance_named(
+            lazy,
+            text,
+            |entity_name| {
+                relationship_attributes(entity_name).is_some()
+                    || classify(entity_name, schema).is_some()
+            },
+            |mut instance| {
+                if relationship_attributes(&instance.entity_name).is_none() {
+                    if matches!(
+                        instance.parameters.get(2),
+                        Some(ParameterValue::String { .. })
+                    ) {
+                        instance.parameters.truncate(3);
+                    } else {
+                        instance.parameters.clear();
+                    }
+                    instance.parameters.shrink_to_fit();
+                }
+                instances.push(instance);
+            },
+        );
+    }
+    EntityInstanceCollection { instances }
+}
+
 pub fn document_symbols(
     text: &str,
     instances: &EntityInstanceCollection,
-    ast_skipped: bool,
     schema: Option<&SchemaDoc>,
 ) -> Option<DocumentSymbolResponse> {
-    if ast_skipped && instances.instances.is_empty() {
-        return Some(DocumentSymbolResponse::Nested(vec![message_symbol(
-            "Outline unavailable: IFC AST was skipped because the file exceeds the configured AST size limit",
-            "Increase `ifc.analysis.astFileSizeLimitMb` to enable the spatial outline",
-        )]));
-    }
-
     let lines: Vec<&str> = text.lines().collect();
     let by_id: HashMap<u32, usize> = instances
         .instances
@@ -87,7 +119,7 @@ pub fn document_symbols(
     let declared_classes: Vec<Option<Class>> = instances
         .instances
         .iter()
-        .map(|item| classify(item, schema))
+        .map(|item| classify(&item.entity_name, schema))
         .collect();
     let classes = resolve_classes(&declared_classes, &edges);
     let relevant: HashSet<usize> = classes
@@ -182,23 +214,23 @@ pub fn document_symbols(
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
-fn classify(item: &EntityInstanceInfo, schema: Option<&SchemaDoc>) -> Option<Class> {
-    if item.entity_name == "IFCPROJECT" {
+fn classify(entity_name: &str, schema: Option<&SchemaDoc>) -> Option<Class> {
+    if entity_name == "IFCPROJECT" {
         return Some(Class::Project);
     }
     let core = matches!(
-        item.entity_name.as_str(),
+        entity_name,
         "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE"
     );
     if core
         || schema.is_some_and(|s| {
-            s.is_entity_compatible(&item.entity_name, "IFCSPATIALELEMENT")
-                || s.is_entity_compatible(&item.entity_name, "IFCSPATIALSTRUCTUREELEMENT")
+            s.is_entity_compatible(entity_name, "IFCSPATIALELEMENT")
+                || s.is_entity_compatible(entity_name, "IFCSPATIALSTRUCTUREELEMENT")
         })
     {
         return Some(Class::Spatial);
     }
-    if schema.is_some_and(|s| s.is_entity_compatible(&item.entity_name, "IFCPRODUCT")) {
+    if schema.is_some_and(|s| s.is_entity_compatible(entity_name, "IFCPRODUCT")) {
         Some(Class::Product)
     } else {
         None
@@ -241,50 +273,56 @@ fn resolve_classes(declared: &[Option<Class>], edges: &[Edge]) -> Vec<Option<Cla
         .collect()
 }
 
+fn relationship_attributes(
+    entity_name: &str,
+) -> Option<(&'static str, &'static str, usize, usize, EdgeKind)> {
+    Some(match entity_name {
+        "IFCRELAGGREGATES" => (
+            "RELATINGOBJECT",
+            "RELATEDOBJECTS",
+            4,
+            5,
+            EdgeKind::Aggregate,
+        ),
+        "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
+        "IFCRELVOIDSELEMENT" => (
+            "RELATINGBUILDINGELEMENT",
+            "RELATEDOPENINGELEMENT",
+            4,
+            5,
+            EdgeKind::Void,
+        ),
+        "IFCRELFILLSELEMENT" => (
+            "RELATINGOPENINGELEMENT",
+            "RELATEDBUILDINGELEMENT",
+            4,
+            5,
+            EdgeKind::Fill,
+        ),
+        "IFCRELCONNECTSPORTTOELEMENT" => (
+            "RELATEDELEMENT",
+            "RELATINGPORT",
+            5,
+            4,
+            EdgeKind::PortContainment,
+        ),
+        "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
+            "RELATINGSTRUCTURE",
+            "RELATEDELEMENTS",
+            5,
+            4,
+            EdgeKind::Containment,
+        ),
+        _ => return None,
+    })
+}
+
 fn relationship_parameters<'a>(
     item: &'a EntityInstanceInfo,
     schema: Option<&SchemaDoc>,
 ) -> Option<(&'a ParameterValue, &'a ParameterValue, EdgeKind)> {
     let (parent_name, children_name, parent_fallback, children_fallback, kind) =
-        match item.entity_name.as_str() {
-            "IFCRELAGGREGATES" => (
-                "RELATINGOBJECT",
-                "RELATEDOBJECTS",
-                4,
-                5,
-                EdgeKind::Aggregate,
-            ),
-            "IFCRELNESTS" => ("RELATINGOBJECT", "RELATEDOBJECTS", 4, 5, EdgeKind::Nest),
-            "IFCRELVOIDSELEMENT" => (
-                "RELATINGBUILDINGELEMENT",
-                "RELATEDOPENINGELEMENT",
-                4,
-                5,
-                EdgeKind::Void,
-            ),
-            "IFCRELFILLSELEMENT" => (
-                "RELATINGOPENINGELEMENT",
-                "RELATEDBUILDINGELEMENT",
-                4,
-                5,
-                EdgeKind::Fill,
-            ),
-            "IFCRELCONNECTSPORTTOELEMENT" => (
-                "RELATEDELEMENT",
-                "RELATINGPORT",
-                5,
-                4,
-                EdgeKind::PortContainment,
-            ),
-            "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (
-                "RELATINGSTRUCTURE",
-                "RELATEDELEMENTS",
-                5,
-                4,
-                EdgeKind::Containment,
-            ),
-            _ => return None,
-        };
+        relationship_attributes(&item.entity_name)?;
     let attribute_index = |name: &str, fallback| {
         schema
             .and_then(|s| s.entity(&item.entity_name))
@@ -482,8 +520,8 @@ fn instance_symbol(
         tags: None,
         #[allow(deprecated)]
         deprecated: None,
-        range: lsp_range(lines, item.entity_range),
-        selection_range: lsp_range(lines, item.id_range.unwrap_or(item.entity_name_range)),
+        range: item.entity_range,
+        selection_range: item.id_range.unwrap_or(item.entity_name_range),
         children: (!children.is_empty()).then_some(children),
     }
 }
@@ -519,19 +557,6 @@ fn extent(ranges: impl Iterator<Item = Range>) -> Range {
         .unwrap_or(start);
     Range::new(start, end)
 }
-fn message_symbol(name: &str, detail: &str) -> DocumentSymbol {
-    DocumentSymbol {
-        name: name.to_string(),
-        detail: Some(detail.to_string()),
-        kind: SymbolKind::NULL,
-        tags: None,
-        #[allow(deprecated)]
-        deprecated: None,
-        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-        selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-        children: None,
-    }
-}
 fn instance_symbol_name(item: &EntityInstanceInfo) -> String {
     match item.id {
         Some(id) => format!("{} #{id}", item.entity_name),
@@ -560,28 +585,18 @@ fn text_for_range(lines: &[&str], range: Range) -> Option<String> {
         return None;
     }
     let line = lines.get(range.start.line as usize)?;
-    Some(
-        line.get(range.start.character as usize..range.end.character as usize)?
-            .to_string(),
-    )
-}
-fn lsp_range(lines: &[&str], range: Range) -> Range {
-    Range::new(
-        lsp_position(lines, range.start),
-        lsp_position(lines, range.end),
-    )
-}
-fn lsp_position(lines: &[&str], position: Position) -> Position {
-    let Some(prefix) = lines
-        .get(position.line as usize)
-        .and_then(|line| line.get(..position.character as usize))
-    else {
-        return position;
-    };
-    Position::new(
-        position.line,
-        prefix.encode_utf16().count().try_into().unwrap_or(u32::MAX),
-    )
+    let mut units = 0;
+    let mut start = None;
+    for (offset, character) in line.char_indices().chain([(line.len(), '\n')]) {
+        if units == range.start.character {
+            start = Some(offset);
+        }
+        if units == range.end.character {
+            return Some(line[start?..offset].to_string());
+        }
+        units += character.len_utf16() as u32;
+    }
+    None
 }
 fn symbol_kind(class: Option<Class>) -> SymbolKind {
     match class {

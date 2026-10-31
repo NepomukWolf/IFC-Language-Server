@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify};
 use tower_lsp::Client;
 use tower_lsp::lsp_types::Url;
 use tracing::{debug, instrument, warn};
@@ -17,7 +17,6 @@ use crate::schema::SchemaDoc;
 pub struct DiagnosticScheduler {
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
-    semantic_work: Arc<Semaphore>,
 }
 
 pub struct DiagnosticTicket {
@@ -29,20 +28,10 @@ impl DiagnosticScheduler {
     pub fn new(client: Client) -> Self {
         let state = Arc::new(Mutex::new(SchedulerState::default()));
         let notify = Arc::new(Notify::new());
-        let semantic_work = Arc::new(Semaphore::new(1));
 
-        crate::rt::spawn(run_worker(
-            client,
-            Arc::clone(&state),
-            Arc::clone(&notify),
-            Arc::clone(&semantic_work),
-        ));
+        crate::rt::spawn(run_worker(client, Arc::clone(&state), Arc::clone(&notify)));
 
-        Self {
-            state,
-            notify,
-            semantic_work,
-        }
+        Self { state, notify }
     }
 
     #[instrument(skip(self), fields(uri = %uri))]
@@ -101,8 +90,10 @@ impl DiagnosticScheduler {
         debug!("invalidated document diagnostics");
     }
 
-    pub fn semantic_work(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.semantic_work)
+    /// Holds the scheduler busy, as its worker does while publishing, until the guard drops.
+    #[cfg(test)]
+    pub async fn hold(&self) -> impl Drop + '_ {
+        self.state.lock().await
     }
 
     #[cfg(test)]
@@ -242,12 +233,7 @@ struct DiagnosticJob {
     schema: Option<(String, Arc<SchemaDoc>)>,
 }
 
-async fn run_worker(
-    client: Client,
-    state: Arc<Mutex<SchedulerState>>,
-    notify: Arc<Notify>,
-    semantic_work: Arc<Semaphore>,
-) {
+async fn run_worker(client: Client, state: Arc<Mutex<SchedulerState>>, notify: Arc<Notify>) {
     loop {
         let next_job = state.lock().await.take_next_job();
         let Some(job) = next_job else {
@@ -262,17 +248,6 @@ async fn run_worker(
 
         let uri = job.uri.clone();
         let generation = job.generation;
-        let permit = match Arc::clone(&semantic_work).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                warn!(uri = %uri, generation, %error, "semantic work limiter closed");
-                continue;
-            }
-        };
-        if !state.lock().await.is_current(&uri, generation) {
-            debug!(uri = %uri, generation, "skipping stale diagnostics job");
-            continue;
-        }
         let diagnostics = match crate::rt::spawn_blocking(move || collect(job)).await {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
@@ -280,7 +255,6 @@ async fn run_worker(
                 continue;
             }
         };
-        drop(permit);
 
         let state = state.lock().await;
         if !state.is_current(&uri, generation) {
@@ -414,8 +388,8 @@ mod tests {
 
     fn schema_doc() -> Arc<SchemaDoc> {
         Arc::new(SchemaDoc {
-            entities: HashMap::new(),
-            types: HashMap::new(),
+            entities: Default::default(),
+            types: Default::default(),
         })
     }
 
@@ -508,7 +482,6 @@ mod tests {
             let scheduler = DiagnosticScheduler {
                 state: Arc::new(Mutex::new(SchedulerState::default())),
                 notify: Arc::new(Notify::new()),
-                semantic_work: Arc::new(Semaphore::new(1)),
             };
             let uri = uri("model");
             let text = Arc::new("#1=IFCWALL($);".to_string());

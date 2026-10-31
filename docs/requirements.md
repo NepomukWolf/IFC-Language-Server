@@ -97,13 +97,13 @@ When the cursor is inside a STEP entity instance argument list, the server shoul
 - highlight the active parameter based on the cursor position
 - include concise parameter metadata where available, such as type information and optionality
 
-Signature help should not require tree-sitter AST state.
+Signature help should not require the statement index.
 
 ### Inlay Hints
 
 The language server should label positional STEP entity arguments with schema attribute names.
-Hints should be range-scoped, include inherited attributes, and remain available without tree-sitter
-AST state.
+Hints should be range-scoped, include inherited attributes, and remain available without the
+statement index.
 
 ### IFC Boilerplate
 
@@ -137,7 +137,7 @@ documentation and a preview of referenced instances. Documentation should be res
 client supports completion-item resolve, with eager documentation as a compatibility fallback.
 
 Schema-aware argument completions should trigger after `(`, `,`, `#`, and `.`, remain available without
-tree-sitter AST state, and replace only an empty or partially typed value. On an otherwise empty
+the statement index, and replace only an empty or partially typed value. On an otherwise empty
 line, `#` should instead complete the next instance definition prefix without adding whitespace.
 Compatible-reference results should be capped at 100 items and marked incomplete when more matches
 exist, allowing the client to request a narrower result as the user types.
@@ -151,28 +151,13 @@ Semantic tokens should:
 
 - be enabled by default
 - be configurable through `initializationOptions.semanticTokensEnabled`
-- remain available without tree-sitter AST state
+- remain available without the statement index
 - support large files through range requests rather than requiring full-document tokenization
 
 ### Large IFC Files
 
-The language server should remain usable for large IFC files without retaining tree-sitter ASTs for every open document.
-
-For files above the configured AST parsing limit:
-
-- local reference hover should remain available
-- entity definition hover should remain available when schema docs are available
-- go-to-definition should remain available for local `#id` references
-- find-references should remain available for local `#id` tokens
-- document highlight should remain available for local `#id` tokens
-- signature help should remain available for IFC entity parameter lists when schema docs are available
-- schema-aware completions should remain available when schema docs are available
-- schema-backed inlay hints should remain available
-- range-based semantic tokens should remain available
-- AST-backed schema diagnostics may be disabled
-- derived `*` hover may be disabled
-
-The AST parsing limit should be configurable through `initializationOptions.astFileSizeLimitMb`.
+The language server should remain usable for large IFC files without retaining a statement index for every open document.
+Every feature, including schema diagnostics and derived `*` hover, stays available regardless of file size.
 
 ### Schema Diagnostics
 

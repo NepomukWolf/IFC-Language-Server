@@ -1,7 +1,9 @@
 //! Shared lightweight STEP entity-instance argument scanner.
 //! Given a known `#id=` definition offset, this walks the positional argument list without a
-//! full tree-sitter parse. Shared by inlay hints and related-entity navigation, which both only
+//! full parse. Shared by inlay hints and related-entity navigation, which both only
 //! need argument boundaries, enclosing entity names, and referenced ids within a bounded region.
+
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ScannedInstance {
@@ -20,6 +22,7 @@ pub(crate) struct EntityArgumentContext {
 /// Locates the positional argument containing `cursor_offset` without requiring an AST.
 pub(crate) fn entity_argument_context(
     text: &str,
+    definitions: &FxHashMap<u32, usize>,
     cursor_offset: usize,
 ) -> Option<EntityArgumentContext> {
     if cursor_offset > text.len() || !text.is_char_boundary(cursor_offset) {
@@ -27,7 +30,7 @@ pub(crate) fn entity_argument_context(
     }
 
     let bytes = text.as_bytes();
-    let mut offset = statement_start_before_cursor(text, cursor_offset);
+    let mut offset = statement_start_before_cursor(text, definitions, cursor_offset);
     offset = skip_trivia(bytes, offset, bytes.len());
     let (_, next) = scan_instance_id(bytes, offset, bytes.len())?;
     offset = skip_trivia(bytes, next, bytes.len());
@@ -91,10 +94,32 @@ pub(crate) fn entity_argument_context(
     })
 }
 
-fn statement_start_before_cursor(text: &str, cursor_offset: usize) -> usize {
+fn statement_start_before_cursor(
+    text: &str,
+    definitions: &FxHashMap<u32, usize>,
+    cursor_offset: usize,
+) -> usize {
     let bytes = text.as_bytes();
-    let mut offset = 0;
-    let mut statement_start = 0;
+    let second_nearest = memchr::memrchr_iter(b'\n', &bytes[..cursor_offset])
+        .map(|newline| newline + 1)
+        .chain(std::iter::once(0))
+        .filter(|&start| {
+            start < cursor_offset
+                && scan_instance_id(bytes, start, bytes.len())
+                    .is_some_and(|(id, _)| definitions.get(&id) == Some(&start))
+        })
+        .nth(1);
+
+    // Indexed definitions lie outside strings and comments, so a scan starting at one sees the
+    // same statement terminators as a scan from the start of the text.
+    second_nearest
+        .and_then(|anchor| last_statement_end(bytes, anchor, cursor_offset))
+        .or_else(|| last_statement_end(bytes, 0, cursor_offset))
+        .unwrap_or(0)
+}
+
+fn last_statement_end(bytes: &[u8], mut offset: usize, cursor_offset: usize) -> Option<usize> {
+    let mut statement_start = None;
 
     while offset < cursor_offset {
         match bytes[offset] {
@@ -104,7 +129,7 @@ fn statement_start_before_cursor(text: &str, cursor_offset: usize) -> usize {
             }
             b';' => {
                 offset += 1;
-                statement_start = offset;
+                statement_start = Some(offset);
             }
             _ => offset += 1,
         }
@@ -146,12 +171,12 @@ pub(crate) fn scan_instance(
     ))
 }
 
-/// Reads only the entity name at a known `#id=` definition offset.
+/// Reads only the entity name, as written, at a known `#id=` definition offset.
 pub(crate) fn scan_definition_entity_name(
     text: &str,
     start: usize,
     scan_end: usize,
-) -> Option<String> {
+) -> Option<&str> {
     let bytes = text.as_bytes();
     let (_, mut offset) = scan_instance_id(bytes, start, scan_end)?;
     offset = skip_trivia(bytes, offset, scan_end);
@@ -162,7 +187,7 @@ pub(crate) fn scan_definition_entity_name(
     offset = skip_trivia(bytes, offset + 1, scan_end);
     let entity_start = offset;
     offset = scan_identifier(bytes, offset, scan_end)?;
-    text.get(entity_start..offset).map(str::to_ascii_uppercase)
+    text.get(entity_start..offset)
 }
 
 /// Collects every local instance id (`#N`) referenced within `[start, end)`, skipping strings
@@ -341,24 +366,44 @@ mod tests {
         let text = "#12 = IfcWall(";
 
         assert_eq!(
-            scan_definition_entity_name(text, 0, text.len()).as_deref(),
-            Some("IFCWALL")
+            scan_definition_entity_name(text, 0, text.len()),
+            Some("IfcWall")
         );
     }
 
     #[test]
     fn argument_context_rejects_statement_without_leading_hash() {
         let text = "12=IFCWALL(";
-        assert!(entity_argument_context(text, text.len()).is_none());
+        assert!(entity_argument_context(text, &FxHashMap::default(), text.len()).is_none());
     }
 
     #[test]
     fn argument_context_skips_leading_comments() {
         let text = "#1=IFCWALL($, /* explanation */ .SO";
-        let context = entity_argument_context(text, text.len()).expect("expected argument context");
+        let context = entity_argument_context(text, &FxHashMap::default(), text.len())
+            .expect("expected argument context");
 
         assert_eq!(context.active_parameter, 1);
         assert_eq!(&text[context.value_start..], " .SO");
+    }
+
+    #[test]
+    fn argument_context_from_indexed_definitions_matches_scan_from_start() {
+        let text = "ISO-10303-21;\nHEADER;FILE_SCHEMA(('IFC4'));ENDSEC;\nDATA;\n\
+            #1=IFCWALL('a;b', /* #9=X(; */ #2, $);\n\
+            #2 = IFCSLAB('#3=IFCBEAM(', (#1, #4));junk #4=IFCBEAM('it''s;', .T.);\n\
+            #5=IFCROOF($, 'multi\nline; #6=IFCX(', (#1,\n#2));\n\
+            #1=IFCWALL(#4, /* open; comment";
+        let definitions = crate::document_index::scan_text(text).definitions;
+        assert!(definitions.len() >= 4);
+
+        for cursor in 0..=text.len() {
+            assert_eq!(
+                entity_argument_context(text, &definitions, cursor),
+                entity_argument_context(text, &FxHashMap::default(), cursor),
+                "cursor {cursor}"
+            );
+        }
     }
 
     #[test]

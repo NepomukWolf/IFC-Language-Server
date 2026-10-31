@@ -1,15 +1,10 @@
 use super::*;
-use crate::document::{Document, build_entity_instances};
+use crate::document::Document;
 use crate::schema::{EntityAttributeDoc, EntityDoc, TypeRef};
-use std::collections::HashMap;
-use tree_sitter::Parser;
+use rustc_hash::FxHashMap;
 
 fn parse(text: &str) -> Document {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_ifc::LANGUAGE.into())
-        .unwrap();
-    Document::parse(&mut parser, text.to_string())
+    Document::parse(text.to_string())
 }
 fn entity(name: &str, supers: &[&str], attrs: &[&str]) -> EntityDoc {
     EntityDoc {
@@ -34,7 +29,7 @@ fn schema() -> SchemaDoc {
     let product = ["IFCROOT", "IFCPRODUCT"];
     let spatial = ["IFCROOT", "IFCSPATIALELEMENT", "IFCPRODUCT"];
     let spatial_structure = ["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"];
-    let mut entities: HashMap<String, EntityDoc> = [
+    let mut entities: FxHashMap<String, EntityDoc> = [
         ("IFCPROJECT", root.as_slice()),
         ("IFCSITE", spatial_structure.as_slice()),
         ("IFCBUILDING", spatial_structure.as_slice()),
@@ -100,7 +95,7 @@ fn schema() -> SchemaDoc {
 
     SchemaDoc {
         entities,
-        types: HashMap::new(),
+        types: Default::default(),
     }
 }
 fn names(symbol: &DocumentSymbol) -> Vec<String> {
@@ -134,8 +129,8 @@ fn nested_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 }
 
 fn symbols(doc: &Document, schema: Option<&SchemaDoc>) -> Option<DocumentSymbolResponse> {
-    let instances = build_entity_instances(doc.tree.as_ref(), &doc.text);
-    document_symbols(&doc.text, &instances, doc.ast_skipped, schema)
+    let instances = outline_instances(doc.lazy.as_deref(), &doc.text, schema);
+    document_symbols(&doc.text, &instances, schema)
 }
 
 #[test]
@@ -152,12 +147,19 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
     assert!(all.iter().any(|n| n == "IFCWALL #7"));
     assert_eq!(
         out[0].range,
-        lsp_range(
-            &doc.text.lines().collect::<Vec<_>>(),
-            doc.entity_instance_by_id(1)
-                .expect("project instance should exist")
-                .entity_range
-        )
+        doc.entity_instance_by_id(1)
+            .expect("project instance should exist")
+            .entity_range
+    );
+}
+#[test]
+fn keeps_instances_whose_statement_has_a_syntax_error() {
+    let doc = parse(
+        "DATA;\n#1=IFCPROJECT(g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;",
+    );
+    assert_eq!(
+        structure(&nested_symbols(&doc)),
+        ["IFCPROJECT #1", "  IFCSITE #2"]
     );
 }
 #[test]
@@ -197,19 +199,37 @@ fn emits_all_products_and_preserves_utf16_ranges() {
     );
 }
 #[test]
-fn explains_ast_skip() {
-    let mut doc = Document::new_unloaded("x".into());
-    doc.ast_skipped = true;
-    let DocumentSymbolResponse::Nested(out) = symbols(&doc, None).unwrap() else {
+fn outline_ranges_count_utf16_units_after_non_ascii_text() {
+    let line = "#1=IFCPROJECT('g',$,'é😀',$,$,$,$,$,$); #2=IFCSITE('g',$,'😀é',$,$,$,$,$,$);";
+    let doc = parse(&format!(
+        "DATA;\n{line}\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;"
+    ));
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, Some(&schema())).unwrap() else {
         panic!()
     };
-    assert!(out[0].name.contains("AST was skipped"));
+    let column = |offset: usize| line[..offset].encode_utf16().count() as u32;
+    let site_start = line.find("#2").unwrap();
+
+    let project = &out[0];
+    assert_eq!(project.detail.as_deref(), Some("é😀"));
+    let site = &project.children.as_ref().unwrap()[0];
+    assert_eq!(site.name, "IFCSITE #2");
+    assert_eq!(site.detail.as_deref(), Some("😀é"));
     assert_eq!(
-        out[0].detail.as_deref(),
-        Some("Increase `ifc.analysis.astFileSizeLimitMb` to enable the spatial outline")
+        site.range,
+        Range::new(
+            Position::new(1, column(site_start)),
+            Position::new(1, column(line.len()))
+        )
+    );
+    assert_eq!(
+        site.selection_range,
+        Range::new(
+            Position::new(1, column(site_start)),
+            Position::new(1, column(site_start + 2))
+        )
     );
 }
-
 #[test]
 fn schema_less_outline_keeps_core_backbone_and_excludes_unknown_endpoints() {
     let doc = parse(
@@ -472,4 +492,37 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
     for symbol in &symbols {
         verify(symbol);
     }
+}
+
+#[test]
+fn outline_instances_keep_only_what_the_outline_reads() {
+    let doc = parse(
+        "DATA;\n#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#3=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;",
+    );
+    let full = crate::test_support::build_entity_instances(doc.lazy.as_deref(), &doc.text);
+    let lean = outline_instances(doc.lazy.as_deref(), &doc.text, Some(&schema()));
+
+    let kept: Vec<(&str, usize)> = lean
+        .instances
+        .iter()
+        .map(|i| (i.entity_name.as_str(), i.parameters.len()))
+        .collect();
+    assert_eq!(kept, vec![("IFCWALL", 3), ("IFCRELAGGREGATES", 6)]);
+    assert_eq!(
+        document_symbols(&doc.text, &lean, Some(&schema())),
+        document_symbols(&doc.text, &full, Some(&schema()))
+    );
+}
+
+#[test]
+fn outline_json_objects_are_insertion_ordered_maps() {
+    let doc = parse("DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\nENDSEC;");
+    let value = serde_json::to_value(symbols(&doc, None).unwrap()).unwrap();
+    let keys: Vec<&str> = value[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys.first(), Some(&"name"));
 }

@@ -2,64 +2,300 @@
 //! This scanner intentionally recognizes only the tokens needed for cheap LSP navigation:
 //! line starts, local instance ids, references, and FILE_SCHEMA declarations.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
-#[derive(Debug, Default)]
+use crate::step;
+
+#[derive(Debug, Default, PartialEq)]
 pub struct TextIndex {
     pub line_offsets: Vec<usize>,
-    pub definitions: HashMap<u32, usize>,
-    pub references: HashMap<u32, Vec<usize>>,
+    pub definitions: FxHashMap<u32, usize>,
+    pub definitions_by_id: Vec<(u32, usize)>,
+    pub references: FxHashMap<u32, Vec<usize>>,
     pub schema_name: Option<String>,
+    pub schema_end: Option<usize>,
 }
 
-pub fn scan_text(text: &str) -> TextIndex {
-    let bytes = text.as_bytes();
-    let mut index = TextIndex {
-        line_offsets: vec![0],
-        definitions: HashMap::new(),
-        references: HashMap::new(),
-        schema_name: None,
-    };
-    let mut offset = 0usize;
+/// Bounds of a local rescan: how far before an edit it looks for an indexed `#id` to restart
+/// from, how far past it it may run, and how many id tokens it may replace. Past them a full
+/// rescan is cheaper.
+const MAX_ANCHOR_DISTANCE: usize = 64 * 1024;
+const MAX_RESCAN_PAST_EDIT: usize = 1024 * 1024;
+const MAX_REPLACED_TOKENS: usize = 64 * 1024;
 
-    while offset < bytes.len() {
-        match bytes[offset] {
-            b'\n' => {
-                index.line_offsets.push(offset + 1);
-                offset += 1;
+pub fn scan_text(text: &str) -> TextIndex {
+    rescan_text(text, TextIndex::default())
+}
+
+pub fn rescan_text(text: &str, mut index: TextIndex) -> TextIndex {
+    index.line_offsets.clear();
+    index.line_offsets.push(0);
+    index.definitions.clear();
+    index.definitions_by_id.clear();
+    for offsets in index.references.values_mut() {
+        offsets.clear();
+    }
+    let mut schema = None;
+    scan(
+        text.as_bytes(),
+        0,
+        usize::MAX,
+        &mut index.line_offsets,
+        Some(&mut schema),
+        |token| {
+            index
+                .references
+                .entry(token.id)
+                .or_default()
+                .push(token.offset);
+            if token.definition {
+                index.definitions.insert(token.id, token.offset);
+                index.definitions_by_id.push((token.id, token.offset));
             }
-            b'\'' => offset = skip_string(bytes, offset, &mut index.line_offsets),
+            true
+        },
+    );
+    (index.schema_name, index.schema_end) = schema.unzip();
+
+    index.references.retain(|_, offsets| !offsets.is_empty());
+    index.definitions_by_id.sort_unstable();
+    index.definitions_by_id.dedup_by(|later, earlier| {
+        let duplicate = later.0 == earlier.0;
+        if duplicate {
+            *earlier = *later;
+        }
+        duplicate
+    });
+    index
+}
+
+#[derive(Clone, Copy)]
+struct IdToken {
+    id: u32,
+    offset: usize,
+    definition: bool,
+}
+
+/// Scans from `offset`, which must be outside any string or comment, until the end, until a
+/// token starts past `stop_after`, or until `visit` returns false for an id token; returns where
+/// it stopped. Only `rescan_text` looks for FILE_SCHEMA, so the other callers must start after it.
+fn scan(
+    bytes: &[u8],
+    mut offset: usize,
+    stop_after: usize,
+    line_offsets: &mut Vec<usize>,
+    mut schema: Option<&mut Option<(String, usize)>>,
+    mut visit: impl FnMut(IdToken) -> bool,
+) -> usize {
+    while offset < bytes.len() && offset <= stop_after {
+        let wants_schema = schema.as_deref().is_some_and(Option::is_none);
+        match bytes[offset] {
+            b'\'' => offset = skip_string(bytes, offset, line_offsets),
             b'/' if bytes.get(offset + 1) == Some(&b'*') => {
-                offset = skip_block_comment(bytes, offset, &mut index.line_offsets);
+                offset = skip_block_comment(bytes, offset, line_offsets);
             }
             b'#' => {
                 if let Some((id, end)) = parse_id(bytes, offset) {
-                    index.references.entry(id).or_default().push(offset);
-                    if is_definition(bytes, end) {
-                        index.definitions.insert(id, offset);
+                    let token = IdToken {
+                        id,
+                        offset,
+                        definition: is_definition(bytes, end),
+                    };
+                    if !visit(token) {
+                        return offset;
                     }
                     offset = end;
                 } else {
                     offset += 1;
                 }
             }
-            byte if is_identifier_start(byte) => {
+            b'\n' if wants_schema => {
+                line_offsets.push(offset + 1);
+                offset += 1;
+            }
+            byte if wants_schema && is_identifier_start(byte) => {
                 let ident_start = offset;
                 offset += 1;
                 while offset < bytes.len() && is_identifier_part(bytes[offset]) {
                     offset += 1;
                 }
-                if index.schema_name.is_none()
+                if let Some(schema) = schema.as_deref_mut()
                     && bytes[ident_start..offset].eq_ignore_ascii_case(b"FILE_SCHEMA")
                 {
-                    index.schema_name = parse_file_schema_name(bytes, offset);
+                    *schema = parse_file_schema_name(bytes, offset);
                 }
             }
-            _ => offset += 1,
+            _ if wants_schema => offset += 1,
+            _ => {
+                let end = memchr::memchr3(b'#', b'\'', b'/', &bytes[offset + 1..])
+                    .map_or(bytes.len(), |n| offset + 1 + n)
+                    .min(stop_after.saturating_add(1));
+                push_lines(bytes, offset, end, line_offsets);
+                offset = end;
+            }
         }
     }
+    offset
+}
 
-    index
+/// Updates `index`, built for the text before an edit, after `removed` at `start` was replaced
+/// by the `inserted_len` bytes of `text` at `start`. Rescans from the last indexed `#id` before
+/// the edit until the first `#id` after it that the old scan also indexed: both scans are outside
+/// strings and comments there, so the rest of the index only shifts. Returns false, leaving
+/// `index` untouched, when the edit reaches into the header or the rescan would exceed its bounds.
+pub fn edit_text_index(
+    index: &mut TextIndex,
+    text: &str,
+    start: usize,
+    removed: &[u8],
+    inserted_len: usize,
+) -> bool {
+    let bytes = text.as_bytes();
+    let Some(schema_end) = index.schema_end.filter(|&end| end <= start) else {
+        return false;
+    };
+    let floor = schema_end.max(start.saturating_sub(MAX_ANCHOR_DISTANCE));
+    // Whether a string before an `#id` ends there depends on the `=` after it, so that lookahead
+    // must end before the edit.
+    let indexed = (floor..start).rev().find(|&offset| {
+        bytes[offset] == b'#'
+            && parse_id(bytes, offset).is_some_and(|(id, end)| {
+                step::trivia(bytes, end, start) < start
+                    && index
+                        .references
+                        .get(&id)
+                        .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
+            })
+    });
+    // The scan leaves the schema name's string right at `schema_end`.
+    let Some(anchor) =
+        indexed.or((floor == schema_end && schema_end < start).then_some(schema_end))
+    else {
+        return false;
+    };
+
+    let new_edit_end = start + inserted_len;
+    let delta = inserted_len as isize - removed.len() as isize;
+    let mut new_lines = Vec::new();
+    let mut new_tokens = Vec::new();
+    let mut synced = false;
+    let new_stop = scan(
+        bytes,
+        anchor,
+        new_edit_end + MAX_RESCAN_PAST_EDIT,
+        &mut new_lines,
+        None,
+        |token| {
+            synced = token.offset >= new_edit_end
+                && index.references.get(&token.id).is_some_and(|offsets| {
+                    offsets
+                        .binary_search(&((token.offset as isize - delta) as usize))
+                        .is_ok()
+                });
+            if !synced {
+                new_tokens.push(token);
+            }
+            !synced
+        },
+    );
+    if !synced && new_stop < bytes.len() || new_tokens.len() > MAX_REPLACED_TOKENS {
+        return false;
+    }
+
+    let mut old_window = Vec::with_capacity(new_stop - anchor - inserted_len + removed.len());
+    old_window.extend_from_slice(&bytes[anchor..start]);
+    old_window.extend_from_slice(removed);
+    old_window.extend_from_slice(&bytes[new_edit_end..new_stop]);
+    let old_stop = anchor + old_window.len();
+    let mut old_lines = Vec::new();
+    let mut old_tokens = Vec::new();
+    scan(&old_window, 0, usize::MAX, &mut old_lines, None, |token| {
+        old_tokens.push(token);
+        old_tokens.len() <= MAX_REPLACED_TOKENS
+    });
+    if old_tokens.len() > MAX_REPLACED_TOKENS {
+        return false;
+    }
+
+    let mut touched: Vec<u32> = old_tokens
+        .iter()
+        .filter(|token| token.definition)
+        .map(|token| token.id)
+        .collect();
+    let mut old_ids: Vec<u32> = old_tokens.iter().map(|token| token.id).collect();
+    old_ids.sort_unstable();
+    old_ids.dedup();
+    for id in old_ids {
+        let offsets = index
+            .references
+            .get_mut(&id)
+            .expect("an old token is indexed");
+        offsets.retain(|&offset| offset < anchor || offset >= old_stop);
+        if offsets.is_empty() {
+            index.references.remove(&id);
+        }
+    }
+    let shift = |offset: &mut usize| {
+        if *offset >= old_stop {
+            *offset = offset.wrapping_add_signed(delta);
+        }
+    };
+    if delta != 0 {
+        index.line_offsets.iter_mut().for_each(shift);
+        index.definitions.values_mut().for_each(shift);
+        index
+            .definitions_by_id
+            .iter_mut()
+            .for_each(|(_, offset)| shift(offset));
+        index.references.values_mut().flatten().for_each(shift);
+    }
+
+    let lines_from = index
+        .line_offsets
+        .partition_point(|&offset| offset <= anchor);
+    let lines_to = lines_from + old_lines.len();
+    index.line_offsets.splice(lines_from..lines_to, new_lines);
+
+    touched.extend(
+        new_tokens
+            .iter()
+            .filter(|token| token.definition)
+            .map(|token| token.id),
+    );
+    new_tokens.sort_by_key(|token| token.id);
+    for tokens in new_tokens.chunk_by(|a, b| a.id == b.id) {
+        let offsets = index.references.entry(tokens[0].id).or_default();
+        let at = offsets.partition_point(|&offset| offset < tokens[0].offset);
+        offsets.splice(at..at, tokens.iter().map(|token| token.offset));
+    }
+    touched.sort_unstable();
+    touched.dedup();
+    for id in touched {
+        let last = index.references.get(&id).and_then(|offsets| {
+            offsets.iter().rev().copied().find(|&offset| {
+                parse_id(bytes, offset).is_some_and(|(_, end)| is_definition(bytes, end))
+            })
+        });
+        let slot = index
+            .definitions_by_id
+            .binary_search_by_key(&id, |&(id, _)| id);
+        match (last, slot) {
+            (Some(offset), Ok(at)) => {
+                index.definitions.insert(id, offset);
+                index.definitions_by_id[at].1 = offset;
+            }
+            (Some(offset), Err(at)) => {
+                index.definitions.insert(id, offset);
+                index.definitions_by_id.insert(at, (id, offset));
+            }
+            (None, Ok(at)) => {
+                index.definitions.remove(&id);
+                index.definitions_by_id.remove(at);
+            }
+            (None, Err(_)) => {}
+        }
+    }
+    true
 }
 
 fn parse_id(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
@@ -88,11 +324,27 @@ fn is_definition(bytes: &[u8], mut offset: usize) -> bool {
     bytes.get(offset) == Some(&b'=')
 }
 
-fn skip_string(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> usize {
+fn skip_string(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> usize {
+    string_end(bytes, offset, line_offsets).0
+}
+
+/// End of the string opening at `offset` and whether a quote closed it. Like
+/// `step::frame_end`, a string that runs into the start of another statement ends there,
+/// so an unclosed string swallows only its own.
+fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> (usize, bool) {
+    let len = bytes.len();
     offset += 1;
-    while offset < bytes.len() {
+    while let Some(n) = memchr::memchr3(b'\n', b'\'', b';', &bytes[offset..]) {
+        offset += n;
         match bytes[offset] {
             b'\n' => {
+                let mut next = offset + 1;
+                while next < len && matches!(bytes[next], b' ' | b'\t' | b'\r') {
+                    next += 1;
+                }
+                if step::definition(bytes, next, len) {
+                    return (offset, false);
+                }
                 line_offsets.push(offset + 1);
                 offset += 1;
             }
@@ -100,30 +352,42 @@ fn skip_string(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -
                 if bytes.get(offset + 1) == Some(&b'\'') {
                     offset += 2;
                 } else {
-                    return offset + 1;
+                    return (offset + 1, true);
                 }
+            }
+            _ if step::definition(bytes, step::trivia(bytes, offset + 1, len), len) => {
+                return (offset + 1, false);
             }
             _ => offset += 1,
         }
     }
-    offset
+    (len, false)
 }
 
-fn skip_block_comment(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> usize {
-    offset += 2;
-    while offset + 1 < bytes.len() {
-        if bytes[offset] == b'*' && bytes[offset + 1] == b'/' {
-            return offset + 2;
+fn skip_block_comment(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> usize {
+    match memchr::memmem::find(&bytes[offset + 2..], b"*/") {
+        Some(n) => {
+            let end = offset + 2 + n;
+            push_lines(bytes, offset + 2, end, line_offsets);
+            end + 2
         }
-        if bytes[offset] == b'\n' {
-            line_offsets.push(offset + 1);
+        None => {
+            push_lines(
+                bytes,
+                offset + 2,
+                (bytes.len() - 1).max(offset + 2),
+                line_offsets,
+            );
+            bytes.len()
         }
-        offset += 1;
     }
-    bytes.len()
 }
 
-fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<String> {
+fn push_lines(bytes: &[u8], start: usize, end: usize, line_offsets: &mut Vec<usize>) {
+    line_offsets.extend(memchr::memchr_iter(b'\n', &bytes[start..end]).map(|n| start + n + 1));
+}
+
+fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<(String, usize)> {
     while offset < bytes.len() {
         match bytes[offset] {
             b'\'' => return parse_schema_string(bytes, offset),
@@ -139,51 +403,11 @@ fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<String> {
     None
 }
 
-fn parse_schema_string(bytes: &[u8], mut offset: usize) -> Option<String> {
-    offset += 1;
-    let start = offset;
-    let mut value = Vec::new();
-
-    while offset < bytes.len() {
-        if bytes[offset] == b'\'' {
-            if bytes.get(offset + 1) == Some(&b'\'') {
-                value.extend_from_slice(&bytes[start..offset]);
-                value.push(b'\'');
-                offset += 2;
-                return parse_schema_string_tail(bytes, offset, value);
-            }
-            value.extend_from_slice(&bytes[start..offset]);
-            return String::from_utf8(value)
-                .ok()
-                .map(|schema_name| schema_name.to_ascii_uppercase());
-        }
-        offset += 1;
-    }
-
-    None
-}
-
-fn parse_schema_string_tail(bytes: &[u8], mut offset: usize, mut value: Vec<u8>) -> Option<String> {
-    let mut start = offset;
-    while offset < bytes.len() {
-        if bytes[offset] == b'\'' {
-            if bytes.get(offset + 1) == Some(&b'\'') {
-                value.extend_from_slice(&bytes[start..offset]);
-                value.push(b'\'');
-                offset += 2;
-                start = offset;
-            } else {
-                value.extend_from_slice(&bytes[start..offset]);
-                return String::from_utf8(value)
-                    .ok()
-                    .map(|schema_name| schema_name.to_ascii_uppercase());
-            }
-        } else {
-            offset += 1;
-        }
-    }
-
-    None
+fn parse_schema_string(bytes: &[u8], offset: usize) -> Option<(String, usize)> {
+    let (end, closed) = string_end(bytes, offset, &mut Vec::new());
+    closed.then_some(())?;
+    let value = std::str::from_utf8(&bytes[offset + 1..end - 1]).ok()?;
+    Some((value.replace("''", "'").to_ascii_uppercase(), end))
 }
 
 fn is_identifier_start(byte: u8) -> bool {
@@ -224,5 +448,76 @@ mod tests {
         assert_eq!(index.references.get(&1), Some(&vec![0, 50]));
         assert!(!index.references.contains_key(&2));
         assert!(!index.references.contains_key(&3));
+    }
+
+    #[test]
+    fn edits_that_change_the_rest_of_a_large_file_fall_back_to_a_full_rescan() {
+        let mut text = String::from("FILE_SCHEMA(('IFC4'));\n");
+        for id in 1..=60_000 {
+            text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
+        }
+        let open = text.find("#2=").expect("second statement");
+        let mut with_comment = text.clone();
+        with_comment.insert_str(open, "/*");
+        let mut index = scan_text(&text);
+        assert!(!edit_text_index(&mut index, &with_comment, open, b"", 2));
+        assert!(index == scan_text(&text));
+
+        let quote = text.find("1',").expect("first closing quote") + 1;
+        let mut with_space = text.clone();
+        with_space.insert(quote, ' ');
+        assert!(edit_text_index(&mut index, &with_space, quote, b"", 1));
+        assert!(index == scan_text(&with_space));
+    }
+
+    #[test]
+    fn an_unclosed_string_ends_at_the_next_statement() {
+        let text = "#1=X('a);\n#2=Y(#1);\n#3=Z('b,\n  #4=W(#2);";
+        let at = |needle: &str| text.find(needle).unwrap();
+        let index = scan_text(text);
+
+        assert_eq!(
+            index.definitions_by_id,
+            vec![(1, 0), (2, at("#2=")), (3, at("#3=")), (4, at("#4="))]
+        );
+        assert_eq!(index.references.get(&1), Some(&vec![0, at("#1)")]));
+        assert_eq!(index.references.get(&2), Some(&vec![at("#2="), at("#2)")]));
+        assert_eq!(
+            index.line_offsets,
+            vec![0, at("#2="), at("#3="), at("  #4=")]
+        );
+    }
+
+    #[test]
+    fn deleting_a_closing_quote_rescans_only_its_statement() {
+        let mut text = String::from("FILE_SCHEMA(('IFC4'));\n");
+        for id in 1..=60_000 {
+            text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
+        }
+        let quote = text.find("1',").expect("first closing quote") + 1;
+        let mut without_quote = text.clone();
+        without_quote.remove(quote);
+        let mut index = scan_text(&text);
+
+        assert!(edit_text_index(&mut index, &without_quote, quote, b"'", 0));
+        assert!(index == scan_text(&without_quote));
+        assert!(edit_text_index(&mut index, &text, quote, b"", 1));
+        assert!(index == scan_text(&text));
+    }
+
+    #[test]
+    fn lists_definitions_by_id_with_the_offsets_of_the_map() {
+        let text = "#10=A();\n#2=B();\n#10=C();\n#1=D('#3=E();');\n#2=F();\n";
+
+        let index = scan_text(text);
+
+        let mut from_map = index
+            .definitions
+            .iter()
+            .map(|(&id, &offset)| (id, offset))
+            .collect::<Vec<_>>();
+        from_map.sort();
+        assert_eq!(index.definitions_by_id, from_map);
+        assert_eq!(index.definitions_by_id, vec![(1, 26), (2, 43), (10, 17)]);
     }
 }
