@@ -14,6 +14,7 @@ use crate::diagnostics::{self, DiagnosticSnapshot};
 use crate::document::drop_on_blocking_thread;
 use crate::schema::SchemaDoc;
 
+#[derive(Clone)]
 pub struct DiagnosticScheduler {
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
@@ -39,6 +40,13 @@ impl DiagnosticScheduler {
         let generation = self.state.lock().await.begin(uri.clone());
         debug!(generation, "started document diagnostics generation");
         DiagnosticTicket { uri, generation }
+    }
+
+    pub async fn is_current(&self, ticket: &DiagnosticTicket) -> bool {
+        self.state
+            .lock()
+            .await
+            .is_current(&ticket.uri, ticket.generation)
     }
 
     #[instrument(skip(self, ticket, snapshot, schema), fields(uri = %ticket.uri, generation = ticket.generation))]
