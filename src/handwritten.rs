@@ -141,8 +141,10 @@ impl Document {
                         retain,
                         depth: 0,
                         recovered: false,
+                        skipped: Vec::new(),
                     };
                     let result = reader.list(Kind::List).and_then(|()| reader.expect(b';'));
+                    doc.errors.append(&mut reader.skipped);
                     if let Err(mut error) = result {
                         if error.message == "expected (" {
                             error.span = Span {
@@ -198,6 +200,7 @@ impl Document {
             retain: self.retain,
             depth: 0,
             recovered: false,
+            skipped: Vec::new(),
         };
         let result = (|| {
             let id_start = r.p;
@@ -228,6 +231,7 @@ impl Document {
             Ok(())
         })();
         let recovered = r.recovered;
+        self.errors.append(&mut r.skipped);
         if let Err(error) = result {
             self.errors.push(error);
             if !recovered {
@@ -258,6 +262,7 @@ impl Document {
             retain: true,
             depth: 0,
             recovered: false,
+            skipped: Vec::new(),
         };
         if r.list(Kind::List).is_err() && !r.recovered {
             params.clear();
@@ -421,7 +426,20 @@ struct Reader<'a, 'p> {
     depth: usize,
     /// Set when the outer list lacked only its `)` and its parameters were kept.
     recovered: bool,
+    /// Malformed values left out of their list.
+    skipped: Vec<ParseError>,
 }
+
+/// Errors confined to one scalar value, which `Reader::skip` can step over.
+const SKIPPABLE: [&str; 7] = [
+    "expected parameter",
+    "invalid reference",
+    "invalid enumeration",
+    "unclosed enumeration",
+    "invalid binary",
+    "invalid exponent",
+    "expected (",
+];
 
 impl Reader<'_, '_> {
     fn error(&self, message: &'static str) -> ParseError {
@@ -487,10 +505,24 @@ impl Reader<'_, '_> {
         }
         self.p = trivia(self.text, self.p, self.end);
         if self.text.get(self.p) != Some(&b')') {
+            let mut comma = None;
             loop {
-                self.value()?;
+                let value_start = trivia(self.text, self.p, self.end);
+                let mark = self.params.len();
+                if let Err(error) = self.value() {
+                    if !SKIPPABLE.contains(&error.message) {
+                        return Err(error);
+                    }
+                    self.params.truncate(mark);
+                    self.p = value_start;
+                    self.skip(comma.unwrap_or(value_start))?;
+                }
                 self.p = trivia(self.text, self.p, self.end);
+                if self.p < self.end && !matches!(self.text[self.p], b',' | b')' | b';') {
+                    self.skip(self.p)?;
+                }
                 if self.p < self.end && self.text[self.p] == b',' {
+                    comma = Some(self.p);
                     self.p += 1;
                 } else {
                     break;
@@ -517,6 +549,48 @@ impl Reader<'_, '_> {
         }
         self.depth -= 1;
         closed
+    }
+    /// Skips one malformed value up to the next `,`, `)` or `;` of its list and records it.
+    fn skip(&mut self, error_start: usize) -> Result<(), ParseError> {
+        let mut depth = 0usize;
+        while self.p < self.end {
+            match self.text[self.p] {
+                quote @ (b'\'' | b'"') => {
+                    let start = self.p;
+                    self.p += 1;
+                    loop {
+                        let Some(n) = memchr::memchr(quote, &self.text[self.p..self.end]) else {
+                            self.p = start;
+                            return Err(self.error("unclosed string"));
+                        };
+                        self.p += n + 1;
+                        if quote != b'\'' || self.text.get(self.p) != Some(&quote) {
+                            break;
+                        }
+                        self.p += 1;
+                    }
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' if depth == 0 => break,
+                b')' => depth -= 1,
+                b',' | b';' if depth == 0 => break,
+                _ => {}
+            }
+            self.p += 1;
+        }
+        let mut end = self.p;
+        while end > error_start && self.text[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        self.skipped.push(ParseError {
+            span: Span {
+                start: error_start as u32,
+                end: end as u32,
+            },
+            message: "unexpected value",
+        });
+        Ok(())
     }
     fn value(&mut self) -> Result<(), ParseError> {
         self.p = trivia(self.text, self.p, self.end);
@@ -872,5 +946,47 @@ mod tests {
         );
         assert_eq!(doc.statements.len(), 5);
         assert!(!doc.decode(text, 4).is_empty());
+    }
+
+    #[test]
+    fn corpus_parses_without_errors_and_both_modes_decode_alike() {
+        fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for item in std::fs::read_dir(dir).unwrap() {
+                let path = item.unwrap().path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "ifc") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        files(std::path::Path::new("samples"), &mut paths);
+        if let Some(dir) = std::env::var_os("STEP_CORPUS_DIR") {
+            for name in [
+                "055.867908MB__uni-project-house-50mb.ifc",
+                "013.646137MB__Ifc4_Revit_ARC.ifc",
+            ] {
+                paths.push(std::path::Path::new(&dir).join(name));
+            }
+        }
+        assert!(!paths.is_empty());
+        for path in paths {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let tape = Document::parse(text.as_bytes(), true);
+            let index = Document::parse(text.as_bytes(), false);
+            assert!(
+                tape.errors.is_empty(),
+                "{}: {:?}",
+                path.display(),
+                tape.errors.iter().take(5).collect::<Vec<_>>()
+            );
+            assert!(!tape.statements.is_empty(), "{}", path.display());
+            for statement in 0..tape.statements.len() {
+                let decoded = tape.decode(text.as_bytes(), statement);
+                assert!(!decoded.is_empty(), "{}", path.display());
+                assert_eq!(decoded, index.decode(text.as_bytes(), statement));
+            }
+        }
     }
 }
