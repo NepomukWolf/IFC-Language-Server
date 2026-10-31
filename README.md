@@ -94,7 +94,7 @@ Supported options:
 
 - `astFileSizeLimitMb`
   - Maximum file size in MiB for AST-backed features.
-  - Defaults to `70`.
+  - Defaults to `200`.
   - Files above this limit keep basic hover/navigation, document highlight, signature help, and semantic tokens available, but skip schema diagnostics and derived-value hover.
 
 - `semanticTokensEnabled`
