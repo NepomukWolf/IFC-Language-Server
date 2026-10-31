@@ -24,12 +24,16 @@ pub struct Document {
     pub text: Arc<String>,
     pub tree: Option<DocumentTree>,
     pub ast_skipped: bool,
+    dirty: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
     pub sorted_definition_ids: Vec<u32>,
     pub references: HashMap<u32, Vec<usize>>,
     schema_end: Option<usize>,
+    text_index_stale: bool,
+    #[cfg(test)]
+    parse_count: usize,
 }
 
 #[derive(Debug)]
@@ -135,12 +139,16 @@ impl Document {
             text: Arc::new(text),
             tree: None,
             ast_skipped: false,
+            dirty: true,
             schema_name,
             line_offsets,
             definitions,
             sorted_definition_ids,
             references,
             schema_end,
+            text_index_stale: false,
+            #[cfg(test)]
+            parse_count: 0,
         }
     }
 
@@ -160,53 +168,40 @@ impl Document {
         self.references = references;
         self.schema_name = schema_name;
         self.schema_end = schema_end;
+        self.text_index_stale = false;
     }
 
     pub fn unload_parse_state(&mut self) {
         self.tree = None;
         self.ast_skipped = false;
+        self.dirty = true;
     }
 
     pub fn reload_parse_state(&mut self, parser: &mut Parser, ast_file_size_limit_bytes: usize) {
-        self.reload_text_index();
-        self.unload_parse_state();
-
-        self.parse_current_text(parser, None, ast_file_size_limit_bytes);
-    }
-
-    pub fn apply_content_changes(
-        &mut self,
-        parser: &mut Parser,
-        changes: &[TextDocumentContentChangeEvent],
-        ast_file_size_limit_bytes: usize,
-    ) -> Result<(), ApplyChangeError> {
-        let mut index_valid = true;
-        for (index, change) in changes.iter().enumerate() {
-            if let Some(range) = change.range {
-                match self.apply_ranged_change(range, &change.text, index_valid) {
-                    Ok(kept_index) => index_valid = kept_index,
-                    Err(error) => {
-                        self.reload_text_index();
-                        let old_tree = self.tree.take();
-                        self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
-                        return Err(error);
-                    }
-                }
-            } else {
-                self.text = Arc::new(change.text.clone());
-                self.tree = None;
-                index_valid = false;
-            }
-            if !index_valid && index + 1 < changes.len() {
-                self.reload_line_offsets();
-            }
-        }
-
-        if !index_valid {
+        if self.text_index_stale {
             self.reload_text_index();
         }
         let old_tree = self.tree.take();
         self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
+    }
+
+    pub fn apply_content_changes(
+        &mut self,
+        changes: &[TextDocumentContentChangeEvent],
+    ) -> Result<(), ApplyChangeError> {
+        for change in changes {
+            if let Some(range) = change.range {
+                if !self.apply_ranged_change(range, &change.text, !self.text_index_stale)? {
+                    self.text_index_stale = true;
+                }
+            } else {
+                self.text = Arc::new(change.text.clone());
+                self.tree = None;
+                self.text_index_stale = true;
+                self.reload_line_offsets();
+            }
+            self.dirty = true;
+        }
         Ok(())
     }
 
@@ -262,6 +257,18 @@ impl Document {
                     }
                 }
             }
+        } else {
+            let tail = range.end.line as usize + 1;
+            for offset in &mut self.line_offsets[tail..] {
+                *offset = *offset - (old_end_byte - start_byte) + replacement.len();
+            }
+            self.line_offsets.splice(
+                range.start.line as usize + 1..tail,
+                replacement
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (byte == b'\n').then_some(start_byte + index + 1)),
+            );
         }
         Ok(keep_index)
     }
@@ -321,10 +328,25 @@ impl Document {
         self.ast_skipped = false;
         if self.text.len() > ast_file_size_limit_bytes {
             self.ast_skipped = true;
+            self.dirty = false;
             return;
         }
 
+        #[cfg(test)]
+        {
+            self.parse_count += 1;
+        }
         self.tree = DocumentTree::parse(parser, self.text.as_bytes(), old_tree);
+        self.dirty = false;
+    }
+
+    pub fn needs_parse(&self) -> bool {
+        self.dirty || !self.is_parse_state_loaded()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_count(&self) -> usize {
+        self.parse_count
     }
 
     #[cfg(test)]
@@ -1268,23 +1290,17 @@ mod tests {
         let label = Position::new(1, 43);
         let edit = |range: Range, text: &str| vec![change(Some(range), text)];
         document
-            .apply_content_changes(
-                &mut parser,
-                &edit(Range::new(label, label), "("),
-                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-            )
+            .apply_content_changes(&edit(Range::new(label, label), "("))
             .unwrap();
+        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
         let root = document.tree.as_ref().unwrap().root_node();
         assert!(!root.has_error());
         assert!(contains_compact(root));
 
         document
-            .apply_content_changes(
-                &mut parser,
-                &edit(Range::new(label, Position::new(1, 44)), ""),
-                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-            )
+            .apply_content_changes(&edit(Range::new(label, Position::new(1, 44)), ""))
             .unwrap();
+        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
         assert_eq!(document.text.as_str(), invalid);
         assert_eq!(
             node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
@@ -1383,10 +1399,11 @@ mod tests {
         ];
 
         document
-            .apply_content_changes(&mut parser, &changes, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES)
+            .apply_content_changes(&changes)
             .expect("changes should be valid");
 
         assert_eq!(document.text.as_str(), "#1=IFCSLAB(#2,$);");
+        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
         assert_eq!(document.references.get(&2), Some(&vec![11]));
         assert_eq!(instances(&document).instances[0].entity_name, "IFCSLAB");
         assert!(document.has_ast());
@@ -1405,10 +1422,11 @@ mod tests {
         )];
 
         document
-            .apply_content_changes(&mut parser, &changes, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES)
+            .apply_content_changes(&changes)
             .expect("change should be valid");
 
         assert_eq!(document.text.as_str(), "#1=IFCWALL('door');");
+        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
         assert!(document.has_ast());
     }
 
@@ -1421,16 +1439,48 @@ mod tests {
             .expect("Error loading IFC parser");
 
         document
-            .apply_content_changes(
-                &mut parser,
-                &[change(None, "#2=IFCDOOR($);")],
-                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-            )
+            .apply_content_changes(&[change(None, "#2=IFCDOOR($);")])
             .expect("change should be valid");
 
         assert_eq!(document.text.as_str(), "#2=IFCDOOR($);");
+        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
         assert!(document.definitions.contains_key(&2));
         assert_eq!(instances(&document).instances[0].entity_name, "IFCDOOR");
+    }
+
+    #[test]
+    fn deferred_multiline_changes_keep_utf16_ranges_current() {
+        let mut document = parse_document("#1=IFCWALL('😀');\n#2=IFCDOOR(#1);\n");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .expect("Error loading IFC parser");
+        document
+            .apply_content_changes(&[change(
+                Some(Range::new(Position::new(0, 12), Position::new(0, 14))),
+                "a\n🦀",
+            )])
+            .expect("first change should be valid");
+        document
+            .apply_content_changes(&[change(
+                Some(Range::new(Position::new(2, 12), Position::new(2, 13))),
+                "3",
+            )])
+            .expect("second change should be valid");
+
+        assert_eq!(document.parse_count(), 1);
+        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
+        assert_eq!(document.parse_count(), 2);
+
+        let fresh = parse_document(document.text.as_str());
+        assert_eq!(
+            document.text.as_str(),
+            "#1=IFCWALL('a\n🦀');\n#2=IFCDOOR(#3);\n"
+        );
+        assert_eq!(document.line_offsets, fresh.line_offsets);
+        assert_eq!(document.definitions, fresh.definitions);
+        assert_eq!(document.references, fresh.references);
+        assert_eq!(instances(&document).instances, instances(&fresh).instances);
     }
 
     #[test]
@@ -1442,14 +1492,16 @@ mod tests {
             .expect("Error loading IFC parser");
 
         document
-            .apply_content_changes(&mut parser, &[change(None, "large")], 4)
+            .apply_content_changes(&[change(None, "large")])
             .expect("change should be valid");
+        document.reload_parse_state(&mut parser, 4);
         assert!(document.ast_skipped);
         assert!(!document.has_ast());
 
         document
-            .apply_content_changes(&mut parser, &[change(None, "#1=IFCWALL($);")], 1024)
+            .apply_content_changes(&[change(None, "#1=IFCWALL($);")])
             .expect("change should be valid");
+        document.reload_parse_state(&mut parser, 1024);
         assert!(!document.ast_skipped);
         assert!(document.has_ast());
     }
@@ -1480,17 +1532,9 @@ mod tests {
     #[test]
     fn invalid_incremental_range_keeps_derived_state_consistent() {
         let mut document = parse_document("#1=IFCWALL($);");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
-            .expect("Error loading IFC parser");
         let invalid_range = Range::new(Position::new(2, 0), Position::new(2, 1));
 
-        let result = document.apply_content_changes(
-            &mut parser,
-            &[change(Some(invalid_range), "x")],
-            DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-        );
+        let result = document.apply_content_changes(&[change(Some(invalid_range), "x")]);
 
         assert_eq!(result, Err(ApplyChangeError::InvalidRange(invalid_range)));
         assert_eq!(document.text.as_str(), "#1=IFCWALL($);");
@@ -1558,12 +1602,9 @@ mod tests {
                             replacement,
                         ));
                         document
-                            .apply_content_changes(
-                                &mut parser,
-                                &[change(Some(range), replacement)],
-                                0,
-                            )
+                            .apply_content_changes(&[change(Some(range), replacement)])
                             .unwrap();
+                        document.reload_parse_state(&mut parser, 0);
                         assert_fresh_index(&document);
                     }
                 }
@@ -1620,15 +1661,15 @@ mod tests {
                         usize::from(document.can_keep_text_index(range, start, end, replacement));
                     let event = change(Some(range), replacement);
                     document
-                        .apply_content_changes(&mut parser, std::slice::from_ref(&event), 0)
+                        .apply_content_changes(std::slice::from_ref(&event))
                         .unwrap();
+                    document.reload_parse_state(&mut parser, 0);
                     assert_fresh_index(&document);
                     changes.push(event);
                 }
                 let mut batched = Document::new_unloaded(before);
-                batched
-                    .apply_content_changes(&mut parser, &changes, 0)
-                    .unwrap();
+                batched.apply_content_changes(&changes).unwrap();
+                batched.reload_parse_state(&mut parser, 0);
                 assert_eq!(batched.text, document.text, "seed {seed}");
                 assert_fresh_index(&batched);
             }
