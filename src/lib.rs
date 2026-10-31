@@ -10,4 +10,7 @@ mod features;
 pub mod handwritten;
 mod rt;
 mod schema;
+#[cfg(test)]
+mod test_support;
+
 pub use backend::Backend;
