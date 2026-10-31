@@ -25,6 +25,7 @@ fn models() -> Vec<Model> {
     ["Infra-Bridge-IFC4x3.ifc", "Duplex_A_20110907-IFC2x3.ifc"]
         .iter()
         .map(|name| Model::load(&samples.join(name)))
+        .chain(std::iter::once(Model::synthetic_properties()))
         .collect()
 }
 
