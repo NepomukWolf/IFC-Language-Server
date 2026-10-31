@@ -3,7 +3,7 @@
 //! parser, and the in-memory schema docs used by hover and datatype diagnostics.
 //! Request handlers stay thin here and delegate document-specific work to the feature modules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, RwLockWriteGuard};
@@ -15,7 +15,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
 use crate::diagnostics::DiagnosticSnapshot;
 use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
-use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document, EntityInstanceCache};
+use crate::document::{Document, EntityInstanceCache};
 use crate::features::{
     completions, definition, document_highlight, document_symbols, hover, inlay_hints, references,
     related_entities, scaffold_completions, semantic_tokens, signature_help,
@@ -29,7 +29,6 @@ struct ConfigState {
     forced_schema_name: Option<String>,
     additional_schema_paths: HashMap<String, std::path::PathBuf>,
     pending_init_config: Option<ServerConfig>,
-    ast_file_size_limit_bytes: usize,
     semantic_tokens_enabled: bool,
     completion_snippet_support: bool,
     completion_documentation_resolve_support: bool,
@@ -41,7 +40,6 @@ impl Default for ConfigState {
             forced_schema_name: None,
             additional_schema_paths: HashMap::new(),
             pending_init_config: None,
-            ast_file_size_limit_bytes: DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             semantic_tokens_enabled: true,
             completion_snippet_support: false,
             completion_documentation_resolve_support: false,
@@ -54,7 +52,6 @@ pub struct Backend {
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     schema_docs: Arc<RwLock<SchemaDocCollection>>,
     config: Arc<RwLock<ConfigState>>,
-    ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>,
     unknown_schema_warned: Arc<RwLock<HashMap<Url, Option<String>>>>,
     diagnostic_scheduler: DiagnosticScheduler,
     instance_cache: Arc<EntityInstanceCache>,
@@ -68,40 +65,10 @@ impl Backend {
             documents: Arc::new(RwLock::new(HashMap::new())),
             schema_docs: Arc::new(RwLock::new(SchemaDocCollection::new())),
             config: Arc::new(RwLock::new(ConfigState::default())),
-            ast_skip_warning_shown: Arc::new(RwLock::new(HashSet::new())),
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
             instance_cache: Arc::new(EntityInstanceCache::default()),
         }
-    }
-
-    async fn ast_file_size_limit_bytes(&self) -> usize {
-        self.config.read().await.ast_file_size_limit_bytes
-    }
-
-    #[instrument(skip(self), fields(uri = %uri, text_len, limit_bytes))]
-    async fn check_ast_support(&self, uri: &Url, text_len: usize, limit_bytes: usize) -> bool {
-        let mut shown = self.ast_skip_warning_shown.write().await;
-        if text_len <= limit_bytes {
-            shown.remove(uri);
-            return false;
-        }
-
-        if shown.insert(uri.clone()) {
-            self.client
-                .show_message(
-                    MessageType::WARNING,
-                    format!(
-                        "This IFC file is larger than the AST parsing limit ({} MB).\nNavigation and basic hover remain available, but schema diagnostics and derived-value hover are disabled.",
-                        limit_bytes / 1024 / 1024
-                    ),
-                )
-                .await;
-            warn!("skipping AST parse because document exceeds configured size limit");
-            return true;
-        }
-
-        false
     }
 
     #[instrument(skip(self), fields(uri = %uri, schema_name = schema_name.unwrap_or("<none>")))]
@@ -174,14 +141,6 @@ impl Backend {
 
     #[instrument(skip(self, text), fields(uri = %uri, text_len = text.len()))]
     async fn load_text_as_active_document(&self, uri: &Url, text: String) -> DiagnosticSnapshot {
-        let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
-        if self
-            .check_ast_support(uri, text.len(), ast_file_size_limit_bytes)
-            .await
-        {
-            crate::rt::yield_now().await;
-        }
-
         let mut documents = self.documents.write().await;
         unload_other_documents(&mut documents, uri);
 
@@ -191,14 +150,10 @@ impl Backend {
         document.unload_parse_state();
         document.text = Arc::new(text);
 
-        {
-            document.reload_parse_state();
-        }
+        document.reload_parse_state();
 
         info!(
             schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
-            has_ast = document.has_ast(),
-            ast_skipped = document.ast_skipped,
             definition_count = document.definitions.len(),
             reference_id_count = document.references.len(),
             "reloaded active document"
@@ -217,7 +172,6 @@ impl Backend {
         uri: &Url,
         changes: Vec<TextDocumentContentChangeEvent>,
     ) -> Option<DiagnosticSnapshot> {
-        let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
         unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
@@ -228,18 +182,13 @@ impl Backend {
         info!(
             text_len = document.text.len(),
             schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
-            has_ast = document.has_ast(),
-            ast_skipped = document.ast_skipped,
             definition_count = document.definitions.len(),
             reference_id_count = document.references.len(),
             "updated active document"
         );
-        let text_len = document.text.len();
         let snapshot = DiagnosticSnapshot::from_document(document);
         drop(documents);
 
-        self.check_ast_support(uri, text_len, ast_file_size_limit_bytes)
-            .await;
         self.check_schema_support(uri, snapshot.schema_name()).await;
         Some(snapshot)
     }
@@ -264,8 +213,6 @@ impl Backend {
             let document = documents.get(uri)?;
             info!(
                 schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
-                has_ast = document.has_ast(),
-                ast_skipped = document.ast_skipped,
                 definition_count = document.definitions.len(),
                 reference_id_count = document.references.len(),
                 "reloaded document parse state on demand"
@@ -401,7 +348,7 @@ impl Backend {
         }
     }
 
-    #[instrument(skip(self, config), fields(ast_file_size_limit_bytes = config.ast_file_size_limit_bytes))]
+    #[instrument(skip(self, config))]
     async fn apply_config(&self, config: ServerConfig) {
         let mut schema_docs = self.schema_docs.read().await.sharing_official();
         let mut next_state = {
@@ -474,7 +421,6 @@ fn config_state_with_client_capabilities(
         forced_schema_name: None,
         additional_schema_paths: HashMap::new(),
         pending_init_config: None,
-        ast_file_size_limit_bytes: config.ast_file_size_limit_bytes,
         semantic_tokens_enabled: config.semantic_tokens_enabled,
         ..current_state.clone()
     }
@@ -662,7 +608,6 @@ impl LanguageServer for Backend {
             self.instance_cache.forget(&closed.text);
         }
 
-        self.ast_skip_warning_shown.write().await.remove(&uri);
         self.unknown_schema_warned.write().await.remove(&uri);
         self.diagnostic_scheduler.invalidate(&uri).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
@@ -881,7 +826,6 @@ impl LanguageServer for Backend {
         });
         let text = Arc::clone(&document.text);
         let lazy = document.lazy.clone();
-        let ast_skipped = document.ast_skipped;
         drop(documents);
 
         let schema = if let Some(schema_name) = schema_name.as_deref() {
@@ -894,7 +838,7 @@ impl LanguageServer for Backend {
             let instances = instance_cache.get_or_build_with(schema.as_ref(), &text, || {
                 document_symbols::outline_instances(lazy.as_deref(), &text, schema.as_deref())
             });
-            document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
+            document_symbols::document_symbols(&text, &instances, schema.as_deref())
         })
         .await
         .unwrap_or_else(|error| {
@@ -1307,13 +1251,11 @@ mod tests {
                 std::path::PathBuf::from("/stale"),
             )]),
             pending_init_config: Some(ServerConfig::default()),
-            ast_file_size_limit_bytes: 1,
             semantic_tokens_enabled: false,
             completion_snippet_support: true,
             completion_documentation_resolve_support: true,
         };
         let new_config = ServerConfig {
-            ast_file_size_limit_bytes: 999,
             semantic_tokens_enabled: true,
             ..ServerConfig::default()
         };
@@ -1323,7 +1265,6 @@ mod tests {
         assert_eq!(next_state.forced_schema_name, None);
         assert!(next_state.additional_schema_paths.is_empty());
         assert!(next_state.pending_init_config.is_none());
-        assert_eq!(next_state.ast_file_size_limit_bytes, 999);
         assert!(next_state.semantic_tokens_enabled);
         assert!(next_state.completion_snippet_support);
         assert!(next_state.completion_documentation_resolve_support);
@@ -1410,7 +1351,7 @@ mod tests {
         let document = Document::parse(text.to_string());
         let instances =
             document_symbols::outline_instances(document.lazy.as_deref(), &document.text, None);
-        document_symbols::document_symbols(&document.text, &instances, document.ast_skipped, None)
+        document_symbols::document_symbols(&document.text, &instances, None)
     }
 
     #[tokio::test]

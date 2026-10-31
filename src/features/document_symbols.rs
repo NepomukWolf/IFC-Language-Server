@@ -80,16 +80,8 @@ pub fn outline_instances(
 pub fn document_symbols(
     text: &str,
     instances: &EntityInstanceCollection,
-    ast_skipped: bool,
     schema: Option<&SchemaDoc>,
 ) -> Option<DocumentSymbolResponse> {
-    if ast_skipped && instances.instances.is_empty() {
-        return Some(DocumentSymbolResponse::Nested(vec![message_symbol(
-            "Outline unavailable: IFC AST was skipped because the file exceeds the configured AST size limit",
-            "Increase `ifc.analysis.astFileSizeLimitMb` to enable the spatial outline",
-        )]));
-    }
-
     let lines: Vec<&str> = text.lines().collect();
     let by_id: HashMap<u32, usize> = instances
         .instances
@@ -564,19 +556,6 @@ fn extent(ranges: impl Iterator<Item = Range>) -> Range {
         .max_by_key(|position| (position.line, position.character))
         .unwrap_or(start);
     Range::new(start, end)
-}
-fn message_symbol(name: &str, detail: &str) -> DocumentSymbol {
-    DocumentSymbol {
-        name: name.to_string(),
-        detail: Some(detail.to_string()),
-        kind: SymbolKind::NULL,
-        tags: None,
-        #[allow(deprecated)]
-        deprecated: None,
-        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-        selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-        children: None,
-    }
 }
 fn instance_symbol_name(item: &EntityInstanceInfo) -> String {
     match item.id {

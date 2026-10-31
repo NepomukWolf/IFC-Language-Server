@@ -130,7 +130,7 @@ fn nested_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 
 fn symbols(doc: &Document, schema: Option<&SchemaDoc>) -> Option<DocumentSymbolResponse> {
     let instances = outline_instances(doc.lazy.as_deref(), &doc.text, schema);
-    document_symbols(&doc.text, &instances, doc.ast_skipped, schema)
+    document_symbols(&doc.text, &instances, schema)
 }
 
 #[test]
@@ -191,20 +191,6 @@ fn emits_all_products_and_preserves_utf16_ranges() {
         statement.encode_utf16().count() as u32
     );
 }
-#[test]
-fn explains_ast_skip() {
-    let mut doc = Document::new_unloaded("x".into());
-    doc.ast_skipped = true;
-    let DocumentSymbolResponse::Nested(out) = symbols(&doc, None).unwrap() else {
-        panic!()
-    };
-    assert!(out[0].name.contains("AST was skipped"));
-    assert_eq!(
-        out[0].detail.as_deref(),
-        Some("Increase `ifc.analysis.astFileSizeLimitMb` to enable the spatial outline")
-    );
-}
-
 #[test]
 fn schema_less_outline_keeps_core_backbone_and_excludes_unknown_endpoints() {
     let doc = parse(
@@ -484,15 +470,16 @@ fn outline_instances_keep_only_what_the_outline_reads() {
         .collect();
     assert_eq!(kept, vec![("IFCWALL", 3), ("IFCRELAGGREGATES", 6)]);
     assert_eq!(
-        document_symbols(&doc.text, &lean, false, Some(&schema())),
-        document_symbols(&doc.text, &full, false, Some(&schema()))
+        document_symbols(&doc.text, &lean, Some(&schema())),
+        document_symbols(&doc.text, &full, Some(&schema()))
     );
 }
 
 #[test]
 fn outline_json_objects_are_insertion_ordered_maps() {
-    let value = serde_json::to_value(message_symbol("name", "detail")).unwrap();
-    let keys: Vec<&str> = value
+    let doc = parse("DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\nENDSEC;");
+    let value = serde_json::to_value(symbols(&doc, None).unwrap()).unwrap();
+    let keys: Vec<&str> = value[0]
         .as_object()
         .unwrap()
         .keys()

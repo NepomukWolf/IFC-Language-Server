@@ -92,11 +92,6 @@ Supported options:
   - These schemas are added to the server's schema selection pool.
   - When an IFC file declares a schema name that is not bundled, the server checks the configured local schemas for an exact `SCHEMA ...;` name match and loads the matching schema on demand.
 
-- `astFileSizeLimitMb`
-  - Maximum file size in MiB for AST-backed features.
-  - Defaults to `70`.
-  - Files above this limit keep basic hover/navigation, document highlight, signature help, and semantic tokens available, but skip schema diagnostics and derived-value hover.
-
 - `semanticTokensEnabled`
   - Enables range-based semantic tokens.
   - Defaults to `true`.
@@ -108,7 +103,6 @@ Example `initializationOptions`:
 ```json
 {
   "overwriteExpSchemaWithLocal": "/Users/alice/dev/express/IFC4x2.exp",
-  "astFileSizeLimitMb": 128,
   "semanticTokensEnabled": true,
   "addLocalSchemaToSelection": [
     "/Users/alice/dev/express/IFC4x1.exp",
@@ -117,11 +111,9 @@ Example `initializationOptions`:
 }
 ```
 
-### Grammar And Parser
+### Parser
 
-This project depends on the published [`tree-sitter-ifc`](https://crates.io/crates/tree-sitter-ifc) crate for IFC parsing.
-
-If you are developing the grammar itself, work in the [`tree-sitter-ifc`](https://github.com/NepomukWolf/tree-sitter-ifc) repository and publish a new crate version when needed. During local development, you can temporarily override the crates.io dependency with a `[patch.crates-io]` entry that points at a local checkout.
+IFC STEP files are parsed by the hand-written statement parser in `src/handwritten.rs`; see [Architecture](./docs/architecture.md#parsing).
 
 ## Documentation
 

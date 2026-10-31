@@ -10,7 +10,7 @@ The implemented architecture is built around:
 
 - incremental document sync
 - one lightweight text index per open IFC document
-- optional tree-sitter parse state for the active document
+- a hand-written STEP statement index and parameter parser for the active document
 - bounded background diagnostic processing
 - generated in-memory EXPRESS schema documentation
 
@@ -32,9 +32,9 @@ The shipped LSP features are:
 The runtime code revolves around three main concepts:
 
 - `Backend`
-  The `tower-lsp` entrypoint. It owns the open-document map, loaded schema docs, server configuration, and large-file warning state.
+  The `tower-lsp` entrypoint. It owns the open-document map, loaded schema docs, server configuration, and the diagnostics scheduler.
 - `Document`
-  The in-memory representation of one IFC file. It always stores source text and cheap text indexes. It may also store tree-sitter state when AST-backed features are enabled for that document.
+  The in-memory representation of one IFC file. It always stores source text and cheap text indexes. The active document also stores the hand-written statement index (`handwritten::Document`).
 - `SchemaDocCollection` and `SchemaDoc`
   In-memory lookup tables for EXPRESS entity and type documentation, keyed by normalized schema name.
 
@@ -45,32 +45,26 @@ Diagnostics operate on an immutable `DiagnosticSnapshot` plus a selected `Schema
 
 On open or document change:
 
-1. `Backend` unloads AST-backed parse state from other open documents.
-2. On open, the active document stores the full text and receives a full tree-sitter parse.
-3. On change, the active document applies every LSP content change in order. Ranged changes edit both the source text and the existing tree-sitter tree before one incremental reparse; full-text changes fall back to a full parse.
-4. The lightweight text index is rebuilt from the final document text.
-5. If the file is within the configured AST size limit, the resulting syntax tree is retained without eagerly materializing every entity instance.
-6. If the file is above the AST size limit, the document is marked as `ast_skipped`.
-7. `Backend` creates a diagnostic snapshot containing the tree and a reference-counted source-text revision.
-8. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
-9. Diagnostics transiently materialize entity instances off the async runtime and publish results only if the snapshot is still the newest generation for that URI.
+1. `Backend` unloads the statement index of other open documents.
+2. On open, the active document stores the full text and builds its statement index with `handwritten::Document::parse`.
+3. On change, the active document applies every LSP content change in order. A ranged change edits the source text and re-parses only the statements it touches (`handwritten::Document::edit`), falling back to a full parse when the edited region no longer splits into whole statements. A full-text change parses from scratch.
+4. The lightweight text index is edited in place, or rescanned when the edit cannot be applied locally.
+5. `Backend` creates a diagnostic snapshot containing the statement index, the recorded edits and a reference-counted source-text revision.
+6. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
+7. Diagnostics revalidate only the statements an edit touched, plus the statements referring to ids whose definition changed, and publish results only if the snapshot is still the newest generation for that URI.
 
-On AST-backed hover or document-symbol requests:
+On hover or document-symbol requests:
 
-1. `Backend::ensure_document_loaded` reloads the requested document if its AST-backed state was previously unloaded.
-2. Reloading one document unloads AST-backed state from the other open documents.
-3. Hover parses only the entity instances needed for the requested value. Document symbols build a transient full instance collection in bounded blocking work.
+1. `Backend::ensure_document_loaded` rebuilds the statement index of the requested document if it was unloaded.
+2. Reloading one document unloads the statement index of the other open documents.
+3. Hover decodes only the statements it reads. Document symbols decode relationships and outline-classified entities in bounded blocking work.
 4. If request-time reloading produced a diagnostic snapshot, it is submitted to the same background scheduler after the feature result is computed, unless the document's current diagnostics generation was already scheduled with the same text and schema.
 
 Definition, references, document-highlight, signature-help, and semantic-token range requests read
-the stored document text and text index only. These requests do not reload tree-sitter parse state
-or publish diagnostics.
+the stored document text and text index only. These requests do not reload the statement index or
+publish diagnostics.
 
 Completion requests also use only stored text, the lightweight index, and the selected schema docs.
-They do not reload tree-sitter state.
-
-There is still no incremental text indexing, incremental entity-instance rebuilding, background
-indexing, diagnostic caching, or cross-document indexing.
 
 ## Backend
 
@@ -79,10 +73,7 @@ indexing, diagnostic caching, or cross-document indexing.
 - `documents: Arc<RwLock<HashMap<Url, Document>>>`
 - `schema_docs: Arc<RwLock<SchemaDocCollection>>`
 - `config: Arc<RwLock<ConfigState>>`
-- `ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>`
 - `diagnostic_scheduler: DiagnosticScheduler`
-
-The backend creates a fresh tree-sitter parser through `new_parser()` when AST state must be rebuilt. It does not keep one long-lived parser.
 
 The server advertises:
 
@@ -117,12 +108,14 @@ notifications such as `window/showMessage`.
 ```rust
 pub struct Document {
     pub text: Arc<String>,
-    pub tree: Option<tree_sitter::Tree>,
-    pub ast_skipped: bool,
+    pub lazy: Option<Arc<handwritten::Document>>,
+    pub lazy_edits: LazyEdits,
+    pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
     pub references: HashMap<u32, Vec<usize>>,
+    // ...
 }
 ```
 
@@ -138,87 +131,43 @@ Important fields:
   Maps numeric ids such as `123` to the byte offset of the local `#123` definition.
 - `references`
   Maps numeric ids to byte offsets of all local `#123` tokens, including the definition token.
-- `tree`
-  Optional tree-sitter syntax tree for AST-backed features.
-- `ast_skipped`
-  Marks a document whose text exceeded the configured AST parsing limit.
+- `lazy`
+  The statement index: one entry per `#id = NAME(...);` statement with its span, id, entity name and parse errors. Parameters are decoded on demand from the statement text.
+- `lazy_edits` and `validation_cache`
+  The statements changed since the last diagnostics run and their cached results, used for incremental revalidation.
 
-`EntityInstanceCollection` is a transient semantic representation of parsed entity instances,
-parameter values, and the local instance-ID lookup. It is built only by background diagnostics or
-an explicit document-symbol request. Hover parses individual instances directly from the tree.
+`EntityInstanceInfo` is the decoded form of one statement: entity name, parameter values and their
+ranges. Features decode only the statements they need.
 
-`src/document_index.rs` provides the lightweight scanner used by every document. It records line starts, local ids, references, and `FILE_SCHEMA(...)` without requiring tree-sitter.
+`src/document_index.rs` provides the lightweight scanner used by every document. It records line starts, local ids, references, and `FILE_SCHEMA(...)`.
+
+## Parsing
+
+`src/handwritten.rs` splits the text into statements and parses each one into a flat parameter tape.
+
+- A statement ends at its `;`, or before a line that starts a new `#id =` definition, so an unclosed
+  string or a missing `;` stays inside one statement.
+- A malformed scalar value (a stray token, a bad number, reference or enumeration) is skipped up to
+  its next `,`, `)` or `;` and reported; the statement keeps its other parameters.
+- A statement missing only its outer `)` before `;` keeps its parameters.
+- Any other error, such as an unclosed string, drops the statement's parameters. Its id and name
+  stay indexed.
+
+Syntax diagnostics come from these parse errors. An unbalanced quote in a statement is reported at its
+opening quote.
 
 ## Loading And Unloading
 
-`Document::new_unloaded(text)` creates a document with source text and the lightweight text index only.
+`Document::new_unloaded(text)` creates a document with source text, the lightweight text index and
+a statement index. `Document::unload_parse_state()` drops the statement index and keeps the text and
+text index. `Document::reload_parse_state()` rebuilds both indexes from the text.
 
-`Document::unload_parse_state()` drops:
+The backend keeps a statement index for at most one active document at a time. Other open documents
+remain in memory as text plus the lightweight index.
 
-- `tree`
-
-It keeps:
-
-- `text`
-- `line_offsets`
-- `schema_name`
-- `definitions`
-- `references`
-
-`Document::reload_parse_state(parser, ast_file_size_limit_bytes)` always rebuilds the text index first and performs a full parse when AST state must be loaded from scratch. `Document::apply_content_changes` converts LSP UTF-16 ranges to byte offsets, applies matching tree-sitter `InputEdit` values, and reparses with the edited previous tree. It rebuilds the full text index but defers semantic entity extraction. Files above the limit keep text-index-backed features available and set `ast_skipped = true` so the server does not repeatedly attempt to parse them.
-
-The backend intentionally keeps AST-backed state for at most one active document at a time. Other open documents remain in memory as text plus the lightweight index.
-
-Background diagnostics may temporarily retain a reference-counted tree-sitter tree and shared
-source-text revision after the live document unloads or changes its parse state. Full semantic
-instance extraction is serialized across diagnostics and document-symbol work, so at most one
-transient collection is built at a time. Snapshot retention remains bounded to one running job plus
-the newest pending snapshot for each URI.
-
-## AST Size Limit
-
-The default AST parsing limit is `70 MiB` (`DEFAULT_AST_FILE_SIZE_LIMIT_BYTES`).
-
-Clients can override it with the LSP initialization option:
-
-```json
-{
-  "astFileSizeLimitMb": 128
-}
-```
-
-When a file is larger than the limit:
-
-- the server shows one warning per URI
-- tree-sitter parsing is skipped
-- schema diagnostics are disabled
-- derived `*` hover is disabled
-- basic hover, navigation, document highlight, signature help, inlay hints, and range-based semantic tokens remain available from the text index/source text
-
-## Feature AST Usage
-
-These features do not require an AST:
-
-- local reference hover for `#123`
-- entity definition hover for names such as `IFCWALL`, when schema docs are available
-- go-to-definition for local `#id` references
-- find-references for local `#id` tokens
-- document highlight for local `#id` tokens
-- signature help for IFC entity parameter lists, when schema docs are available
-- next-id, entity-name, GUID, enumeration, and compatible-reference completions
-- schema-backed inlay hints for STEP entity arguments
-- schema name detection from `FILE_SCHEMA(...)`
-- related-entity navigation code actions, when schema docs are available
-- range-based semantic tokens
-
-These features require an AST:
-
-- syntax diagnostics
-- schema-aware datatype diagnostics
-- parsed entity argument validation
-- derived `*` hover for `IfcSIUnit` and `IfcGeometricRepresentationSubContext`
-
-New features should explicitly choose the cheapest data source that is sufficient. Prefer the text index for navigation and simple token lookup. Use tree-sitter only when syntax structure or parsed parameter values are required.
+Background diagnostics may retain a reference-counted statement index and source-text revision after
+the live document unloads or changes. Snapshot retention remains bounded to one running job plus the
+newest pending snapshot for each URI.
 
 ## Schema Documentation
 
@@ -254,7 +203,7 @@ Derived hover uses the fixed STEP parameter layouts for these two entities. It d
 `src/features/document_highlight.rs` returns all same-document text-indexed `#id` ranges for the
 id under the cursor. All occurrences are returned as textual highlights.
 
-Document highlight does not use tree-sitter or schema docs.
+Document highlight does not use the statement index or schema docs.
 
 ### Signature Help
 
@@ -263,17 +212,17 @@ docs. It uses a lightweight text scanner to find the current STEP entity argumen
 top-level commas before the cursor to choose the active parameter.
 
 Signature help ignores commas inside nested parameter lists, strings, and block comments. It does
-not use tree-sitter AST state.
+not use the statement index.
 
 ### Inlay Hints
 
 `src/features/inlay_hints.rs` labels positional STEP arguments with schema attribute names using a
-range-scoped text scanner. It includes inherited attributes and does not use tree-sitter AST state.
+range-scoped text scanner. It includes inherited attributes and does not use the statement index.
 
 ### IFC Boilerplate
 
-`src/features/scaffold_completions.rs` provides minimal IFC STEP boilerplate without tree-sitter AST
-state. It is surfaced as snippet-aware completions for `!ifc`, `!!ifc`, and `!!!ifc`, and as plain
+`src/features/scaffold_completions.rs` provides minimal IFC STEP boilerplate without the statement
+index. It is surfaced as snippet-aware completions for `!ifc`, `!!ifc`, and `!!!ifc`, and as plain
 text code actions for empty or whitespace-only documents.
 
 Boilerplate generation targets the current default schema. Older schema versions are not generated
@@ -281,7 +230,7 @@ directly.
 
 ### Completions
 
-`src/features/completions.rs` provides next-id and schema-aware completions without AST state. It
+`src/features/completions.rs` provides next-id and schema-aware completions without the statement index. It
 uses the shared STEP argument scanner to locate the active flattened attribute, resolves aliases,
 aggregates, and entity selects through `SchemaDoc`, and scans indexed local definitions on demand
 when compatible reference suggestions are requested. IFC GUID generation is shared with scaffold
@@ -305,7 +254,7 @@ resolved from the selected `SchemaDoc` rather than hardcoded, so it stays correc
 versions.
 
 `src/features/step_scan.rs` is a small shared STEP argument-list scanner (entity name, positional
-argument boundaries) used by both this feature and inlay hints, without tree-sitter.
+argument boundaries) used by both this feature and inlay hints.
 
 Each action carries a `Command` executed via `workspace/executeCommand`, which calls back into the
 client with `window/showDocument` to move the cursor. This depends on the client declaring
@@ -319,12 +268,12 @@ The lexer in `src/features/semantic_tokens/lexer.rs` scans borrowed document tex
 absolute byte ranges for STEP keywords, entity/type identifiers, instance ids, strings, numbers,
 enumerations, operators, and block comments.
 
-Semantic tokens do not use tree-sitter or schema docs.
+Semantic tokens do not use the statement index or schema docs.
 
 ### Diagnostics
 
 `src/diagnostics/datatype.rs` validates transiently extracted entity instances against runtime
-schema documentation. Diagnostics require a matching tree and source-text revision.
+schema documentation. Diagnostics require a matching statement index and source-text revision.
 
 `src/diagnostics/scheduler.rs` owns the bounded background queue. Repeated edits replace pending
 work for the same URI, while monotonically increasing generations prevent results from older edits
@@ -361,7 +310,7 @@ src/
   diagnostics/
   features/
   schema/
-  step/
+  handwritten.rs
 samples/
   *.ifc
 ```
@@ -371,9 +320,8 @@ samples/
 Avoid these unless explicitly requested:
 
 - cross-file indexing
-- incremental parsing infrastructure
 - general-purpose background worker systems beyond the diagnostics scheduler
-- retaining ASTs for every open document
+- retaining a statement index for every open document
 - large abstraction layers or service registries
 - premature support for unimplemented LSP features
 

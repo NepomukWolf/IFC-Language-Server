@@ -1549,8 +1549,7 @@ mod tests {
 
     #[test]
     fn schema_aware_completions_do_not_require_ast() {
-        let mut document = Document::new_unloaded("#1=IFCWALL(".to_string());
-        document.ast_skipped = true;
+        let document = Document::new_unloaded("#1=IFCWALL(".to_string());
         let position = document.offset_to_position(document.text.len()).unwrap();
         assert!(
             completions(

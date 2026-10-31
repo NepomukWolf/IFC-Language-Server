@@ -12,8 +12,6 @@ use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
 use crate::handwritten;
 use crate::schema::SchemaDoc;
 
-pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyChangeError {
     InvalidRange(Range),
@@ -26,7 +24,6 @@ pub struct Document {
     pub lazy: Option<Arc<handwritten::Document>>,
     pub lazy_edits: LazyEdits,
     pub validation_cache: Arc<ValidationCache>,
-    pub ast_skipped: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
@@ -141,7 +138,6 @@ impl Document {
             lazy: Some(lazy),
             lazy_edits: LazyEdits::fresh(),
             validation_cache: Arc::default(),
-            ast_skipped: false,
             schema_name,
             line_offsets,
             definitions,
@@ -176,7 +172,6 @@ impl Document {
 
     pub fn unload_parse_state(&mut self) {
         self.lazy = None;
-        self.ast_skipped = false;
     }
 
     pub fn reload_parse_state(&mut self) {
@@ -278,11 +273,6 @@ impl Document {
 
     pub fn is_parse_state_loaded(&self) -> bool {
         self.lazy.is_some()
-    }
-
-    pub fn has_ast(&self) -> bool {
-        let _ = self;
-        false
     }
 
     pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
