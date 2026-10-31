@@ -566,8 +566,17 @@ impl Reader<'_, '_> {
     /// returns where it ends.
     fn skip(&mut self, error_start: usize) -> Result<usize, ParseError> {
         let mut depth = 0usize;
+        let mut end = self.p;
         while self.p < self.end {
             match self.text[self.p] {
+                b'/' if self.text.get(self.p..self.p + 2) == Some(b"/*") => {
+                    self.p = comment_end(self.text, self.p, self.end).unwrap_or(self.end);
+                    continue;
+                }
+                byte if byte.is_ascii_whitespace() => {
+                    self.p += 1;
+                    continue;
+                }
                 quote @ (b'\'' | b'"') => {
                     let start = self.p;
                     self.p += 1;
@@ -582,6 +591,7 @@ impl Reader<'_, '_> {
                         }
                         self.p += 1;
                     }
+                    end = self.p;
                     continue;
                 }
                 b'(' => depth += 1,
@@ -591,8 +601,8 @@ impl Reader<'_, '_> {
                 _ => {}
             }
             self.p += 1;
+            end = self.p;
         }
-        let mut end = self.p;
         while end > error_start && self.text[end - 1].is_ascii_whitespace() {
             end -= 1;
         }

@@ -177,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn skipping_an_invalid_value_steps_over_a_comment_with_delimiters() {
+        let doc = parse_document("DATA;\n#1=IFCCARTESIANPOINT((1.0,2x /* ; ) */,3.0));\nENDSEC;\n");
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&doc)),
+            vec![Diagnostic {
+                range: Range::new(Position::new(1, 27), Position::new(1, 28)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Invalid IFC STEP syntax".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
     fn reports_missing_step_semicolon() {
         let doc = parse_document("#1=IFCWALL('gid')\n#2=IFCWALL('next');");
         let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));
