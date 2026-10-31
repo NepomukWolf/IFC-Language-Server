@@ -11,6 +11,7 @@ pub struct TextIndex {
     pub sorted_definition_ids: Vec<u32>,
     pub references: HashMap<u32, Vec<usize>>,
     pub schema_name: Option<String>,
+    pub schema_end: Option<usize>,
 }
 
 pub fn scan_text(text: &str) -> TextIndex {
@@ -21,6 +22,7 @@ pub fn scan_text(text: &str) -> TextIndex {
         sorted_definition_ids: Vec::new(),
         references: HashMap::new(),
         schema_name: None,
+        schema_end: None,
     };
     let mut offset = 0usize;
 
@@ -54,8 +56,10 @@ pub fn scan_text(text: &str) -> TextIndex {
                 }
                 if index.schema_name.is_none()
                     && bytes[ident_start..offset].eq_ignore_ascii_case(b"FILE_SCHEMA")
+                    && let Some((name, end)) = parse_file_schema_name(bytes, offset)
                 {
-                    index.schema_name = parse_file_schema_name(bytes, offset);
+                    index.schema_name = Some(name);
+                    index.schema_end = Some(end);
                 }
             }
             _ => offset += 1,
@@ -65,6 +69,104 @@ pub fn scan_text(text: &str) -> TextIndex {
     index.sorted_definition_ids.sort_unstable();
     index.sorted_definition_ids.dedup();
     index
+}
+
+/// Whether replacing `start..end` leaves the index unchanged apart from shifted offsets, given that
+/// the scanner is outside strings and comments at `anchor`, an offset at or before `start`.
+pub fn index_neutral_edit(
+    text: &str,
+    anchor: usize,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) -> bool {
+    let bytes = text.as_bytes();
+    let mut offset = anchor;
+    let mut ignored_lines = Vec::new();
+    while offset <= start && offset < bytes.len() {
+        let token_start = offset;
+        let (interior_start, interior_end) = match bytes[offset] {
+            b'#' => {
+                offset += 1;
+                // Digits after `#` are never neutral, even in an id too large to index.
+                while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+                    offset += 1;
+                }
+                continue;
+            }
+            b'\'' => {
+                offset = skip_string(bytes, offset, &mut ignored_lines);
+                (token_start + 1, offset.saturating_sub(1))
+            }
+            b'/' if bytes.get(offset + 1) == Some(&b'*') => {
+                offset = skip_block_comment(bytes, offset, &mut ignored_lines);
+                (token_start + 2, offset.saturating_sub(2))
+            }
+            byte if is_identifier_start(byte) => {
+                offset += 1;
+                while bytes.get(offset).is_some_and(|b| is_identifier_part(*b)) {
+                    offset += 1;
+                }
+                (token_start, offset)
+            }
+            byte if byte.is_ascii_digit() || byte.is_ascii_whitespace() => {
+                offset += 1;
+                while bytes.get(offset).is_some_and(|b| {
+                    if byte.is_ascii_digit() {
+                        b.is_ascii_digit()
+                    } else {
+                        b.is_ascii_whitespace()
+                    }
+                }) {
+                    offset += 1;
+                }
+                (token_start, offset)
+            }
+            _ => {
+                offset += 1;
+                continue;
+            }
+        };
+        if start < interior_start || end > interior_end {
+            continue;
+        }
+        let old = &bytes[start..end];
+        let new = replacement.as_bytes();
+        return match bytes[token_start] {
+            b'\'' => {
+                // Inserting between doubled quotes would split a single escape.
+                (start == token_start + 1
+                    || !(bytes.get(start - 1) == Some(&b'\'') && bytes.get(start) == Some(&b'\'')))
+                    && old.iter().chain(new).all(|b| !matches!(b, b'\'' | b'\n'))
+            }
+            b'/' => {
+                // Deleting the bytes between `*` and `/` would end the comment early.
+                !(new.is_empty() && bytes[start - 1] == b'*' && bytes.get(end) == Some(&b'/'))
+                    && old
+                        .iter()
+                        .chain(new)
+                        .all(|b| !matches!(b, b'*' | b'/' | b'\n'))
+            }
+            byte => {
+                let remaining = offset - token_start - old.len() + new.len();
+                remaining > 0
+                    && if is_identifier_start(byte) {
+                        new.iter().all(|b| is_identifier_part(*b))
+                            && (start != token_start
+                                || new.first().is_some_and(|b| is_identifier_start(*b))
+                                || (new.is_empty()
+                                    && bytes.get(end).is_some_and(|b| is_identifier_start(*b))))
+                    } else if byte.is_ascii_digit() {
+                        new.iter().all(u8::is_ascii_digit)
+                    } else {
+                        old.iter()
+                            .chain(new)
+                            .all(|b| b.is_ascii_whitespace() && *b != b'\n')
+                    }
+            }
+        };
+    }
+    false
 }
 
 fn parse_id(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
@@ -128,7 +230,7 @@ fn skip_block_comment(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<us
     bytes.len()
 }
 
-fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<String> {
+fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<(String, usize)> {
     while offset < bytes.len() {
         match bytes[offset] {
             b'\'' => return parse_schema_string(bytes, offset),
@@ -144,7 +246,7 @@ fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<String> {
     None
 }
 
-fn parse_schema_string(bytes: &[u8], mut offset: usize) -> Option<String> {
+fn parse_schema_string(bytes: &[u8], mut offset: usize) -> Option<(String, usize)> {
     offset += 1;
     let start = offset;
     let mut value = Vec::new();
@@ -160,7 +262,7 @@ fn parse_schema_string(bytes: &[u8], mut offset: usize) -> Option<String> {
             value.extend_from_slice(&bytes[start..offset]);
             return String::from_utf8(value)
                 .ok()
-                .map(|schema_name| schema_name.to_ascii_uppercase());
+                .map(|schema_name| (schema_name.to_ascii_uppercase(), offset + 1));
         }
         offset += 1;
     }
@@ -168,7 +270,11 @@ fn parse_schema_string(bytes: &[u8], mut offset: usize) -> Option<String> {
     None
 }
 
-fn parse_schema_string_tail(bytes: &[u8], mut offset: usize, mut value: Vec<u8>) -> Option<String> {
+fn parse_schema_string_tail(
+    bytes: &[u8],
+    mut offset: usize,
+    mut value: Vec<u8>,
+) -> Option<(String, usize)> {
     let mut start = offset;
     while offset < bytes.len() {
         if bytes[offset] == b'\'' {
@@ -181,7 +287,7 @@ fn parse_schema_string_tail(bytes: &[u8], mut offset: usize, mut value: Vec<u8>)
                 value.extend_from_slice(&bytes[start..offset]);
                 return String::from_utf8(value)
                     .ok()
-                    .map(|schema_name| schema_name.to_ascii_uppercase());
+                    .map(|schema_name| (schema_name.to_ascii_uppercase(), offset + 1));
             }
         } else {
             offset += 1;
