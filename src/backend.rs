@@ -198,8 +198,7 @@ impl Backend {
         let document = documents
             .entry(uri.clone())
             .or_insert_with(|| Document::new_unloaded(String::new()));
-        document.unload_parse_state();
-        document.text = Arc::new(text);
+        *document = Document::new_unloaded(text);
 
         {
             let mut parser = new_parser();
