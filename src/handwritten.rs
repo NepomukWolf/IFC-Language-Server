@@ -26,6 +26,8 @@ pub enum Kind {
     Binary,
     Null,
     Omitted,
+    /// A malformed value the parser stepped over.
+    Invalid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -515,7 +517,17 @@ impl Reader<'_, '_> {
                     }
                     self.params.truncate(mark);
                     self.p = value_start;
-                    self.skip(comma.unwrap_or(value_start))?;
+                    let end = self.skip(comma.unwrap_or(value_start))?;
+                    if self.retain {
+                        self.params.push(Param {
+                            span: Span {
+                                start: value_start as u32,
+                                end: end.max(value_start) as u32,
+                            },
+                            next: self.params.len() as u32 + 1,
+                            kind: Kind::Invalid,
+                        });
+                    }
                 }
                 self.p = trivia(self.text, self.p, self.end);
                 if self.p < self.end && !matches!(self.text[self.p], b',' | b')' | b';') {
@@ -550,8 +562,9 @@ impl Reader<'_, '_> {
         self.depth -= 1;
         closed
     }
-    /// Skips one malformed value up to the next `,`, `)` or `;` of its list and records it.
-    fn skip(&mut self, error_start: usize) -> Result<(), ParseError> {
+    /// Skips one malformed value up to the next `,`, `)` or `;` of its list, records it and
+    /// returns where it ends.
+    fn skip(&mut self, error_start: usize) -> Result<usize, ParseError> {
         let mut depth = 0usize;
         while self.p < self.end {
             match self.text[self.p] {
@@ -590,7 +603,7 @@ impl Reader<'_, '_> {
             },
             message: "unexpected value",
         });
-        Ok(())
+        Ok(end)
     }
     fn value(&mut self) -> Result<(), ParseError> {
         self.p = trivia(self.text, self.p, self.end);

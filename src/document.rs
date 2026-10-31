@@ -89,6 +89,9 @@ pub enum ParameterValue {
     Unknown {
         range: Range,
     },
+    Malformed {
+        range: Range,
+    },
 }
 
 impl ParameterValue {
@@ -102,7 +105,8 @@ impl ParameterValue {
             | ParameterValue::Omitted { range }
             | ParameterValue::List { range, .. }
             | ParameterValue::Typed { range, .. }
-            | ParameterValue::Unknown { range } => *range,
+            | ParameterValue::Unknown { range }
+            | ParameterValue::Malformed { range } => *range,
         }
     }
 
@@ -117,6 +121,7 @@ impl ParameterValue {
             ParameterValue::List { .. } => "aggregate",
             ParameterValue::Typed { .. } => "typed value",
             ParameterValue::Unknown { .. } => "unknown value",
+            ParameterValue::Malformed { .. } => "malformed value",
         }
     }
 }
@@ -753,6 +758,7 @@ fn lazy_parameter_values(
             },
             Kind::Null => ParameterValue::Null { range },
             Kind::Omitted => ParameterValue::Omitted { range },
+            Kind::Invalid => ParameterValue::Malformed { range },
             Kind::Typed => ParameterValue::Typed {
                 type_name: source[..source.find('(').unwrap_or(source.len())]
                     .trim_end()

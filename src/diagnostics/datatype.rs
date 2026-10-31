@@ -261,6 +261,9 @@ fn validate_non_null_value<'a>(
     value: &'a ParameterValue,
     expected: &'a TypeRef,
 ) -> Validation<'a> {
+    if matches!(value, ParameterValue::Malformed { .. }) {
+        return Ok(());
+    }
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
         TypeRef::Aggregate(aggregate) => validate_aggregate(entity_types, schema, value, aggregate),
@@ -607,6 +610,13 @@ mod tests {
             [2],
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn datatype_validation_keeps_positions_after_a_malformed_value() {
+        let doc = parse_document("#1=IFCWALL(#,.MOVABLE.);\n#2=IFCWALL(1E,#);\n");
+        let diagnostics = collect(&doc, &test_schema(), None);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     /// Test that the datatype validator accepts valid values.
