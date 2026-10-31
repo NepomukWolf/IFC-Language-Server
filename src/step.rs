@@ -1,5 +1,3 @@
-pub mod ast;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Span {
     pub start: u32,

@@ -111,11 +111,9 @@ Example `initializationOptions`:
 }
 ```
 
-### Grammar And Parser
+### Parser
 
-This project depends on the published [`tree-sitter-ifc`](https://crates.io/crates/tree-sitter-ifc) crate for IFC parsing.
-
-If you are developing the grammar itself, work in the [`tree-sitter-ifc`](https://github.com/NepomukWolf/tree-sitter-ifc) repository and publish a new crate version when needed. During local development, you can temporarily override the crates.io dependency with a `[patch.crates-io]` entry that points at a local checkout.
+IFC STEP files are parsed by the STEP statement parser in `src/step.rs`; see [Architecture](./docs/architecture.md#parsing).
 
 ## Documentation
 
