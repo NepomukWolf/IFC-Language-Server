@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE language SYSTEM "language.dtd">
+<language name="IFC STEP" version="2" kateversion="5.0" section="Sources" extensions="*.ifc" mimetype="text/x-ifc" priority="10">
+  <highlighting>
+    <contexts>
+      <context name="Normal" attribute="Normal Text" lineEndContext="#stay">
+        <Detect2Chars char="/" char1="*" attribute="Comment" context="Comment"/>
+        <StringDetect String="'" attribute="String" context="String"/>
+        <RegExpr String="#[0-9]+" attribute="Variable"/>
+        <RegExpr String="\.[A-Z][A-Z0-9_]*\." attribute="Constant"/>
+        <RegExpr String="\bIFC[A-Z0-9_]+\b" attribute="Type"/>
+        <RegExpr String="\b(HEADER|DATA|ENDSEC|END-ISO-10303-21)\b" attribute="Keyword"/>
+        <RegExpr String="\b[-+]?[0-9]+(\.[0-9]*)?([Ee][-+]?[0-9]+)?\b" attribute="Decimal"/>
+        <AnyChar String="();,$=*" attribute="Operator"/>
+      </context>
+      <context name="String" attribute="String" lineEndContext="#stay">
+        <StringDetect String="''" attribute="String" context="#stay"/>
+        <StringDetect String="'" attribute="String" context="#pop"/>
+      </context>
+      <context name="Comment" attribute="Comment" lineEndContext="#stay">
+        <Detect2Chars char="*" char1="/" attribute="Comment" context="#pop"/>
+      </context>
+    </contexts>
+    <itemDatas>
+      <itemData name="Normal Text" defStyleNum="dsNormal"/>
+      <itemData name="Comment" defStyleNum="dsComment"/>
+      <itemData name="String" defStyleNum="dsString"/>
+      <itemData name="Variable" defStyleNum="dsVariable"/>
+      <itemData name="Constant" defStyleNum="dsConstant"/>
+      <itemData name="Type" defStyleNum="dsDataType"/>
+      <itemData name="Keyword" defStyleNum="dsKeyword"/>
+      <itemData name="Decimal" defStyleNum="dsDecVal"/>
+      <itemData name="Operator" defStyleNum="dsOperator"/>
+    </itemDatas>
+  </highlighting>
+  <general><comments><comment name="multiLine" start="/*" end="*/"/></comments></general>
+</language>

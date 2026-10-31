@@ -113,6 +113,28 @@ Colouring, diagnostics, hover, go-to-definition, references and completion work 
 
 In Notepad++, open **Language > User Defined Language > Define your language…**, click **Import…**, choose `editors/notepad++/IFC_STEP.udl.xml` and restart. `.ifc` files are coloured up to at least 56 MB. This is colouring only: NppLspClient 0.0.40, the available LSP client, does not load in Notepad++ 8.9.
 
+#### Kate
+
+Copy the syntax definition and the LSP configuration into place (if you already have `settings.json`, merge the file's contents in via **Settings > Configure Kate > LSP Client > User Server Settings** instead):
+
+```sh
+mkdir -p ~/.local/share/org.kde.syntax-highlighting/syntax ~/.config/kate/lspclient
+cp editors/kate/ifc.xml ~/.local/share/org.kde.syntax-highlighting/syntax/ifc.xml
+cp editors/kate/lspclient-settings.json ~/.config/kate/lspclient/settings.json
+```
+
+Tested with Kate 26.11: on a 13.6 MB file, diagnostics, hover, go-to-definition, references, completion and outline work, and Kate requests semantic tokens for the visible range; a 56 MB file gets diagnostics, outline and semantic tokens. Enable semantic highlighting in the LSP Client settings. Raise **Settings > Configure Kate > Editing > Line Length Limit**, as very long STEP lines otherwise make the document read-only. Kate asks once to trust the server command.
+
+#### Sublime Text
+
+Install the LSP package through Package Control, then put both files in `Packages/User/` (**Preferences > Browse Packages…**) and restart:
+
+```sh
+cp editors/sublime/IFC.sublime-syntax editors/sublime/LSP.sublime-settings "<Packages>/User/"
+```
+
+Tested with build 4215 and the LSP package: colouring, diagnostics, completion and go-to-definition work, and Sublime requests semantic tokens for the visible range; hover, references and outline are untested. A 56 MB file opened as Plain Text; choose **View > Syntax > IFC STEP** for it.
+
 ### Manual
 
 Release binaries are available on the [Releases](https://github.com/NepomukWolf/IFC-Language-Server/releases) page.
