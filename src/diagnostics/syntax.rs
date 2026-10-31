@@ -193,6 +193,23 @@ mod tests {
     }
 
     #[test]
+    fn reports_a_stray_closing_parenthesis_instead_of_a_missing_semicolon() {
+        let doc = parse_document("DATA;\n#1=IFCX((1)));\n#2=IFCX(2);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(1, 12), Position::new(1, 13)),
+                "Invalid IFC STEP syntax".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn reports_one_unclosed_string_diagnostic_at_its_opening_quote() {
         let doc = parse_document("#1=IFCWALL('Anna's wall');\n#2=IFCWALL('next');\n");
         let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));

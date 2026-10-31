@@ -462,7 +462,7 @@ impl Reader<'_, '_> {
                 b'=' => "expected =",
                 _ => "expected delimiter",
             });
-            if byte == b';' {
+            if byte == b';' && self.p >= self.end {
                 error.span.start = before_trivia as u32;
                 error.span.end = before_trivia as u32;
             } else if byte == b')' && self.text.get(self.p) == Some(&b';') {
