@@ -26,9 +26,22 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["js", "v4"] }
 
 [dev-dependencies]
+criterion = "0.8"
 futures = "0.3"
 tokio = { version = "1", features = ["test-util"] }
 tower = "0.4"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "ifc-language-server"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "lsp"
+harness = false
 
 [build-dependencies]
 sha2 = "0.11"
