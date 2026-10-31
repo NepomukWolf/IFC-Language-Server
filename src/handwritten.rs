@@ -227,7 +227,6 @@ impl Document {
         })();
         if let Err(error) = result {
             self.errors.push(error);
-            self.params.truncate(param_start as usize);
         }
         statement.param_len = self.params.len() as u32 - param_start;
         self.statements.push(statement);
@@ -253,9 +252,7 @@ impl Document {
             retain: true,
             depth: 0,
         };
-        if r.list(Kind::List).is_err() {
-            params.clear();
-        }
+        let _ = r.list(Kind::List);
         params
     }
 
@@ -323,7 +320,9 @@ impl Document {
             param.next = (param.next as i64 + param_delta) as u32;
         }
         for param in &mut local.params {
-            param.next += a;
+            if param.next != 0 {
+                param.next += a;
+            }
         }
         for statement in &mut self.statements[last..] {
             statement.span.shift(delta);
@@ -478,7 +477,7 @@ impl Reader<'_, '_> {
             });
         }
         self.p = trivia(self.text, self.p, self.end);
-        if self.text.get(self.p) != Some(&b')') {
+        let result = if self.text.get(self.p) != Some(&b')') {
             loop {
                 self.value()?;
                 self.p = trivia(self.text, self.p, self.end);
@@ -488,20 +487,32 @@ impl Reader<'_, '_> {
                     break;
                 }
             }
-        }
-        self.expect(b')')?;
+            Ok(())
+        } else {
+            Ok(())
+        };
+        let result = result.and_then(|()| self.expect(b')'));
         if self.retain {
+            let complete = result.is_ok() || self.params.len() > slot + 1;
             self.params[slot] = Param {
                 span: Span {
-                    start: start as u32,
-                    end: self.p as u32,
+                    start: if complete { start as u32 } else { 0 },
+                    end: if complete {
+                        self.p.min(self.end) as u32
+                    } else {
+                        0
+                    },
                 },
-                next: self.params.len() as u32,
+                next: if complete {
+                    self.params.len() as u32
+                } else {
+                    0
+                },
                 kind,
             };
         }
         self.depth -= 1;
-        Ok(())
+        result
     }
     fn value(&mut self) -> Result<(), ParseError> {
         self.p = trivia(self.text, self.p, self.end);

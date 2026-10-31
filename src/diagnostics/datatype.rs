@@ -576,13 +576,13 @@ mod tests {
             "#3=IFCWALL(789,.MOVABLE.);\n",
         ));
         let diagnostics = collect(&doc, &test_schema(), None);
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         assert_eq!(
             diagnostics
                 .iter()
                 .map(|d| d.range.start.line)
                 .collect::<Vec<_>>(),
-            [0, 2]
+            [0, 1, 2]
         );
         assert!(
             diagnostics
