@@ -1,0 +1,11 @@
+{
+  "clients": {
+    "ifc-language-server": {
+      "enabled": true,
+      "command": ["ifc-language-server"],
+      "selector": "source.ifc",
+      "initializationOptions": {"semanticTokensEnabled": true}
+    }
+  },
+  "semantic_highlighting": true
+}

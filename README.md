@@ -49,6 +49,94 @@ Extensions for VSCode and Zed are available for local installation (though still
 
 - [Zed](https://github.com/Finradon/zed-ifc)
 
+Other editors are set up with the files in [`editors/`](editors) and an `ifc-language-server` binary on your `PATH` (see [Manual](#manual)). In every editor, files above the server's `astFileSizeLimitMb` (70 MB by default, see [Configuration](#configuration)) get only the features that don't need the full syntax tree.
+
+#### Neovim
+
+Neovim 0.11 or later. Copy the syntax, file-type and LSP files into your config and enable the server in `init.lua`:
+
+```sh
+cp -R editors/neovim/. ~/.config/nvim/
+```
+
+```lua
+vim.lsp.enable('ifc')
+```
+
+Colouring and the server connection work on files of at least 180 MB. The file-type rule takes priority over size-based detection such as LazyVim's snacks.nvim `bigfile`. On lines of hundreds of thousands of characters, semantic colours take minutes to fill in, as Neovim's cost per token grows with line length.
+
+#### Helix
+
+Add to `~/.config/helix/languages.toml`:
+
+```toml
+[[language]]
+name = "ifc"
+scope = "source.ifc"
+file-types = ["ifc"]
+language-servers = ["ifc-language-server"]
+
+[language-server.ifc-language-server]
+command = "ifc-language-server"
+
+[[grammar]]
+name = "ifc"
+source = { git = "https://github.com/NepomukWolf/tree-sitter-ifc", rev = "168e01eba32896cfbdacea38fdb068343d43073c" }
+```
+
+Then build the grammar and install its highlight query:
+
+```sh
+hx --grammar fetch && hx --grammar build
+mkdir -p ~/.config/helix/runtime/queries/ifc
+cp ~/.config/helix/runtime/grammars/sources/ifc/queries/highlights.scm ~/.config/helix/runtime/queries/ifc/
+```
+
+The server connection works at any file size. Helix stops parsing after a fixed 500 ms, so files above roughly 8 MB stay uncoloured.
+
+#### Emacs
+
+Emacs 29 or later (tested with Emacs 31.1 and its built-in Eglot). Put `editors/emacs/ifc-mode.el` in a directory on your `load-path` and add to `init.el`:
+
+```elisp
+(require 'ifc-mode)
+(with-eval-after-load 'eglot
+  (add-to-list 'eglot-server-programs
+               '(ifc-mode . ("ifc-language-server"
+                             :initializationOptions (:semanticTokensEnabled :json-false)))))
+(add-hook 'ifc-mode-hook #'eglot-ensure)
+```
+
+Colouring, diagnostics, hover, go-to-definition, references and completion work on files of at least 56 MB. Eglot only requests full-document semantic tokens, which the server does not provide, so the snippet turns them off. The outline (`imenu`) takes seconds on a 13.6 MB file and minutes on a 56 MB one, as Eglot locates each symbol by counting lines from the top of the buffer. Emacs asks for confirmation before opening files above `large-file-warning-threshold` (10 MB by default).
+
+#### Notepad++
+
+In Notepad++, open **Language > User Defined Language > Define your language…**, click **Import…**, choose `editors/notepad++/IFC_STEP.udl.xml` and restart. `.ifc` files are coloured up to at least 56 MB. This is colouring only: NppLspClient 0.0.40, the available LSP client, does not load in Notepad++ 8.9.
+
+#### Kate
+
+Copy the syntax definition and the LSP configuration into place (if you already have `settings.json`, merge the file's contents in via **Settings > Configure Kate > LSP Client > User Server Settings** instead):
+
+```sh
+mkdir -p ~/.local/share/org.kde.syntax-highlighting/syntax ~/.config/kate/lspclient
+cp editors/kate/ifc.xml ~/.local/share/org.kde.syntax-highlighting/syntax/ifc.xml
+cp editors/kate/lspclient-settings.json ~/.config/kate/lspclient/settings.json
+```
+
+Tested with Kate 26.11: on a 13.6 MB file, diagnostics, hover, go-to-definition, references, completion and outline work, and Kate requests semantic tokens for the visible range; a 56 MB file gets diagnostics, outline and semantic tokens. Enable semantic highlighting in the LSP Client settings. Raise **Settings > Configure Kate > Editing > Line Length Limit**, as very long STEP lines otherwise make the document read-only. Kate asks once to trust the server command.
+
+#### Sublime Text
+
+Install the LSP package through Package Control and copy the syntax into `Packages/User/` (**Preferences > Browse Packages…**):
+
+```sh
+cp editors/sublime/IFC.sublime-syntax "<Packages>/User/"
+```
+
+Then open **Preferences > Package Settings > LSP > Settings**, merge the `clients.ifc-language-server` entry and `"semantic_highlighting": true` from `editors/sublime/LSP.sublime-settings` into your settings, and restart.
+
+Tested with build 4215 and the LSP package: colouring, diagnostics, completion and go-to-definition work, and Sublime requests semantic tokens for the visible range; hover, references and outline are untested. A 56 MB file opened as Plain Text; choose **View > Syntax > IFC STEP** for it.
+
 ### Manual
 
 Release binaries are available on the [Releases](https://github.com/NepomukWolf/IFC-Language-Server/releases) page.

@@ -1,0 +1,29 @@
+%YAML 1.2
+---
+name: IFC STEP
+file_extensions: [ifc]
+first_line_match: '^ISO-10303-21;'
+scope: source.ifc
+contexts:
+  main:
+    - match: '/\*'
+      push: comment
+      scope: punctuation.definition.comment.begin.ifc
+    - match: "'([^']|'')*'"
+      scope: string.quoted.single.ifc
+    - match: '#[0-9]+'
+      scope: variable.other.instance.ifc
+    - match: '\.[A-Z][A-Z0-9_]*\.'
+      scope: constant.language.enum.ifc
+    - match: '\bIFC[A-Z0-9_]+\b'
+      scope: entity.name.type.ifc
+    - match: '\b(ISO-10303-21|HEADER|DATA|ENDSEC|END-ISO-10303-21)\b'
+      scope: keyword.control.ifc
+    - match: '[-+]?\b[0-9]+(\.[0-9]*)?([Ee][-+]?[0-9]+)?\b'
+      scope: constant.numeric.ifc
+    - match: '[();,$=*]'
+      scope: keyword.operator.ifc
+  comment:
+    - meta_scope: comment.block.ifc
+    - match: '\*/'
+      pop: true

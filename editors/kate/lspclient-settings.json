@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "ifc": {
+      "highlightingModeRegex": "^IFC STEP$",
+      "servers": {
+        "ifc-language-server": {
+          "command": ["ifc-language-server"],
+          "initializationOptions": {"semanticTokensEnabled": true}
+        }
+      }
+    }
+  }
+}
