@@ -388,8 +388,8 @@ mod tests {
 
     fn schema_doc() -> Arc<SchemaDoc> {
         Arc::new(SchemaDoc {
-            entities: HashMap::new(),
-            types: HashMap::new(),
+            entities: Default::default(),
+            types: Default::default(),
         })
     }
 

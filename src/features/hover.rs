@@ -574,8 +574,6 @@ fn format_attribute_type(type_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
     use crate::schema::EntityAttributeDoc;
 
@@ -1050,7 +1048,7 @@ mod tests {
                 },
             ],
             url: "https://example.invalid/IfcWall.htm".to_string(),
-            all_supertypes: HashSet::new(),
+            all_supertypes: Default::default(),
         };
 
         let markdown = render_entity_hover(&entity);
@@ -1081,7 +1079,7 @@ mod tests {
                 allows_omitted: false,
             }],
             url: "https://example.invalid/IfcRoot.htm".to_string(),
-            all_supertypes: HashSet::new(),
+            all_supertypes: Default::default(),
         };
 
         let markdown = render_entity_hover(&entity);

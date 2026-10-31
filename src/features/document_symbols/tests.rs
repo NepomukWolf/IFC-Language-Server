@@ -1,7 +1,7 @@
 use super::*;
 use crate::document::Document;
 use crate::schema::{EntityAttributeDoc, EntityDoc, TypeRef};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 fn parse(text: &str) -> Document {
     Document::parse(text.to_string())
@@ -29,7 +29,7 @@ fn schema() -> SchemaDoc {
     let product = ["IFCROOT", "IFCPRODUCT"];
     let spatial = ["IFCROOT", "IFCSPATIALELEMENT", "IFCPRODUCT"];
     let spatial_structure = ["IFCROOT", "IFCSPATIALSTRUCTUREELEMENT", "IFCPRODUCT"];
-    let mut entities: HashMap<String, EntityDoc> = [
+    let mut entities: FxHashMap<String, EntityDoc> = [
         ("IFCPROJECT", root.as_slice()),
         ("IFCSITE", spatial_structure.as_slice()),
         ("IFCBUILDING", spatial_structure.as_slice()),
@@ -95,7 +95,7 @@ fn schema() -> SchemaDoc {
 
     SchemaDoc {
         entities,
-        types: HashMap::new(),
+        types: Default::default(),
     }
 }
 fn names(symbol: &DocumentSymbol) -> Vec<String> {

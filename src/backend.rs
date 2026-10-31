@@ -1132,8 +1132,8 @@ mod tests {
         *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
             "IFC4".to_string(),
             SchemaDoc {
-                entities: HashMap::new(),
-                types: HashMap::new(),
+                entities: Default::default(),
+                types: Default::default(),
             },
         )]);
 
@@ -1162,8 +1162,8 @@ mod tests {
         *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
             normalize_name("Forced"),
             SchemaDoc {
-                entities: HashMap::new(),
-                types: HashMap::new(),
+                entities: Default::default(),
+                types: Default::default(),
             },
         )]);
         backend.config.write().await.forced_schema_name = Some(normalize_name("Forced"));
@@ -1177,8 +1177,8 @@ mod tests {
 
     fn empty_schema() -> SchemaDoc {
         SchemaDoc {
-            entities: HashMap::new(),
-            types: HashMap::new(),
+            entities: Default::default(),
+            types: Default::default(),
         }
     }
 
@@ -1303,8 +1303,8 @@ mod tests {
         *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
             normalize_name("IFC4"),
             SchemaDoc {
-                entities: HashMap::new(),
-                types: HashMap::new(),
+                entities: Default::default(),
+                types: Default::default(),
             },
         )]);
         let large = Url::parse("file:///tmp/large.ifc").unwrap();

@@ -880,7 +880,7 @@ pub fn resolve_completion_item(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use crate::schema::{
         AggregateKind, AggregateTypeRef, AliasTypeDef, EntityAttributeDoc, EntityDoc,
@@ -925,7 +925,7 @@ mod tests {
             optional: false,
         });
         SchemaDoc {
-            entities: HashMap::from([
+            entities: FxHashMap::from_iter([
                 (
                     "IFCWALL".to_string(),
                     entity(
@@ -962,7 +962,7 @@ mod tests {
                     entity("IfcOwnerHistory", Vec::new(), &[]),
                 ),
             ]),
-            types: HashMap::from([
+            types: FxHashMap::from_iter([
                 (
                     "IFCGLOBALLYUNIQUEID".to_string(),
                     TypeDoc::Alias(AliasTypeDef {
@@ -1592,6 +1592,6 @@ mod tests {
     fn test_schema_has_no_accidental_duplicate_supertypes() {
         let schema = schema();
         let supers = &schema.entity("IfcWall").unwrap().all_supertypes;
-        assert_eq!(supers, &HashSet::from(["IFCROOT".to_string()]));
+        assert_eq!(supers, &FxHashSet::from_iter(["IFCROOT".to_string()]));
     }
 }

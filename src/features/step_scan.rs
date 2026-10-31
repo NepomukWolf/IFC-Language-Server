@@ -3,7 +3,7 @@
 //! full parse. Shared by inlay hints and related-entity navigation, which both only
 //! need argument boundaries, enclosing entity names, and referenced ids within a bounded region.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ScannedInstance {
@@ -22,7 +22,7 @@ pub(crate) struct EntityArgumentContext {
 /// Locates the positional argument containing `cursor_offset` without requiring an AST.
 pub(crate) fn entity_argument_context(
     text: &str,
-    definitions: &HashMap<u32, usize>,
+    definitions: &FxHashMap<u32, usize>,
     cursor_offset: usize,
 ) -> Option<EntityArgumentContext> {
     if cursor_offset > text.len() || !text.is_char_boundary(cursor_offset) {
@@ -96,7 +96,7 @@ pub(crate) fn entity_argument_context(
 
 fn statement_start_before_cursor(
     text: &str,
-    definitions: &HashMap<u32, usize>,
+    definitions: &FxHashMap<u32, usize>,
     cursor_offset: usize,
 ) -> usize {
     let bytes = text.as_bytes();
@@ -374,13 +374,13 @@ mod tests {
     #[test]
     fn argument_context_rejects_statement_without_leading_hash() {
         let text = "12=IFCWALL(";
-        assert!(entity_argument_context(text, &HashMap::new(), text.len()).is_none());
+        assert!(entity_argument_context(text, &FxHashMap::default(), text.len()).is_none());
     }
 
     #[test]
     fn argument_context_skips_leading_comments() {
         let text = "#1=IFCWALL($, /* explanation */ .SO";
-        let context = entity_argument_context(text, &HashMap::new(), text.len())
+        let context = entity_argument_context(text, &FxHashMap::default(), text.len())
             .expect("expected argument context");
 
         assert_eq!(context.active_parameter, 1);
@@ -400,7 +400,7 @@ mod tests {
         for cursor in 0..=text.len() {
             assert_eq!(
                 entity_argument_context(text, &definitions, cursor),
-                entity_argument_context(text, &HashMap::new(), cursor),
+                entity_argument_context(text, &FxHashMap::default(), cursor),
                 "cursor {cursor}"
             );
         }

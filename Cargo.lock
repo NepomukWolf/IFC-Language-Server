@@ -576,6 +576,7 @@ dependencies = [
  "futures",
  "memchr",
  "percent-encoding",
+ "rustc-hash",
  "serde_json",
  "sha2",
  "time",
@@ -908,6 +909,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"

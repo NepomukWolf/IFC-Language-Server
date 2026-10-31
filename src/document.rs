@@ -2,7 +2,7 @@
 //! This module owns the source text, cheap text indexes for navigation, and the lazy STEP index.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
@@ -26,9 +26,9 @@ pub struct Document {
     pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
-    pub definitions: HashMap<u32, usize>,
+    pub definitions: FxHashMap<u32, usize>,
     pub definitions_by_id: Vec<(u32, usize)>,
-    pub references: HashMap<u32, Vec<usize>>,
+    pub references: FxHashMap<u32, Vec<usize>>,
     schema_end: Option<usize>,
 }
 
@@ -1025,8 +1025,8 @@ mod tests {
             .expect("replacement should parse");
         let edited = build(&document);
         let schema = Arc::new(SchemaDoc {
-            entities: HashMap::new(),
-            types: HashMap::new(),
+            entities: Default::default(),
+            types: Default::default(),
         });
         let with_schema = cache.get_or_build_with(Some(&schema), &document.text, || {
             build_entity_instances(None, &document.text)

@@ -2,16 +2,16 @@
 //! This scanner intentionally recognizes only the tokens needed for cheap LSP navigation:
 //! line starts, local instance ids, references, and FILE_SCHEMA declarations.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::handwritten;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct TextIndex {
     pub line_offsets: Vec<usize>,
-    pub definitions: HashMap<u32, usize>,
+    pub definitions: FxHashMap<u32, usize>,
     pub definitions_by_id: Vec<(u32, usize)>,
-    pub references: HashMap<u32, Vec<usize>>,
+    pub references: FxHashMap<u32, Vec<usize>>,
     pub schema_name: Option<String>,
     pub schema_end: Option<usize>,
 }

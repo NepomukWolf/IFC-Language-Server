@@ -12,6 +12,7 @@ build = "build.rs"
 espr = "0.4.0"
 memchr = "2"
 percent-encoding = "2"
+rustc-hash = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
 tower-lsp = "0.20"
 tokio = {
