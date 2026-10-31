@@ -1,6 +1,6 @@
 //! Schema-backed inlay hints for positional STEP entity arguments.
 //! A lightweight range scanner finds entity instances and argument starts without requiring
-//! tree-sitter AST state.
+//! AST state.
 
 use tower_lsp::lsp_types::{InlayHint, InlayHintKind, Range};
 
@@ -88,8 +88,6 @@ fn scan_instances(document: &Document, scan_start: usize, scan_end: usize) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use tower_lsp::lsp_types::{InlayHintLabel, Position};
 
     use super::*;
@@ -105,12 +103,12 @@ mod tests {
                 attribute("Representation", "IfcProduct"),
             ],
             url: String::new(),
-            all_supertypes: HashSet::new(),
+            all_supertypes: Default::default(),
         };
         SchemaDocCollection::from_docs([(
             "IFC4".to_string(),
             SchemaDoc {
-                entities: [("IFCWALL".to_string(), entity)].into(),
+                entities: [("IFCWALL".to_string(), entity)].into_iter().collect(),
                 types: Default::default(),
             },
         )])

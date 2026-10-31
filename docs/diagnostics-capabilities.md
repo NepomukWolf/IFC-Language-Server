@@ -58,6 +58,12 @@ The diagnostics provider distinguishes between valid and invalid uses of `*`.
 Checks if the cardinalities for an agggregation type are correct.
 ![alt text](assets/too_many_items.png)
 
+## 8. Nesting Depth
+
+Lists and typed values nested more than 256 levels deep are reported as "Values nested more than
+256 levels deep are not supported" at the list that exceeds the limit. The statement's parameters
+are not read, so the other diagnostics skip it.
+
 ## Current Limitations
 
 The current diagnostics provider does not yet implement:
