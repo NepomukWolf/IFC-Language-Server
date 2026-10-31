@@ -1,7 +1,7 @@
 //! Lightweight STEP and schema-aware completions.
 //! Completion context is derived from document text and schema docs without loading AST state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation,
@@ -77,7 +77,7 @@ fn next_id_completion(
     position: Position,
     offset: usize,
 ) -> Option<CompletionItem> {
-    if entity_argument_context(&document.text, offset).is_some() {
+    if entity_argument_context(&document.text, &document.definitions, offset).is_some() {
         return None;
     }
 
@@ -240,7 +240,8 @@ fn argument_completions(
     snippet_supported: bool,
     eager_documentation: bool,
 ) -> CompletionResults {
-    let Some(context) = entity_argument_context(&document.text, offset) else {
+    let Some(context) = entity_argument_context(&document.text, &document.definitions, offset)
+    else {
         return empty_results();
     };
     let Some(entity) = schema.entity(&context.entity_name) else {
@@ -418,27 +419,23 @@ fn reference_completions(
         return (Vec::new(), false);
     };
 
-    let mut definitions = document
-        .definitions
-        .iter()
-        .map(|(id, offset)| (*id, *offset))
-        .filter(|(id, _)| id.to_string().starts_with(prefix))
-        .collect::<Vec<_>>();
-    definitions.sort_by_key(|(id, _)| *id);
-
-    let mut matching = definitions
-        .into_iter()
-        .filter_map(|(id, offset)| {
+    let mut compatible_by_name = HashMap::<&str, bool>::new();
+    let mut matching = definitions_with_id_prefix(&document.sorted_definition_ids, prefix)
+        .filter_map(|&id| {
+            let offset = *document.definitions.get(&id)?;
             let entity_name =
                 scan_definition_entity_name(&document.text, offset, document.text.len())?;
-            if !accepts_any_entity
-                && !expected_entities
-                    .iter()
-                    .any(|expected| schema.is_entity_compatible(&entity_name, expected))
-            {
+            let compatible = accepts_any_entity
+                || *compatible_by_name.entry(entity_name).or_insert_with(|| {
+                    expected_entities
+                        .iter()
+                        .any(|expected| schema.is_entity_compatible(entity_name, expected))
+                });
+            if !compatible {
                 return None;
             }
 
+            let entity_name = normalize_name(entity_name);
             let reference = format!("#{id}");
             let mut item = completion_item(
                 reference.clone(),
@@ -464,6 +461,32 @@ fn reference_completions(
     let is_incomplete = matching.len() > MAX_REFERENCE_COMPLETIONS;
     matching.truncate(MAX_REFERENCE_COMPLETIONS);
     (matching, is_incomplete)
+}
+
+fn definitions_with_id_prefix<'a>(
+    sorted_definition_ids: &'a [u32],
+    prefix: &str,
+) -> impl Iterator<Item = &'a u32> {
+    let mut ranges = Vec::new();
+    if prefix.is_empty() {
+        ranges.push((0, u64::from(u32::MAX)));
+    } else if prefix == "0" {
+        ranges.push((0, 0));
+    } else if !prefix.starts_with('0')
+        && let Ok(value) = prefix.parse::<u64>()
+    {
+        let (mut low, mut high) = (value, value);
+        while low <= u64::from(u32::MAX) {
+            ranges.push((low, high));
+            low *= 10;
+            high = high * 10 + 9;
+        }
+    }
+    ranges.into_iter().flat_map(move |(low, high)| {
+        let start = sorted_definition_ids.partition_point(|&id| u64::from(id) < low);
+        let end = sorted_definition_ids.partition_point(|&id| u64::from(id) <= high);
+        &sorted_definition_ids[start..end]
+    })
 }
 
 fn render_entity_signature(entity: &EntityDoc) -> String {
@@ -1324,6 +1347,187 @@ mod tests {
         assert_eq!(narrowed_results.items.len(), 1);
         assert_eq!(narrowed_results.items[0].label, "#100");
         assert!(!narrowed_results.is_incomplete);
+    }
+
+    #[test]
+    fn reference_results_ignore_entity_name_case_and_follow_numeric_id_order() {
+        let text = "#9=IfcWall($);#3=ifcdoor($);#12=IfcOwnerHistory($);#5=IFCWALL($);\
+                    #7=ifcWallStandardCase($);#20=IFCWALL($,$,$,(#";
+        let results = items(text, Some(&schema()));
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| (item.label.as_str(), item.detail.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("#3", "IFCDOOR"),
+                ("#5", "IFCWALL"),
+                ("#7", "IFCWALLSTANDARDCASE"),
+                ("#9", "IFCWALL"),
+                ("#20", "IFCWALL"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_results_take_first_hundred_compatible_ids_among_incompatible_ones() {
+        let definitions = |ids: &mut dyn Iterator<Item = u32>| {
+            ids.map(|id| {
+                let entity = if id % 2 == 0 {
+                    "IfcWall"
+                } else {
+                    "IFCOWNERHISTORY"
+                };
+                format!("#{id}={entity}($);")
+            })
+            .collect::<String>()
+        };
+        let text = format!("{}#300=IFCWALL($,$,$,(#", definitions(&mut (1..=250).rev()));
+        let response = results(&text, Some(&schema()), false, false);
+
+        let expected = (1..=100).map(|n| format!("#{}", n * 2)).collect::<Vec<_>>();
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(response.is_incomplete);
+
+        let response = results(
+            &format!("{}#300=IFCWALL($,$,$,(#", definitions(&mut (1..=198))),
+            Some(&schema()),
+            false,
+            false,
+        );
+        assert_eq!(response.items.len(), MAX_REFERENCE_COMPLETIONS);
+        assert_eq!(response.items.last().unwrap().label, "#300");
+        assert!(!response.is_incomplete);
+    }
+
+    #[test]
+    fn reference_prefix_filters_ids_before_compatibility() {
+        let definitions = (1..=120)
+            .map(|id| {
+                let entity = if id % 3 == 0 {
+                    "IFCOWNERHISTORY"
+                } else {
+                    "IfcDoor"
+                };
+                format!("#{id}={entity}($);")
+            })
+            .collect::<String>();
+        let text = format!("{definitions}#300=IFCWALL($,$,$,(#1");
+        let labels = items(&text, Some(&schema()))
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            [
+                "#1", "#10", "#11", "#13", "#14", "#16", "#17", "#19", "#100", "#101", "#103",
+                "#104", "#106", "#107", "#109", "#110", "#112", "#113", "#115", "#116", "#118",
+                "#119"
+            ]
+        );
+    }
+
+    #[test]
+    fn id_prefix_ranges_match_decimal_string_prefixes_in_numeric_order() {
+        let ids = [
+            0,
+            1,
+            9,
+            10,
+            11,
+            19,
+            100,
+            199,
+            1000,
+            2,
+            20,
+            42,
+            429_496_729,
+            4_294_967_295,
+            4_294_967_290,
+            1_000_000_000,
+            999_999_999,
+        ];
+        let mut sorted_definition_ids = ids.to_vec();
+        sorted_definition_ids.sort();
+        for prefix in [
+            "",
+            "0",
+            "00",
+            "01",
+            "1",
+            "10",
+            "100",
+            "19",
+            "2",
+            "4",
+            "42",
+            "429496729",
+            "4294967295",
+            "42949672950",
+            "5",
+            "99999999999999999999999",
+        ] {
+            let expected = sorted_definition_ids
+                .iter()
+                .filter(|id| id.to_string().starts_with(prefix))
+                .copied()
+                .collect::<Vec<_>>();
+            let actual = definitions_with_id_prefix(&sorted_definition_ids, prefix)
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "prefix {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn reference_prefix_orders_ids_written_out_of_order_and_duplicated() {
+        let text = "#100=IFCWALL($);#2=IFCWALL($);#10=IFCWALL($);#1=IFCWALL($);#21=IFCWALL($);\
+                    #10=IFCOWNERHISTORY($);#1000=IFCWALL($);#11=IFCWALL($);#300=IFCWALL($,$,$,(#";
+        let labels = |prefix: &str| {
+            items(&format!("{text}{prefix}"), Some(&schema()))
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            labels(""),
+            ["#1", "#2", "#11", "#21", "#100", "#300", "#1000"]
+        );
+        assert_eq!(labels("1"), ["#1", "#11", "#100", "#1000"]);
+        assert_eq!(labels("10"), ["#100", "#1000"]);
+        assert!(labels("0").is_empty());
+    }
+
+    #[test]
+    fn bundled_schemas_filter_spatial_references_by_their_own_hierarchy() {
+        let schemas = crate::schema::SchemaDocCollection::new();
+        let text = "#1=IFCBUILDINGSTOREY($);#2=IfcSpatialZone($);#3=IFCROAD($);#4=IFCWALL($);\
+                    #5=IFCSPACE($);#9=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#4),#";
+        for (schema_name, expected) in [
+            ("IFC2X3", vec!["#1", "#5"]),
+            ("IFC4", vec!["#1", "#2", "#5"]),
+            ("IFC4X3_ADD2", vec!["#1", "#2", "#3", "#5"]),
+        ] {
+            let schema = schemas
+                .get(schema_name)
+                .expect("bundled schema should load");
+            let labels = items(text, Some(schema))
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, expected, "{schema_name}");
+        }
     }
 
     #[test]
