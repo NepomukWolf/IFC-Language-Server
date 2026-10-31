@@ -44,7 +44,7 @@ Prefer the simplest implementation that matches the documented current scope in 
   - Prefer the standard library or existing dependencies for small tasks.
 - Major architectural changes require approval.
 - Large refactors require approval.
-- Changes to the document memory strategy, AST loading/unloading behavior, or AST size-threshold behavior require explicit user approval.
+- Changes to the document memory strategy or statement-index loading/unloading behavior require explicit user approval.
 - No modifications to `./docs` without specific instructions by the user.
 - No deleting, resetting, or reverting unrelated work without approval.
 - Ask the user when encountering ambiguous requirements, conflicting docs, or risky edits.
@@ -52,7 +52,7 @@ Prefer the simplest implementation that matches the documented current scope in 
 ## Error Handling
 
 - Handle errors deliberately; do not ignore them silently.
-- Prefer graceful fallbacks for unsupported schema versions, missing docs, absent syntax nodes, and documents without loaded AST state.
+- Prefer graceful fallbacks for unsupported schema versions, missing docs, malformed statements, and documents without a loaded statement index.
 - Use `expect` only when failure is truly unrecoverable or in tests.
 - Avoid panics in normal LSP request handling paths.
 - Prefer runtime logging through `tracing` on `stderr`; keep `stdout` reserved for the LSP protocol stream.
@@ -61,7 +61,7 @@ Prefer the simplest implementation that matches the documented current scope in 
 
 - Prefer small unit tests close to the code they exercise.
 - Test behavior, not implementation noise.
-- When changing text indexing, parsing, AST loading/unloading, AST size limits, schema loading, version detection, or hover rendering, update tests in the same module.
+- When changing text indexing, parsing, statement-index loading/unloading, schema loading, version detection, or hover rendering, update tests in the same module.
 - Use short IFC snippets in tests unless a repository sample file is clearly more useful.
 - Note: Builds require internet access due to the EXPRESS schema pulling at compile time in `build.rs`.
 

@@ -108,8 +108,8 @@ notifications such as `window/showMessage`.
 ```rust
 pub struct Document {
     pub text: Arc<String>,
-    pub lazy: Option<Arc<step::Document>>,
-    pub lazy_edits: LazyEdits,
+    pub statement_index: Option<Arc<step::Document>>,
+    pub statement_edits: StatementEdits,
     pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
@@ -131,9 +131,9 @@ Important fields:
   Maps numeric ids such as `123` to the byte offset of the local `#123` definition.
 - `references`
   Maps numeric ids to byte offsets of all local `#123` tokens, including the definition token.
-- `lazy`
+- `statement_index`
   The statement index: one entry per `#id = NAME(...);` statement with its span, id, entity name and parse errors. Parameters are decoded on demand from the statement text.
-- `lazy_edits` and `validation_cache`
+- `statement_edits` and `validation_cache`
   The statements changed since the last diagnostics run and their cached results, used for incremental revalidation.
 
 `EntityInstanceInfo` is the decoded form of one statement: entity name, parameter values and their

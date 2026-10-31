@@ -1,6 +1,6 @@
 //! IFC scaffold completion snippets and file-level code actions.
 //! This module handles Emmet-like abbreviations such as `!ifc` and empty-file scaffold
-//! actions without requiring AST state.
+//! actions without the statement index.
 
 use crate::document::Document;
 use crate::features::ifc_guid::new_guid;
