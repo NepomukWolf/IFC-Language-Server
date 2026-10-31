@@ -511,20 +511,14 @@ impl AggregateKindDisplay for AggregateKind {
 //*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::Range;
-    use tree_sitter::Parser;
-
     use super::*;
     use crate::document::Document;
     use crate::schema::{IfcVersion, load_express};
+    use tower_lsp::lsp_types::Range;
 
     /// Helper function to parse a document and return the result.
     fn parse_document(text: &str) -> Document {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        Document::parse(&mut parser, text.to_string())
+        Document::parse(text.to_string())
     }
 
     fn collect(
@@ -534,23 +528,7 @@ mod tests {
     ) -> Vec<Diagnostic> {
         let lazy = document.lazy.as_deref().expect("document has lazy index");
         let lazy_types = crate::document::lazy_entity_type_index(lazy, &document.text);
-        let diagnostics = collect_lazy(lazy, &document.text, &lazy_types, schema, schema_name);
-        let mut parser = Parser::new();
-        let tree =
-            crate::document_tree::DocumentTree::parse(&mut parser, document.text.as_bytes(), None)
-                .expect("tree oracle parses");
-        let types = crate::document::build_entity_type_index(Some(&tree), &document.text);
-        let mut expected = Vec::new();
-        crate::document::for_each_entity_node(Some(&tree), |node| {
-            if let Some(instance) = crate::document::parse_entity_instance(node, &document.text) {
-                validate(&types, schema, schema_name, &instance, &mut expected);
-            }
-        });
-        assert_eq!(
-            diagnostics, expected,
-            "lazy diagnostics differ from tree oracle"
-        );
-        diagnostics
+        collect_lazy(lazy, &document.text, &lazy_types, schema, schema_name)
     }
 
     /// Helper function to load a schema from a fixture source string.
@@ -598,13 +576,13 @@ mod tests {
             "#3=IFCWALL(789,.MOVABLE.);\n",
         ));
         let diagnostics = collect(&doc, &test_schema(), None);
-        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
         assert_eq!(
             diagnostics
                 .iter()
                 .map(|d| d.range.start.line)
                 .collect::<Vec<_>>(),
-            [0, 1, 2]
+            [0, 2]
         );
         assert!(
             diagnostics

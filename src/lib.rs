@@ -6,13 +6,8 @@ mod config;
 mod diagnostics;
 mod document;
 mod document_index;
-pub mod document_tree;
 mod features;
 pub mod handwritten;
 mod rt;
 mod schema;
-mod step;
-#[cfg(test)]
-mod test_support;
-
 pub use backend::Backend;

@@ -1,6 +1,6 @@
 //! Signature-help feature logic.
 //! Finds the current STEP entity argument list with a lightweight text scanner and renders
-//! schema-backed parameter information without requiring tree-sitter AST state.
+//! schema-backed parameter information without requiring AST state.
 
 use tower_lsp::lsp_types::{
     Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position,

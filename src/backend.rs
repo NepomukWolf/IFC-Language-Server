@@ -1,5 +1,5 @@
 //! LSP backend and document store.
-//! This is the `tower-lsp` entry point: it owns the open-document map, the shared tree-sitter
+//! This is the `tower-lsp` entry point: it owns the open-document map, the shared document state
 //! parser, and the in-memory schema docs used by hover and datatype diagnostics.
 //! Request handlers stay thin here and delegate document-specific work to the feature modules.
 
@@ -192,8 +192,7 @@ impl Backend {
         document.text = Arc::new(text);
 
         {
-            let mut parser = new_parser();
-            document.reload_parse_state(&mut parser, ast_file_size_limit_bytes);
+            document.reload_parse_state();
         }
 
         info!(
@@ -222,10 +221,7 @@ impl Backend {
         unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
-        let mut parser = new_parser();
-        if let Err(error) =
-            document.apply_content_changes(&mut parser, &changes, ast_file_size_limit_bytes)
-        {
+        if let Err(error) = document.apply_content_changes(&changes) {
             warn!(?error, "received invalid incremental document change");
         }
 
@@ -261,10 +257,7 @@ impl Backend {
         unload_other_documents(documents, uri);
 
         {
-            let mut parser = new_parser();
-            documents
-                .get_mut(uri)?
-                .reload_parse_state(&mut parser, self.ast_file_size_limit_bytes().await);
+            documents.get_mut(uri)?.reload_parse_state();
         }
 
         let snapshot = {
@@ -500,14 +493,6 @@ fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &U
     if !unloaded_documents.is_empty() {
         crate::document::drop_on_blocking_thread(unloaded_documents);
     }
-}
-
-fn new_parser() -> tree_sitter::Parser {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_ifc::LANGUAGE.into())
-        .expect("Error loading IFC parser");
-    parser
 }
 
 fn completion_snippet_support(params: &InitializeParams) -> bool {
@@ -1422,7 +1407,7 @@ mod tests {
     }
 
     fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
-        let document = Document::parse(&mut new_parser(), text.to_string());
+        let document = Document::parse(text.to_string());
         let instances =
             document_symbols::outline_instances(document.lazy.as_deref(), &document.text, None);
         document_symbols::document_symbols(&document.text, &instances, document.ast_skipped, None)

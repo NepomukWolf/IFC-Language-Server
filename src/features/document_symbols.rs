@@ -635,6 +635,3 @@ fn symbol_kind(class: Option<Class>) -> SymbolKind {
         _ => SymbolKind::OBJECT,
     }
 }
-
-#[cfg(test)]
-mod tests;

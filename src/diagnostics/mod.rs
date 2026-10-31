@@ -77,14 +77,8 @@ pub fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::Parser;
-
     fn snapshot_of(text: &str) -> DiagnosticSnapshot {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("IFC parser language should load");
-        DiagnosticSnapshot::from_document(&Document::parse(&mut parser, text.to_string()))
+        DiagnosticSnapshot::from_document(&Document::parse(text.to_string()))
     }
 
     #[test]
@@ -96,13 +90,9 @@ mod tests {
 
     #[test]
     fn documents_above_the_ast_limit_get_syntax_diagnostics_from_the_lazy_index() {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("IFC parser language should load");
         let mut document =
             Document::new_unloaded("DATA;\n#1=IFCWALL('a);\n#2=IFCSLAB X$);\nENDSEC;\n".into());
-        document.reload_parse_state(&mut parser, 1);
+        document.reload_parse_state();
 
         let diagnostics = collect(&DiagnosticSnapshot::from_document(&document), None);
 
@@ -139,11 +129,7 @@ mod tests {
 
     #[test]
     fn snapshot_retains_diagnostic_data_after_document_unloads() {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("IFC parser language should load");
-        let mut document = Document::parse(&mut parser, "#1=IFCWALL('gid')".to_string());
+        let mut document = Document::parse("#1=IFCWALL('gid')".to_string());
         let snapshot = DiagnosticSnapshot::from_document(&document);
 
         document.unload_parse_state();
@@ -153,28 +139,20 @@ mod tests {
 
     #[test]
     fn snapshot_shares_text_and_retains_its_source_revision() {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("IFC parser language should load");
-        let mut document = Document::parse(&mut parser, "#1=IFCWALL($);".to_string());
+        let mut document = Document::parse("#1=IFCWALL($);".to_string());
         let snapshot = DiagnosticSnapshot::from_document(&document);
 
         assert!(Arc::ptr_eq(&snapshot.text, &document.text));
 
         document
-            .apply_content_changes(
-                &mut parser,
-                &[tower_lsp::lsp_types::TextDocumentContentChangeEvent {
-                    range: Some(tower_lsp::lsp_types::Range::new(
-                        tower_lsp::lsp_types::Position::new(0, 6),
-                        tower_lsp::lsp_types::Position::new(0, 10),
-                    )),
-                    range_length: None,
-                    text: "DOOR".to_string(),
-                }],
-                crate::document::DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-            )
+            .apply_content_changes(&[tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                range: Some(tower_lsp::lsp_types::Range::new(
+                    tower_lsp::lsp_types::Position::new(0, 6),
+                    tower_lsp::lsp_types::Position::new(0, 10),
+                )),
+                range_length: None,
+                text: "DOOR".to_string(),
+            }])
             .expect("replacement should parse");
 
         assert_eq!(snapshot.shared_text().as_str(), "#1=IFCWALL($);");

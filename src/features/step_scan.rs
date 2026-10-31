@@ -1,6 +1,6 @@
 //! Shared lightweight STEP entity-instance argument scanner.
 //! Given a known `#id=` definition offset, this walks the positional argument list without a
-//! full tree-sitter parse. Shared by inlay hints and related-entity navigation, which both only
+//! full parse. Shared by inlay hints and related-entity navigation, which both only
 //! need argument boundaries, enclosing entity names, and referenced ids within a bounded region.
 
 use std::collections::HashMap;
