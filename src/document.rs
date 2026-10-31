@@ -6,11 +6,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-use tree_sitter::{InputEdit, Node, Parser, Point, Tree, TreeCursor};
+use tree_sitter::{InputEdit, Node, Parser, Point, TreeCursor};
 
 use crate::document_index::{TextIndex, scan_text};
+use crate::document_tree::DocumentTree;
+use crate::step::compact::{self, CompactKind, CompactValue};
 
-pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
+pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyChangeError {
@@ -20,7 +22,7 @@ pub enum ApplyChangeError {
 #[derive(Debug)]
 pub struct Document {
     pub text: Arc<String>,
-    pub tree: Option<Tree>,
+    pub tree: Option<DocumentTree>,
     pub ast_skipped: bool,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
@@ -31,7 +33,11 @@ pub struct Document {
 #[derive(Debug)]
 pub struct EntityInstanceCollection {
     pub instances: Vec<EntityInstanceInfo>,
-    instance_indexes_by_id: HashMap<u32, usize>,
+}
+
+#[derive(Debug, Default)]
+pub struct EntityTypeIndex {
+    entity_names_by_id: HashMap<u32, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,7 +175,7 @@ impl Document {
                 if let Err(error) = self.apply_ranged_change(range, &change.text) {
                     self.reload_text_index();
                     let old_tree = self.tree.take();
-                    self.parse_current_text(parser, old_tree.as_ref(), ast_file_size_limit_bytes);
+                    self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
                     return Err(error);
                 }
             } else {
@@ -184,7 +190,7 @@ impl Document {
 
         self.reload_text_index();
         let old_tree = self.tree.take();
-        self.parse_current_text(parser, old_tree.as_ref(), ast_file_size_limit_bytes);
+        self.parse_current_text(parser, old_tree, ast_file_size_limit_bytes);
         Ok(())
     }
 
@@ -248,7 +254,7 @@ impl Document {
     fn parse_current_text(
         &mut self,
         parser: &mut Parser,
-        old_tree: Option<&Tree>,
+        old_tree: Option<DocumentTree>,
         ast_file_size_limit_bytes: usize,
     ) {
         self.ast_skipped = false;
@@ -257,7 +263,7 @@ impl Document {
             return;
         }
 
-        self.tree = parser.parse(self.text.as_bytes(), old_tree);
+        self.tree = DocumentTree::parse(parser, self.text.as_bytes(), old_tree);
     }
 
     #[cfg(test)]
@@ -278,25 +284,17 @@ impl Document {
     pub fn node_at_position(&self, position: Position) -> Option<Node<'_>> {
         let tree = self.tree.as_ref()?;
         let offset = self.position_to_offset(position)?;
-        let line_start = *self.line_offsets.get(position.line as usize)?;
-        let point = Point {
-            row: position.line as usize,
-            column: offset.checked_sub(line_start)?,
-        };
-
-        tree.root_node().descendant_for_point_range(point, point)
+        tree.node_at_offset(offset)
     }
 
     pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
         let definition_offset = *self.definitions.get(&id)?;
         let tree = self.tree.as_ref()?;
-        let mut node = tree
-            .root_node()
-            .descendant_for_byte_range(definition_offset, definition_offset)?;
+        let mut node = tree.node_at_offset(definition_offset)?;
         while node.kind() != "entity_instance" {
             node = node.parent()?;
         }
-        parse_entity_instance(node, &self.text)
+        parse_entity_instance(node, &self.text, &|_| Some(usize::MAX))
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -539,49 +537,73 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
+#[cfg(test)]
+pub fn build_entity_instances(tree: Option<&DocumentTree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
-
-    if let Some(tree) = tree {
-        let mut cursor = tree.root_node().walk();
-        traverse(&mut cursor, text, &mut instances);
-    }
-
-    EntityInstanceCollection::new(instances)
+    for_each_entity_instance(
+        tree,
+        text,
+        |_| Some(usize::MAX),
+        |instance| instances.push(instance),
+    );
+    EntityInstanceCollection { instances }
 }
 
-impl EntityInstanceCollection {
-    pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
-        let instance_indexes_by_id = instances
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
-            .collect();
-        Self {
-            instances,
-            instance_indexes_by_id,
+/// Visits the entity instances for which `parameter_limit`, given the upper-case entity name,
+/// returns how many leading parameters to parse; `None` skips the instance.
+pub fn for_each_entity_instance(
+    tree: Option<&DocumentTree>,
+    text: &str,
+    parameter_limit: impl Fn(&str) -> Option<usize>,
+    mut visit: impl FnMut(EntityInstanceInfo),
+) {
+    for_each_entity_node(tree, |node| {
+        if let Some(instance) = parse_entity_instance(node, text, &parameter_limit) {
+            visit(instance);
         }
-    }
+    });
+}
 
-    pub fn instance_by_id(&self, id: u32) -> Option<&EntityInstanceInfo> {
-        self.instance_indexes_by_id
-            .get(&id)
-            .and_then(|index| self.instances.get(*index))
+pub fn build_entity_type_index(tree: Option<&DocumentTree>, text: &str) -> EntityTypeIndex {
+    let mut index = EntityTypeIndex::default();
+
+    for_each_entity_node(tree, |node| {
+        if let Some(instance) = parse_entity_header(node, text)
+            && let Some(id) = instance.id
+        {
+            index.entity_names_by_id.insert(id, instance.entity_name);
+        }
+    });
+
+    index
+}
+
+impl EntityTypeIndex {
+    pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        self.entity_names_by_id.get(&id).map(String::as_str)
     }
 }
 
-fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInstanceInfo>) {
+fn for_each_entity_node<'a>(tree: Option<&'a DocumentTree>, visit: impl FnMut(Node<'a>)) {
+    if let Some(tree) = tree {
+        tree.for_each_entity(visit);
+    }
+}
+
+pub(crate) fn visit_entity_nodes<'a>(
+    cursor: &mut TreeCursor<'a>,
+    visit: &mut impl FnMut(Node<'a>),
+) {
     loop {
         let node = cursor.node();
-
-        if node.kind() == "entity_instance"
-            && let Some(instance) = parse_entity_instance(node, text)
-        {
-            instances.push(instance);
+        let is_entity = node.kind() == "entity_instance";
+        if is_entity {
+            visit(node);
         }
 
-        if cursor.goto_first_child() {
-            traverse(cursor, text, instances);
+        // Valid entity parameters cannot contain entity instances; error recovery can.
+        if (!is_entity || node.has_error()) && cursor.goto_first_child() {
+            visit_entity_nodes(cursor, visit);
             cursor.goto_parent();
         }
 
@@ -591,14 +613,39 @@ fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInsta
     }
 }
 
-fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+fn parse_entity_instance(
+    node: Node<'_>,
+    text: &str,
+    parameter_limit: &impl Fn(&str) -> Option<usize>,
+) -> Option<EntityInstanceInfo> {
+    if compact::is_compact_entity(node) {
+        return parse_compact_entity(node, text, parameter_limit);
+    }
+    let mut instance = parse_entity_header(node, text)?;
+    let limit = parameter_limit(&instance.entity_name)?;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "parameter_list" => instance.parameters = parse_parameter_list(child, text, limit),
+            "compact_parameter_list" => {
+                instance.parameters = parse_compact_parameter_list(child, text, limit);
+            }
+            _ => {}
+        }
+    }
+    Some(instance)
+}
+
+fn parse_entity_header(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+    if compact::is_compact_entity(node) {
+        return parse_compact_entity(node, text, |_| Some(0));
+    }
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
     let mut entity_name = None;
     let mut entity_name_range = None;
     let mut parameter_list_range = None;
-    let mut parameters = Vec::new();
 
     for child in node.children(&mut child_cursor) {
         match child.kind() {
@@ -612,9 +659,8 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
                 entity_name = Some(name.to_ascii_uppercase());
                 entity_name_range = Some(node_range(&child));
             }
-            "parameter_list" => {
+            "parameter_list" | "compact_parameter_list" => {
                 parameter_list_range = Some(node_range(&child));
-                parameters = parse_parameter_list(child, text);
             }
             _ => {}
         }
@@ -627,11 +673,11 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
         entity_name_range: entity_name_range?,
         entity_range: node_range(&node),
         parameter_list_range,
-        parameters,
+        parameters: Vec::new(),
     })
 }
 
-fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
+fn parse_parameter_list(node: Node<'_>, text: &str, limit: usize) -> Vec<ParameterValue> {
     let mut cursor = node.walk();
     let Some(sequence) = node
         .children(&mut cursor)
@@ -644,8 +690,135 @@ fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
     sequence
         .children(&mut seq_cursor)
         .filter(|child| child.kind() == "parameter")
+        .take(limit)
         .map(|parameter| parse_parameter(parameter, text))
         .collect()
+}
+
+fn parse_compact_entity(
+    node: Node<'_>,
+    text: &str,
+    parameter_limit: impl Fn(&str) -> Option<usize>,
+) -> Option<EntityInstanceInfo> {
+    let entity = compact::entity(text, node.start_byte());
+    let entity_name = text[entity.name.0..entity.name.1].to_ascii_uppercase();
+    let limit = parameter_limit(&entity_name)?;
+    let mut points = PointCursor {
+        text: text.as_bytes(),
+        offset: node.start_byte(),
+        point: node.start_position(),
+    };
+    let id_range = Range {
+        start: points.position(entity.id.0),
+        end: points.position(entity.id.1),
+    };
+    let entity_name_range = Range {
+        start: points.position(entity.name.0),
+        end: points.position(entity.name.1),
+    };
+    let parameters_start = points.position(entity.parameters.0);
+    let parameters = if limit == 0 {
+        Vec::new()
+    } else {
+        compact::parameters(text, entity.parameters.0)
+            .iter()
+            .take(limit)
+            .map(|value| compact_parameter_value(value, text, &mut points))
+            .collect()
+    };
+    Some(EntityInstanceInfo {
+        id: text[entity.id.0 + 1..entity.id.1].parse::<u32>().ok(),
+        id_range: Some(id_range),
+        entity_name,
+        entity_name_range,
+        entity_range: node_range(&node),
+        parameter_list_range: Some(Range {
+            start: parameters_start,
+            end: points.position(entity.parameters.1),
+        }),
+        parameters,
+    })
+}
+
+fn parse_compact_parameter_list(node: Node<'_>, text: &str, limit: usize) -> Vec<ParameterValue> {
+    let mut points = PointCursor {
+        text: text.as_bytes(),
+        offset: node.start_byte(),
+        point: node.start_position(),
+    };
+    compact::parameters(text, node.start_byte())
+        .iter()
+        .take(limit)
+        .map(|value| compact_parameter_value(value, text, &mut points))
+        .collect()
+}
+
+fn compact_parameter_value(
+    value: &CompactValue,
+    text: &str,
+    points: &mut PointCursor<'_>,
+) -> ParameterValue {
+    let start = points.position(value.start);
+    let source = &text[value.start..value.end];
+    let children = match &value.kind {
+        CompactKind::Typed { inner: values, .. } | CompactKind::List(values) => values
+            .iter()
+            .map(|value| compact_parameter_value(value, text, points))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let range = Range {
+        start,
+        end: points.position(value.end),
+    };
+    match &value.kind {
+        CompactKind::String => ParameterValue::String { range },
+        CompactKind::Number => ParameterValue::Number {
+            text: source.to_string(),
+            range,
+        },
+        CompactKind::Reference => match source[1..].parse::<u32>() {
+            Ok(id) => ParameterValue::Reference { id, range },
+            Err(_) => ParameterValue::Unknown { range },
+        },
+        CompactKind::Enumeration => ParameterValue::Enumeration {
+            value: source.trim_matches('.').to_ascii_uppercase(),
+            range,
+        },
+        CompactKind::Null => ParameterValue::Null { range },
+        CompactKind::Omitted => ParameterValue::Omitted { range },
+        CompactKind::Typed { name_end, .. } => ParameterValue::Typed {
+            type_name: text[value.start..*name_end].to_ascii_uppercase(),
+            inner: children,
+            range,
+        },
+        CompactKind::List(_) => ParameterValue::List {
+            items: children,
+            range,
+        },
+    }
+}
+
+/// Converts monotonically increasing byte offsets to tree-sitter style positions.
+struct PointCursor<'a> {
+    text: &'a [u8],
+    offset: usize,
+    point: Point,
+}
+
+impl PointCursor<'_> {
+    fn position(&mut self, offset: usize) -> Position {
+        for byte in &self.text[self.offset..offset] {
+            if *byte == b'\n' {
+                self.point.row += 1;
+                self.point.column = 0;
+            } else {
+                self.point.column += 1;
+            }
+        }
+        self.offset = offset;
+        Position::new(self.point.row as u32, self.point.column as u32)
+    }
 }
 
 fn parse_parameter(node: Node<'_>, text: &str) -> ParameterValue {
@@ -714,6 +887,37 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                 .unwrap_or_default();
             ParameterValue::List { items, range }
         }
+        "compact_number_list" | "compact_reference_list" => {
+            let range = node_range(&node);
+            let value = node.utf8_text(text.as_bytes()).expect("compact list text");
+            let mut position = point_after_text(node.start_position(), "(");
+            let items = value[1..value.len() - 1]
+                .split(',')
+                .map(|part| {
+                    let leading = part.len() - part.trim_start().len();
+                    let item = part.trim();
+                    let start = point_after_text(position, &part[..leading]);
+                    let end = point_after_text(start, item);
+                    position = point_after_text(point_after_text(position, part), ",");
+                    let range = Range {
+                        start: Position::new(start.row as u32, start.column as u32),
+                        end: Position::new(end.row as u32, end.column as u32),
+                    };
+                    if let Some(id) = item.strip_prefix('#') {
+                        match id.parse::<u32>() {
+                            Ok(id) => ParameterValue::Reference { id, range },
+                            Err(_) => ParameterValue::Unknown { range },
+                        }
+                    } else {
+                        ParameterValue::Number {
+                            text: item.to_string(),
+                            range,
+                        }
+                    }
+                })
+                .collect();
+            ParameterValue::List { items, range }
+        }
         "typed_parameter" => {
             let range = node_range(&node);
             let mut cursor = node.walk();
@@ -728,7 +932,7 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                             .ok()
                             .map(|name| name.to_ascii_uppercase());
                     }
-                    "parameter_list" => inner = parse_parameter_list(child, text),
+                    "parameter_list" => inner = parse_parameter_list(child, text, usize::MAX),
                     _ => {}
                 }
             }
@@ -778,6 +982,7 @@ fn point_after_text(start: Point, text: &str) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Tree;
 
     fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
@@ -790,10 +995,65 @@ mod tests {
     fn parse_document(text: &str) -> Document {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
 
         Document::parse(&mut parser, text.to_string())
+    }
+
+    #[test]
+    fn numeric_aggregate_preserves_values_and_multiline_ranges() {
+        let document = parse_document("#1=IFCCARTESIANPOINT(( 1.25,\n -2E-3, .75 ));");
+        let instances = build_entity_instances(document.tree.as_ref(), &document.text);
+        let ParameterValue::List { items, range } = &instances.instances[0].parameters[0] else {
+            panic!("coordinate aggregate expected");
+        };
+        assert_eq!(
+            *range,
+            Range::new(Position::new(0, 21), Position::new(1, 13))
+        );
+        assert_eq!(
+            items,
+            &vec![
+                ParameterValue::Number {
+                    text: "1.25".into(),
+                    range: Range::new(Position::new(0, 23), Position::new(0, 27))
+                },
+                ParameterValue::Number {
+                    text: "-2E-3".into(),
+                    range: Range::new(Position::new(1, 1), Position::new(1, 6))
+                },
+                ParameterValue::Number {
+                    text: ".75".into(),
+                    range: Range::new(Position::new(1, 8), Position::new(1, 11))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_aggregate_preserves_ranges_and_overflow() {
+        let document = parse_document("#1=IFCPOLYLINE((#12,\n #4294967296,#3));");
+        let instances = build_entity_instances(document.tree.as_ref(), &document.text);
+        let ParameterValue::List { items, .. } = &instances.instances[0].parameters[0] else {
+            panic!("reference aggregate expected");
+        };
+        assert_eq!(
+            items,
+            &vec![
+                ParameterValue::Reference {
+                    id: 12,
+                    range: Range::new(Position::new(0, 16), Position::new(0, 19))
+                },
+                ParameterValue::Unknown {
+                    range: Range::new(Position::new(1, 1), Position::new(1, 12))
+                },
+                ParameterValue::Reference {
+                    id: 3,
+                    range: Range::new(Position::new(1, 13), Position::new(1, 15))
+                },
+            ]
+        );
     }
 
     fn instances(document: &Document) -> EntityInstanceCollection {
@@ -846,7 +1106,7 @@ mod tests {
 
     #[test]
     fn node_at_position_finds_reference() {
-        let text = "#1=IFCWALL(#2);";
+        let text = "#1=IFCWALL(#2,/* structured */$);";
         let document = parse_document(text);
 
         let node = document
@@ -855,6 +1115,120 @@ mod tests {
 
         assert_eq!(node.kind(), "reference");
         assert_eq!(node.utf8_text(document.text.as_bytes()).ok(), Some("#2"));
+    }
+
+    fn contains_compact(node: Node<'_>) -> bool {
+        node.kind() == "compact_parameter_list"
+            || compact::is_compact_entity(node)
+            || node.children(&mut node.walk()).any(contains_compact)
+    }
+
+    #[test]
+    fn compact_parameter_lists_match_structured_parsing() {
+        // `~` becomes a space in the compact text and a form feed, which the compact token does
+        // not accept, in the structured text, so both parse at identical offsets.
+        let cases = [
+            "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL~('it''s'),*);",
+            "#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.~);",
+            "#3=IFCX((1.,-2.5E-3,.5),(#1,#22),(),('a',IFCREAL(1.),*),~#4294967296,.T.,'/');",
+            "#4=IFCX(\n  'a\nb',\n~#5,\n  (1,\n2), ( .A. , $ )\n);",
+            "#5=IFCX(IFCBOOLEAN~(.T.),IFCINTEGER(-3),(IFCLABEL ( '' ),*));",
+            "#6=IFCX(~);",
+            "#7=IFCX(((1.,2.),(3.,\n4.)),((#1),('a',IFCLABEL('b'),*),()),~$);",
+            "#8=IFCX('a /* b',IFCLABEL('*/ c'),~'/**/');",
+        ];
+        let texts = cases.iter().flat_map(|case| {
+            [
+                case.to_string(),
+                format!("DATA;\n{case}\n{case}\nENDSEC;\n"),
+            ]
+        });
+        for case in texts {
+            let compact = parse_document(&case.replace('~', " "));
+            let structured = parse_document(&case.replace('~', "\u{c}"));
+            let compact_root = compact.tree.as_ref().unwrap().root_node();
+            let structured_root = structured.tree.as_ref().unwrap().root_node();
+            assert!(contains_compact(compact_root), "{case}");
+            assert!(!contains_compact(structured_root), "{case}");
+            assert!(
+                !compact_root.has_error() && !structured_root.has_error(),
+                "{case}"
+            );
+            assert_eq!(
+                build_entity_instances(compact.tree.as_ref(), &compact.text).instances,
+                build_entity_instances(structured.tree.as_ref(), &structured.text).instances,
+                "{case}"
+            );
+
+            for offset in 0..=case.len() {
+                let position = compact.offset_to_position(offset).unwrap();
+                let lookup = |document: &Document| {
+                    let node = document.node_at_position(position)?;
+                    Some((
+                        crate::step::ast::parameter_context(node, offset, &document.text),
+                        crate::step::ast::omitted_value_span(node, offset, &document.text),
+                        crate::step::ast::typed_value_name_span(node, offset, &document.text),
+                    ))
+                };
+                assert_eq!(lookup(&compact), lookup(&structured), "{case} at {offset}");
+            }
+        }
+    }
+
+    fn node_spans(tree: &Tree) -> Vec<(String, usize, usize)> {
+        fn visit(node: Node<'_>, spans: &mut Vec<(String, usize, usize)>) {
+            spans.push((node.kind().to_string(), node.start_byte(), node.end_byte()));
+            for child in node.children(&mut node.walk()) {
+                visit(child, spans);
+            }
+        }
+        let mut spans = Vec::new();
+        visit(tree.root_node(), &mut spans);
+        spans
+    }
+
+    #[test]
+    fn documents_with_syntax_errors_keep_the_structured_tree() {
+        let structured_spans = |text: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_ifc::LANGUAGE.into())
+                .unwrap();
+            node_spans(&parser.parse(text, None).unwrap())
+        };
+        let invalid = "DATA;\n#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL'x'),$);\n#2=IFCPROPERTYSET('g',#3,'n',$,(#1));\nENDSEC;\n";
+        let mut parser = Parser::new();
+        let mut document = parse_document(invalid);
+        assert_eq!(
+            node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
+            structured_spans(invalid)
+        );
+
+        let label = Position::new(1, 43);
+        let edit = |range: Range, text: &str| vec![change(Some(range), text)];
+        document
+            .apply_content_changes(
+                &mut parser,
+                &edit(Range::new(label, label), "("),
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .unwrap();
+        let root = document.tree.as_ref().unwrap().root_node();
+        assert!(!root.has_error());
+        assert!(contains_compact(root));
+
+        document
+            .apply_content_changes(
+                &mut parser,
+                &edit(Range::new(label, Position::new(1, 44)), ""),
+                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
+            )
+            .unwrap();
+        assert_eq!(document.text.as_str(), invalid);
+        assert_eq!(
+            node_spans(document.tree.as_ref().unwrap().structured().unwrap()),
+            structured_spans(invalid)
+        );
     }
 
     #[test]
@@ -911,7 +1285,7 @@ mod tests {
 
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
         document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
 
@@ -934,7 +1308,7 @@ mod tests {
         let mut document = parse_document("#1=IFCWALL($);");
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
         let changes = [
             change(
@@ -962,7 +1336,7 @@ mod tests {
         let mut document = parse_document("#1=IFCWALL('😀');");
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
         let changes = [change(
             Some(Range::new(Position::new(0, 12), Position::new(0, 14))),
@@ -982,7 +1356,7 @@ mod tests {
         let mut document = parse_document("#1=IFCWALL($);");
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
 
         document
@@ -1003,7 +1377,7 @@ mod tests {
         let mut document = parse_document("#1=IFCWALL($);");
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
 
         document
@@ -1047,7 +1421,7 @@ mod tests {
         let mut document = parse_document("#1=IFCWALL($);");
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
         let invalid_range = Range::new(Position::new(2, 0), Position::new(2, 1));
 

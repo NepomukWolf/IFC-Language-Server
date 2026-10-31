@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
+use crate::document_tree::DocumentTree;
 use tower_lsp::lsp_types::Diagnostic;
-use tree_sitter::Tree;
 
 use crate::document::Document;
 use crate::schema::SchemaDoc;
@@ -16,7 +16,7 @@ pub mod syntax;
 
 #[derive(Debug)]
 pub struct DiagnosticSnapshot {
-    tree: Option<Tree>,
+    tree: Option<DocumentTree>,
     text: Arc<String>,
     schema_name: Option<String>,
 }
@@ -34,7 +34,7 @@ impl DiagnosticSnapshot {
         self.schema_name.as_deref()
     }
 
-    pub fn tree(&self) -> Option<&Tree> {
+    pub fn tree(&self) -> Option<&DocumentTree> {
         self.tree.as_ref()
     }
 
@@ -54,9 +54,9 @@ pub fn collect(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
     if let Some((schema_name, schema)) = schema {
-        let instances = crate::document::build_entity_instances(snapshot.tree(), snapshot.text());
         diagnostics.extend(datatype::collect_with_schema_name(
-            &instances,
+            snapshot.tree(),
+            snapshot.text(),
             schema,
             Some(schema_name),
         ));
@@ -72,7 +72,7 @@ mod tests {
     fn snapshot_of(text: &str) -> DiagnosticSnapshot {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("IFC parser language should load");
         DiagnosticSnapshot::from_document(&Document::parse(&mut parser, text.to_string()))
     }
@@ -95,7 +95,7 @@ mod tests {
     fn snapshot_retains_diagnostic_data_after_document_unloads() {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("IFC parser language should load");
         let mut document = Document::parse(&mut parser, "#1=IFCWALL('gid')".to_string());
         let snapshot = DiagnosticSnapshot::from_document(&document);
@@ -109,7 +109,7 @@ mod tests {
     fn snapshot_shares_text_and_retains_its_source_revision() {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("IFC parser language should load");
         let mut document = Document::parse(&mut parser, "#1=IFCWALL($);".to_string());
         let snapshot = DiagnosticSnapshot::from_document(&document);
