@@ -11,7 +11,3 @@ pub async fn spawn_blocking<T: Send + 'static>(
 ) -> Result<T, tokio::task::JoinError> {
     tokio::task::spawn_blocking(work).await
 }
-
-pub async fn yield_now() {
-    tokio::task::yield_now().await;
-}

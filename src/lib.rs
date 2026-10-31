@@ -10,5 +10,7 @@ mod features;
 mod rt;
 mod schema;
 pub mod step;
+#[cfg(test)]
+mod test_support;
 
 pub use backend::Backend;

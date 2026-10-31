@@ -7,13 +7,10 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::LSPAny;
 
-use crate::document::DEFAULT_AST_FILE_SIZE_LIMIT_BYTES;
-
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub overwrite_exp_schema_with_local: Option<PathBuf>,
     pub add_local_schema_to_selection: Vec<PathBuf>,
-    pub ast_file_size_limit_bytes: usize,
     pub semantic_tokens_enabled: bool,
 }
 
@@ -22,7 +19,6 @@ impl Default for ServerConfig {
         Self {
             overwrite_exp_schema_with_local: None,
             add_local_schema_to_selection: Vec::new(),
-            ast_file_size_limit_bytes: DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             semantic_tokens_enabled: true,
         }
     }
@@ -43,25 +39,11 @@ pub fn parse_server_config(value: &LSPAny) -> ServerConfig {
             .get("addLocalSchemaToSelection")
             .map(parse_path_list)
             .unwrap_or_default(),
-        ast_file_size_limit_bytes: object
-            .get("astFileSizeLimitMb")
-            .and_then(parse_size_limit_mb)
-            .unwrap_or(DEFAULT_AST_FILE_SIZE_LIMIT_BYTES),
         semantic_tokens_enabled: object
             .get("semanticTokensEnabled")
             .and_then(|value| value.as_bool())
             .unwrap_or(true),
     }
-}
-
-fn parse_size_limit_mb(value: &LSPAny) -> Option<usize> {
-    let mb = value.as_f64()?;
-    if !mb.is_finite() || mb <= 0.0 {
-        return None;
-    }
-
-    let bytes = mb * 1024.0 * 1024.0;
-    (bytes <= usize::MAX as f64).then_some(bytes as usize)
 }
 
 fn parse_path_list(value: &LSPAny) -> Vec<PathBuf> {
