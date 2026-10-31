@@ -1,4 +1,4 @@
-//! Datatype diagnostics of a lazy statement index, cached per statement and revalidated after
+//! Datatype diagnostics of a statement index, cached per statement and revalidated after
 //! statement-local edits: the reparsed statements plus every statement referring to an id whose
 //! resolved entity name may have changed.
 
@@ -15,9 +15,9 @@ use crate::step::{self, EditOutcome};
 const LOG_CAPACITY: usize = 64;
 const MAX_CHANGED_IDS: usize = 64;
 
-/// Identifies a lazy index across statement-local edits. A rebuilt index gets a new generation.
+/// Identifies a statement index across statement-local edits. A rebuilt index gets a new generation.
 #[derive(Clone, Debug)]
-pub struct LazyEdits {
+pub struct StatementEdits {
     generation: u64,
     revision: u64,
     log: VecDeque<LoggedEdit>,
@@ -32,7 +32,7 @@ struct LoggedEdit {
     changed_ids: Vec<u32>,
 }
 
-impl LazyEdits {
+impl StatementEdits {
     pub fn fresh() -> Self {
         static GENERATION: AtomicU64 = AtomicU64::new(0);
         Self {
@@ -98,20 +98,20 @@ pub enum Mode {
 
 #[tracing::instrument(skip_all)]
 pub fn collect(
-    lazy: &step::Document,
+    parsed: &step::Document,
     text: &str,
-    edits: &LazyEdits,
+    edits: &StatementEdits,
     cache: &ValidationCache,
     schema: &SchemaDoc,
     schema_name: &str,
 ) -> (Vec<Diagnostic>, Mode) {
-    let entity_types = crate::document::lazy_entity_type_index(lazy, text);
+    let entity_types = crate::document::entity_type_index(parsed, text);
     let mut guard = cache.0.lock().expect("validation cache lock");
     if guard.as_ref().is_some_and(|cached| {
         (cached.generation, cached.revision) > (edits.generation, edits.revision)
     }) {
         let diagnostics =
-            datatype::collect_lazy(lazy, text, &entity_types, schema, Some(schema_name));
+            datatype::collect_all(parsed, text, &entity_types, schema, Some(schema_name));
         return (diagnostics, Mode::StaleSnapshot);
     }
 
@@ -119,9 +119,11 @@ pub fn collect(
         .take()
         .filter(|cached| cached.generation == edits.generation && cached.schema_name == schema_name)
         .and_then(|cached| edits.since(cached.revision).map(|log| (cached, log)))
-        .map(|(cached, log)| dirty_statements(lazy, text, cached, log));
+        .map(|(cached, log)| dirty_statements(parsed, text, cached, log));
     let validate = |index: usize, out: &mut Vec<Diagnostic>| {
-        if let Some(instance) = crate::document::lazy_entity_instance_relative(lazy, text, index) {
+        if let Some(instance) =
+            crate::document::decode_entity_instance_relative(parsed, text, index)
+        {
             datatype::validate(&entity_types, schema, Some(schema_name), &instance, out);
         }
     };
@@ -153,7 +155,7 @@ pub fn collect(
         None => {
             let mut entries = Vec::new();
             let mut diagnostics = Vec::new();
-            for index in 0..lazy.statements.len() {
+            for index in 0..parsed.statements.len() {
                 validate(index, &mut diagnostics);
                 if !diagnostics.is_empty() {
                     entries.push((index, std::mem::take(&mut diagnostics)));
@@ -170,13 +172,13 @@ pub fn collect(
     };
 
     let entries = &guard.as_ref().expect("cache was just filled").entries;
-    (absolute(lazy, text, entries), mode)
+    (absolute(parsed, text, entries), mode)
 }
 
 /// Replays `log` over the cached entries and returns them with the statements to
 /// revalidate, ascending.
 fn dirty_statements<'a>(
-    lazy: &step::Document,
+    parsed: &step::Document,
     text: &str,
     cached: Cached,
     log: impl Iterator<Item = &'a LoggedEdit>,
@@ -201,9 +203,9 @@ fn dirty_statements<'a>(
     changed_ids.sort_unstable();
     changed_ids.dedup();
     if changed_ids.len() > MAX_CHANGED_IDS {
-        dirty = (0..lazy.statements.len()).collect();
+        dirty = (0..parsed.statements.len()).collect();
     } else {
-        dirty.extend(referrers(lazy, text, &changed_ids));
+        dirty.extend(referrers(parsed, text, &changed_ids));
     }
     dirty.sort_unstable();
     dirty.dedup();
@@ -211,7 +213,7 @@ fn dirty_statements<'a>(
 }
 
 /// Statements whose text contains `#id` for one of `ids`, a superset of those referring to it.
-fn referrers(lazy: &step::Document, text: &str, ids: &[u32]) -> Vec<usize> {
+fn referrers(parsed: &step::Document, text: &str, ids: &[u32]) -> Vec<usize> {
     let bytes = text.as_bytes();
     let mut statements = Vec::new();
     for id in ids {
@@ -221,10 +223,10 @@ fn referrers(lazy: &step::Document, text: &str, ids: &[u32]) -> Vec<usize> {
             if bytes.get(end).is_some_and(u8::is_ascii_digit) {
                 continue;
             }
-            let index = lazy
+            let index = parsed
                 .statements
                 .partition_point(|statement| (statement.span.end as usize) <= at);
-            if lazy
+            if parsed
                 .statements
                 .get(index)
                 .is_some_and(|statement| statement.span.start as usize <= at)
@@ -237,7 +239,7 @@ fn referrers(lazy: &step::Document, text: &str, ids: &[u32]) -> Vec<usize> {
 }
 
 fn absolute(
-    lazy: &step::Document,
+    parsed: &step::Document,
     text: &str,
     entries: &[(usize, Vec<Diagnostic>)],
 ) -> Vec<Diagnostic> {
@@ -245,7 +247,7 @@ fn absolute(
         text,
         entries
             .iter()
-            .map(|&(index, _)| lazy.statements[index].span.start as usize),
+            .map(|&(index, _)| parsed.statements[index].span.start as usize),
     );
     let place = |base: Position, relative: Position| {
         if relative.line == 0 {
@@ -319,12 +321,14 @@ mod tests {
         let mut document = Document::new_unloaded(text.to_string());
         document.reload_parse_state();
         let snapshot = DiagnosticSnapshot::from_document(&document);
-        let lazy = snapshot.lazy().expect("forced lazy path");
+        let parsed = snapshot
+            .statement_index()
+            .expect("document has a statement index");
         let mut diagnostics = syntax::collect(&snapshot);
-        diagnostics.extend(datatype::collect_lazy(
-            lazy,
+        diagnostics.extend(datatype::collect_all(
+            parsed,
             text,
-            &crate::document::lazy_entity_type_index(lazy, text),
+            &crate::document::entity_type_index(parsed, text),
             schema,
             Some(schema_name),
         ));
@@ -462,12 +466,14 @@ mod tests {
         let mut rebuilds = BTreeMap::<&'static str, (usize, usize)>::new();
         let mut collect = |document: &Document, step: &str| {
             let snapshot = DiagnosticSnapshot::from_document(document);
-            let lazy = snapshot.lazy().expect("forced lazy path");
+            let parsed = snapshot
+                .statement_index()
+                .expect("document has a statement index");
             let mut diagnostics = syntax::collect(&snapshot);
             let (datatype, mode) = super::collect(
-                lazy,
+                parsed,
                 snapshot.text(),
-                &snapshot.lazy_edits,
+                &snapshot.statement_edits,
                 &snapshot.validation_cache,
                 &schema,
                 &schema_name,
@@ -479,7 +485,7 @@ mod tests {
             diagnostics.extend(datatype);
             document.assert_text_index_matches_scan();
             assert!(
-                *lazy == step::Document::parse(snapshot.text().as_bytes(), false),
+                *parsed == step::Document::parse(snapshot.text().as_bytes(), false),
                 "{} seed {seed} {step}: statement index differs from a fresh parse",
                 path.display()
             );
@@ -523,13 +529,13 @@ mod tests {
                         .apply_content_changes(&std::mem::take(&mut changes))
                         .expect("change should be valid");
                 } else {
-                    let generation = document.lazy_edits.generation;
+                    let generation = document.statement_edits.generation;
                     document
                         .apply_content_changes(&[change])
                         .expect("change should be valid");
                     let entry = rebuilds.entry(kind).or_default();
                     entry.0 += 1;
-                    entry.1 += usize::from(document.lazy_edits.generation != generation);
+                    entry.1 += usize::from(document.statement_edits.generation != generation);
                 }
                 if random.below(5) == 0 {
                     stale = Some(DiagnosticSnapshot::from_document(&document));
@@ -542,13 +548,15 @@ mod tests {
             }
             collect(&document, &format!("step {step} {kinds:?}"));
             if let Some(stale) = stale {
-                let lazy = stale.lazy().expect("forced lazy path");
+                let parsed = stale
+                    .statement_index()
+                    .expect("document has a statement index");
                 let mut diagnostics = syntax::collect(&stale);
                 diagnostics.extend(
                     super::collect(
-                        lazy,
+                        parsed,
                         stale.text(),
-                        &stale.lazy_edits,
+                        &stale.statement_edits,
                         &stale.validation_cache,
                         &schema,
                         &schema_name,
@@ -561,7 +569,7 @@ mod tests {
         (incremental, fallbacks, rebuilds)
     }
 
-    fn lazy_document(text: &str) -> Document {
+    fn reloaded_document(text: &str) -> Document {
         let mut document = Document::new_unloaded(text.to_string());
         document.reload_parse_state();
         document
@@ -585,9 +593,11 @@ mod tests {
     fn incremental(document: &Document, schema: &SchemaDoc) -> (Vec<Diagnostic>, Mode) {
         let snapshot = DiagnosticSnapshot::from_document(document);
         super::collect(
-            snapshot.lazy().expect("forced lazy path"),
+            snapshot
+                .statement_index()
+                .expect("document has a statement index"),
             snapshot.text(),
-            &snapshot.lazy_edits,
+            &snapshot.statement_edits,
             &snapshot.validation_cache,
             schema,
             "IFC4",
@@ -605,7 +615,7 @@ mod tests {
     #[test]
     fn statements_edited_before_a_later_insertion_stay_revalidated() {
         let schema = ifc4();
-        let mut document = lazy_document(POINTS);
+        let mut document = reloaded_document(POINTS);
         incremental(&document, &schema);
 
         edit(
@@ -628,7 +638,7 @@ mod tests {
     #[test]
     fn more_edits_than_the_log_keeps_revalidate_everything() {
         let schema = ifc4();
-        let mut document = lazy_document(POINTS);
+        let mut document = reloaded_document(POINTS);
         incremental(&document, &schema);
 
         edit(
@@ -649,7 +659,7 @@ mod tests {
     #[test]
     fn diagnostics_on_later_lines_of_a_statement_starting_mid_line_keep_their_columns() {
         let schema = ifc4();
-        let mut document = lazy_document(
+        let mut document = reloaded_document(
             "DATA;\n#1=IFCCARTESIANPOINT((0.,0.)); #2=IFCCARTESIANPOINT((1.,0.),\n  'x');\nENDSEC;\n",
         );
         assert_eq!(
@@ -668,7 +678,7 @@ mod tests {
     #[test]
     fn diagnostics_after_non_ascii_text_on_a_shared_line_count_utf16_units() {
         let schema = ifc4();
-        let mut document = lazy_document(
+        let mut document = reloaded_document(
             "DATA;\n#1=IFCCARTESIANPOINT((0.,0.)); /*é😀*/ #2=IFCCARTESIANPOINT('é😀');\nENDSEC;\n",
         );
         incremental(&document, &schema);

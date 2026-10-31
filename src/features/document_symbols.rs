@@ -3,8 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::document::{
-    EntityInstanceCollection, EntityInstanceInfo, ParameterValue,
-    for_each_lazy_entity_instance_named,
+    EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_entity_instance_named,
 };
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
@@ -45,14 +44,14 @@ enum ProductRenderMode {
 /// are skipped before they are decoded. `schema` must be the one later passed to
 /// `document_symbols`.
 pub fn outline_instances(
-    lazy: Option<&crate::step::Document>,
+    parsed: Option<&crate::step::Document>,
     text: &str,
     schema: Option<&SchemaDoc>,
 ) -> EntityInstanceCollection {
     let mut instances = Vec::new();
-    if let Some(lazy) = lazy {
-        for_each_lazy_entity_instance_named(
-            lazy,
+    if let Some(parsed) = parsed {
+        for_each_entity_instance_named(
+            parsed,
             text,
             |entity_name| {
                 relationship_attributes(entity_name).is_some()

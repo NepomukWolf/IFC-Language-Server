@@ -19,7 +19,7 @@ pub(crate) struct EntityArgumentContext {
     pub(crate) value_start: usize,
 }
 
-/// Locates the positional argument containing `cursor_offset` without requiring an AST.
+/// Locates the positional argument containing `cursor_offset` without the statement index.
 pub(crate) fn entity_argument_context(
     text: &str,
     definitions: &FxHashMap<u32, usize>,

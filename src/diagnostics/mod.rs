@@ -17,8 +17,8 @@ pub mod syntax;
 
 #[derive(Debug)]
 pub struct DiagnosticSnapshot {
-    lazy: Option<Arc<step::Document>>,
-    lazy_edits: incremental::LazyEdits,
+    statement_index: Option<Arc<step::Document>>,
+    statement_edits: incremental::StatementEdits,
     validation_cache: Arc<incremental::ValidationCache>,
     text: Arc<String>,
     schema_name: Option<String>,
@@ -27,8 +27,8 @@ pub struct DiagnosticSnapshot {
 impl DiagnosticSnapshot {
     pub fn from_document(document: &Document) -> Self {
         Self {
-            lazy: document.lazy.clone(),
-            lazy_edits: document.lazy_edits.clone(),
+            statement_index: document.statement_index.clone(),
+            statement_edits: document.statement_edits.clone(),
             validation_cache: Arc::clone(&document.validation_cache),
             text: Arc::clone(&document.text),
             schema_name: document.schema_name.clone(),
@@ -39,8 +39,8 @@ impl DiagnosticSnapshot {
         self.schema_name.as_deref()
     }
 
-    pub fn lazy(&self) -> Option<&step::Document> {
-        self.lazy.as_deref()
+    pub fn statement_index(&self) -> Option<&step::Document> {
+        self.statement_index.as_deref()
     }
 
     pub fn text(&self) -> &str {
@@ -59,16 +59,16 @@ pub fn collect(
     schema: Option<(&str, &SchemaDoc)>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
-    if let (Some(lazy), Some((schema_name, schema))) = (snapshot.lazy(), schema) {
+    if let (Some(parsed), Some((schema_name, schema))) = (snapshot.statement_index(), schema) {
         let (datatype, mode) = incremental::collect(
-            lazy,
+            parsed,
             snapshot.text(),
-            &snapshot.lazy_edits,
+            &snapshot.statement_edits,
             &snapshot.validation_cache,
             schema,
             schema_name,
         );
-        tracing::info!(?mode, "lazy datatype diagnostics");
+        tracing::info!(?mode, "datatype diagnostics");
         diagnostics.extend(datatype);
     }
     diagnostics
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_above_the_ast_limit_get_syntax_diagnostics_from_the_lazy_index() {
+    fn reloaded_documents_get_syntax_diagnostics() {
         let mut document =
             Document::new_unloaded("DATA;\n#1=IFCWALL('a);\n#2=IFCSLAB X$);\nENDSEC;\n".into());
         document.reload_parse_state();
