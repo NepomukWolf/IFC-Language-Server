@@ -7,22 +7,23 @@ use crate::step;
 
 #[tracing::instrument(skip_all)]
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
-    snapshot
-        .lazy()
-        .map_or_else(Vec::new, |lazy| collect_lazy(lazy, snapshot.text()))
+    snapshot.statement_index().map_or_else(Vec::new, |parsed| {
+        parse_error_diagnostics(parsed, snapshot.text())
+    })
 }
 
-fn collect_lazy(lazy: &step::Document, text: &str) -> Vec<Diagnostic> {
-    lazy.errors
+fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnostic> {
+    parsed
+        .errors
         .iter()
         .map(|error| {
             let mut start = error.span.start as usize;
             let mut end = error.span.end as usize;
-            let statement_index = lazy
+            let statement_index = parsed
                 .statements
                 .partition_point(|statement| statement.span.start as usize <= start);
             let statement = statement_index.checked_sub(1).and_then(|index| {
-                let statement = lazy.statements[index];
+                let statement = parsed.statements[index];
                 (start < statement.span.end as usize).then_some(statement)
             });
             if let Some(offset) = statement

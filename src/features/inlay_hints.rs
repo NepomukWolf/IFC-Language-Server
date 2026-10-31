@@ -1,6 +1,6 @@
 //! Schema-backed inlay hints for positional STEP entity arguments.
-//! A lightweight range scanner finds entity instances and argument starts without requiring
-//! AST state.
+//! A lightweight range scanner finds entity instances and argument starts without the
+//! statement index.
 
 use tower_lsp::lsp_types::{InlayHint, InlayHintKind, Range};
 

@@ -14,8 +14,8 @@ use crate::schema::{
 };
 
 #[tracing::instrument(skip_all)]
-pub fn collect_lazy(
-    lazy: &crate::step::Document,
+pub fn collect_all(
+    parsed: &crate::step::Document,
     text: &str,
     entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
@@ -23,7 +23,7 @@ pub fn collect_lazy(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    crate::document::for_each_lazy_entity_instance(lazy, text, |instance| {
+    crate::document::for_each_entity_instance(parsed, text, |instance| {
         validate(
             entity_types,
             schema,
@@ -529,9 +529,12 @@ mod tests {
         schema: &SchemaDoc,
         schema_name: Option<&str>,
     ) -> Vec<Diagnostic> {
-        let lazy = document.lazy.as_deref().expect("document has lazy index");
-        let lazy_types = crate::document::lazy_entity_type_index(lazy, &document.text);
-        collect_lazy(lazy, &document.text, &lazy_types, schema, schema_name)
+        let parsed = document
+            .statement_index
+            .as_deref()
+            .expect("document has a statement index");
+        let entity_types = crate::document::entity_type_index(parsed, &document.text);
+        collect_all(parsed, &document.text, &entity_types, schema, schema_name)
     }
 
     /// Helper function to load a schema from a fixture source string.

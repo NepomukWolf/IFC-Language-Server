@@ -481,13 +481,13 @@ fn config_state_with_client_capabilities(
     }
 }
 
-/// Drops lazy parse state from every open document except `active_uri`.
+/// Drops the statement index of every open document except `active_uri`.
 /// Large decoded tapes are freed on a blocking thread instead of inside the handler that switched documents.
 fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &Url) {
     let mut unloaded_documents = Vec::new();
     for (document_uri, document) in documents.iter_mut() {
         if document_uri != active_uri {
-            unloaded_documents.extend(document.lazy.take());
+            unloaded_documents.extend(document.statement_index.take());
             document.unload_parse_state();
         }
     }
@@ -881,7 +881,7 @@ impl LanguageServer for Backend {
                 .map(crate::schema::normalize_name)
         });
         let text = Arc::clone(&document.text);
-        let lazy = document.lazy.clone();
+        let parsed = document.statement_index.clone();
         drop(documents);
 
         let schema = if let Some(schema_name) = schema_name.as_deref() {
@@ -892,7 +892,7 @@ impl LanguageServer for Backend {
         let instance_cache = Arc::clone(&self.instance_cache);
         let result = crate::rt::spawn_blocking(move || {
             let instances = instance_cache.get_or_build_with(schema.as_ref(), &text, || {
-                document_symbols::outline_instances(lazy.as_deref(), &text, schema.as_deref())
+                document_symbols::outline_instances(parsed.as_deref(), &text, schema.as_deref())
             });
             document_symbols::document_symbols(&text, &instances, schema.as_deref())
         })
@@ -1405,8 +1405,11 @@ mod tests {
 
     fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
         let document = Document::parse(text.to_string());
-        let instances =
-            document_symbols::outline_instances(document.lazy.as_deref(), &document.text, None);
+        let instances = document_symbols::outline_instances(
+            document.statement_index.as_deref(),
+            &document.text,
+            None,
+        );
         document_symbols::document_symbols(&document.text, &instances, None)
     }
 

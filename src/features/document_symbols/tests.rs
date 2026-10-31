@@ -129,7 +129,7 @@ fn nested_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 }
 
 fn symbols(doc: &Document, schema: Option<&SchemaDoc>) -> Option<DocumentSymbolResponse> {
-    let instances = outline_instances(doc.lazy.as_deref(), &doc.text, schema);
+    let instances = outline_instances(doc.statement_index.as_deref(), &doc.text, schema);
     document_symbols(&doc.text, &instances, schema)
 }
 
@@ -499,8 +499,9 @@ fn outline_instances_keep_only_what_the_outline_reads() {
     let doc = parse(
         "DATA;\n#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCWALL('g',$,'W',$,$,$,$,$,$);\n#3=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;",
     );
-    let full = crate::test_support::build_entity_instances(doc.lazy.as_deref(), &doc.text);
-    let lean = outline_instances(doc.lazy.as_deref(), &doc.text, Some(&schema()));
+    let full =
+        crate::test_support::build_entity_instances(doc.statement_index.as_deref(), &doc.text);
+    let lean = outline_instances(doc.statement_index.as_deref(), &doc.text, Some(&schema()));
 
     let kept: Vec<(&str, usize)> = lean
         .instances

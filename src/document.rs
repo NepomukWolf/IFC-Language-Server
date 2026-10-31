@@ -1,5 +1,5 @@
 //! Parsed in-memory representation of one IFC document.
-//! This module owns the source text, cheap text indexes for navigation, and the lazy STEP index.
+//! This module owns the source text, cheap text indexes for navigation, and the STEP statement index.
 #![allow(dead_code)]
 
 use rustc_hash::FxHashMap;
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
-use crate::diagnostics::incremental::{LazyEdits, ValidationCache};
+use crate::diagnostics::incremental::{StatementEdits, ValidationCache};
 use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
 use crate::schema::SchemaDoc;
 use crate::step;
@@ -20,9 +20,9 @@ pub enum ApplyChangeError {
 #[derive(Debug)]
 pub struct Document {
     pub text: Arc<String>,
-    /// Statement index and lazy parameter tape for this document.
-    pub lazy: Option<Arc<step::Document>>,
-    pub lazy_edits: LazyEdits,
+    /// Statement index of this document; parameters are decoded on demand.
+    pub statement_index: Option<Arc<step::Document>>,
+    pub statement_edits: StatementEdits,
     pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
@@ -40,7 +40,7 @@ pub struct EntityInstanceCollection {
 #[derive(Debug, Default)]
 pub struct EntityTypeIndex<'a> {
     entity_names_by_id: Vec<(u32, &'a str)>,
-    lazy: Option<(&'a step::Document, &'a str)>,
+    statement_index: Option<(&'a step::Document, &'a str)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,11 +137,11 @@ impl Document {
             schema_end,
         } = scan_text(&text);
 
-        let lazy = Arc::new(step::Document::parse(text.as_bytes(), false));
+        let parsed = Arc::new(step::Document::parse(text.as_bytes(), false));
         Self {
             text: Arc::new(text),
-            lazy: Some(lazy),
-            lazy_edits: LazyEdits::fresh(),
+            statement_index: Some(parsed),
+            statement_edits: StatementEdits::fresh(),
             validation_cache: Arc::default(),
             schema_name,
             line_offsets,
@@ -176,13 +176,13 @@ impl Document {
     }
 
     pub fn unload_parse_state(&mut self) {
-        self.lazy = None;
+        self.statement_index = None;
     }
 
     pub fn reload_parse_state(&mut self) {
         self.reload_text_index();
         self.unload_parse_state();
-        self.lazy = Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
+        self.statement_index = Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
     }
 
     pub fn apply_content_changes(
@@ -197,14 +197,15 @@ impl Document {
                 }
             } else {
                 self.text = Arc::new(change.text.clone());
-                self.lazy = None;
+                self.statement_index = None;
                 self.reload_text_index();
             }
         }
 
-        if self.lazy.is_none() {
-            self.lazy = Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
-            self.lazy_edits = LazyEdits::fresh();
+        if self.statement_index.is_none() {
+            self.statement_index =
+                Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
+            self.statement_edits = StatementEdits::fresh();
         }
         Ok(())
     }
@@ -226,8 +227,8 @@ impl Document {
 
         let removed = self.text.as_bytes()[start_byte..old_end_byte].to_vec();
         replace_text(&mut self.text, start_byte..old_end_byte, replacement);
-        if let Some(lazy) = self.lazy.as_mut() {
-            let outcome = Arc::make_mut(lazy).edit(
+        if let Some(parsed) = self.statement_index.as_mut() {
+            let outcome = Arc::make_mut(parsed).edit(
                 &removed,
                 self.text.as_bytes(),
                 step::Edit {
@@ -236,7 +237,7 @@ impl Document {
                     insert_len: replacement.len(),
                 },
             );
-            self.lazy_edits.record(outcome);
+            self.statement_edits.record(outcome);
         }
         let edited = self.with_text_index(|index, text| {
             edit_text_index(index, text, start_byte, &removed, replacement.len())
@@ -271,32 +272,36 @@ impl Document {
     }
 
     pub fn is_parse_state_loaded(&self) -> bool {
-        self.lazy.is_some()
+        self.statement_index.is_some()
     }
 
     pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
         let definition_offset = *self.definitions.get(&id)?;
-        let lazy = self.lazy.as_deref()?;
-        let index = lazy
+        let parsed = self.statement_index.as_deref()?;
+        let index = parsed
             .statements
             .partition_point(|statement| (statement.span.start as usize) < definition_offset);
-        (lazy.statements.get(index)?.span.start as usize == definition_offset).then_some(())?;
-        self.decode_statement(lazy, index)
+        (parsed.statements.get(index)?.span.start as usize == definition_offset).then_some(())?;
+        self.decode_statement(parsed, index)
     }
 
     /// The statement whose span contains `offset`, decoded.
     pub fn entity_instance_at_offset(&self, offset: usize) -> Option<EntityInstanceInfo> {
-        let lazy = self.lazy.as_deref()?;
-        let index = lazy
+        let parsed = self.statement_index.as_deref()?;
+        let index = parsed
             .statements
             .partition_point(|statement| statement.span.start as usize <= offset)
             .checked_sub(1)?;
-        (offset < lazy.statements[index].span.end as usize).then_some(())?;
-        self.decode_statement(lazy, index)
+        (offset < parsed.statements[index].span.end as usize).then_some(())?;
+        self.decode_statement(parsed, index)
     }
 
-    fn decode_statement(&self, lazy: &step::Document, index: usize) -> Option<EntityInstanceInfo> {
-        let start = lazy.statements[index].span.start as usize;
+    fn decode_statement(
+        &self,
+        parsed: &step::Document,
+        index: usize,
+    ) -> Option<EntityInstanceInfo> {
+        let start = parsed.statements[index].span.start as usize;
         let row = self.line_offsets.partition_point(|&line| line <= start) - 1;
         let mut points = LinePoints {
             text: self.text.as_bytes(),
@@ -304,7 +309,7 @@ impl Document {
             row,
             column: 0,
         };
-        lazy_entity_instance(lazy, &self.text, index, &mut points)
+        decode_entity_instance(parsed, &self.text, index, &mut points)
             .filter(|instance| instance.parameter_list_range.is_some())
     }
 
@@ -565,21 +570,21 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-pub fn lazy_entity_type_index<'a>(lazy: &'a step::Document, text: &'a str) -> EntityTypeIndex<'a> {
+pub fn entity_type_index<'a>(parsed: &'a step::Document, text: &'a str) -> EntityTypeIndex<'a> {
     EntityTypeIndex {
         entity_names_by_id: Vec::new(),
-        lazy: Some((lazy, text)),
+        statement_index: Some((parsed, text)),
     }
 }
 
-/// Decodes each well-formed statement of a lazy index, in document order, one at a time.
-pub(crate) fn for_each_lazy_entity_instance(
-    lazy: &step::Document,
+/// Decodes each well-formed statement, in document order, one at a time.
+pub(crate) fn for_each_entity_instance(
+    parsed: &step::Document,
     text: &str,
     mut visit: impl FnMut(EntityInstanceInfo),
 ) {
-    for_each_lazy_entity_instance_named(
-        lazy,
+    for_each_entity_instance_named(
+        parsed,
         text,
         |_| true,
         |instance| {
@@ -590,11 +595,11 @@ pub(crate) fn for_each_lazy_entity_instance(
     );
 }
 
-/// Like `for_each_lazy_entity_instance`, but decodes only instances whose uppercase entity name
+/// Like `for_each_entity_instance`, but decodes only instances whose uppercase entity name
 /// `keep` accepts, and also visits statements whose parameters could not be read, with no
 /// parameters and no `parameter_list_range`.
-pub(crate) fn for_each_lazy_entity_instance_named(
-    lazy: &step::Document,
+pub(crate) fn for_each_entity_instance_named(
+    parsed: &step::Document,
     text: &str,
     mut keep: impl FnMut(&str) -> bool,
     mut visit: impl FnMut(EntityInstanceInfo),
@@ -606,8 +611,8 @@ pub(crate) fn for_each_lazy_entity_instance_named(
         column: 0,
     };
     let mut name = String::new();
-    for index in 0..lazy.statements.len() {
-        let indexed_name = lazy.statements[index].name;
+    for index in 0..parsed.statements.len() {
+        let indexed_name = parsed.statements[index].name;
         if indexed_name.end != 0 {
             name.clear();
             name.push_str(&text[indexed_name.range()]);
@@ -616,7 +621,7 @@ pub(crate) fn for_each_lazy_entity_instance_named(
                 continue;
             }
         }
-        if let Some(instance) = lazy_entity_instance(lazy, text, index, &mut points)
+        if let Some(instance) = decode_entity_instance(parsed, text, index, &mut points)
             && keep(&instance.entity_name)
         {
             visit(instance);
@@ -626,19 +631,19 @@ pub(crate) fn for_each_lazy_entity_instance_named(
 
 /// Decodes one statement with positions relative to its start: row 0 columns count from the
 /// statement's first byte, later rows keep absolute columns.
-pub(crate) fn lazy_entity_instance_relative(
-    lazy: &step::Document,
+pub(crate) fn decode_entity_instance_relative(
+    parsed: &step::Document,
     text: &str,
     index: usize,
 ) -> Option<EntityInstanceInfo> {
-    let start = lazy.statements[index].span.start as usize;
+    let start = parsed.statements[index].span.start as usize;
     let mut points = LinePoints {
         text: text.as_bytes(),
         offset: start,
         row: 0,
         column: 0,
     };
-    lazy_entity_instance(lazy, text, index, &mut points)
+    decode_entity_instance(parsed, text, index, &mut points)
         .filter(|instance| instance.parameter_list_range.is_some())
 }
 
@@ -661,20 +666,20 @@ thread_local! {
     pub(crate) static DECODED_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn lazy_entity_instance(
-    lazy: &step::Document,
+fn decode_entity_instance(
+    parsed: &step::Document,
     text: &str,
     index: usize,
     points: &mut LinePoints<'_>,
 ) -> Option<EntityInstanceInfo> {
     #[cfg(test)]
     DECODED_STATEMENTS.with(|count| count.set(count.get() + 1));
-    let statement = lazy.statements[index];
+    let statement = parsed.statements[index];
     let span = statement.span.range();
     if statement.name.end == 0 {
         return None;
     }
-    let tape = lazy.decode(text.as_bytes(), index);
+    let tape = parsed.decode(text.as_bytes(), index);
     let id_range = Range {
         start: points.position(span.start),
         end: points.position(
@@ -694,7 +699,7 @@ fn lazy_entity_instance(
     let (parameters, parameter_list_range) = match tape.first() {
         Some(list) => {
             let list_start = points.position(list.span.start as usize);
-            let parameters = lazy_parameter_values(&tape, 1, tape.len(), text, points);
+            let parameters = decode_parameter_values(&tape, 1, tape.len(), text, points);
             let range = Range {
                 start: list_start,
                 end: points.position(list.span.end as usize),
@@ -718,7 +723,7 @@ fn lazy_entity_instance(
     })
 }
 
-fn lazy_parameter_values(
+fn decode_parameter_values(
     tape: &[step::Param],
     mut slot: usize,
     end: usize,
@@ -733,7 +738,7 @@ fn lazy_parameter_values(
         let start = points.position(span.start);
         let children = match param.kind {
             Kind::List | Kind::Typed => {
-                lazy_parameter_values(tape, slot + 1, param.next as usize, text, points)
+                decode_parameter_values(tape, slot + 1, param.next as usize, text, points)
             }
             _ => Vec::new(),
         };
@@ -810,8 +815,8 @@ pub(crate) fn utf16_len(bytes: &[u8]) -> usize {
 
 impl EntityTypeIndex<'_> {
     pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
-        if let Some((lazy, text)) = self.lazy {
-            let name = lazy.statements[lazy.find(id)?].name;
+        if let Some((parsed, text)) = self.statement_index {
+            let name = parsed.statements[parsed.find(id)?].name;
             return (name.end != 0).then(|| &text[name.range()]);
         }
         let index = self
@@ -1011,7 +1016,7 @@ mod tests {
     }
 
     fn instances(document: &Document) -> EntityInstanceCollection {
-        build_entity_instances(document.lazy.as_deref(), &document.text)
+        build_entity_instances(document.statement_index.as_deref(), &document.text)
     }
 
     fn position_at(text: &str, needle: &str) -> Position {
@@ -1106,12 +1111,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_builds_text_index_and_lazy_state() {
+    fn parse_builds_text_index_and_statement_index() {
         let text = "#1=IFCWALL($);";
         let document = parse_document(text);
 
         assert_eq!(document.text.as_str(), text);
-        assert!(document.lazy.is_some());
+        assert!(document.statement_index.is_some());
         assert_eq!(document.schema_name, None);
         assert_eq!(document.definitions.get(&1), Some(&0));
         assert_eq!(document.references.get(&1), Some(&vec![0]));
@@ -1172,9 +1177,17 @@ mod tests {
         for case in texts {
             let compact = parse_document(&case.replace('~', " "));
             let structured = parse_document(&case.replace('~', "\u{c}"));
-            assert!(compact.lazy.as_ref().unwrap().errors.is_empty(), "{case}");
             assert!(
-                structured.lazy.as_ref().unwrap().errors.is_empty(),
+                compact.statement_index.as_ref().unwrap().errors.is_empty(),
+                "{case}"
+            );
+            assert!(
+                structured
+                    .statement_index
+                    .as_ref()
+                    .unwrap()
+                    .errors
+                    .is_empty(),
                 "{case}"
             );
             assert_eq!(
@@ -1186,9 +1199,9 @@ mod tests {
             for offset in 0..=case.len() {
                 let position = compact.offset_to_position(offset).unwrap();
                 let lookup = |document: &Document| {
-                    let lazy = document.lazy.as_ref().unwrap();
-                    let context = lazy.statements.iter().enumerate().find_map(|(index, s)| {
-                        let tape = lazy.decode(document.text.as_bytes(), index);
+                    let parsed = document.statement_index.as_ref().unwrap();
+                    let context = parsed.statements.iter().enumerate().find_map(|(index, s)| {
+                        let tape = parsed.decode(document.text.as_bytes(), index);
                         let mut slot = 1;
                         let mut parameter_index = 0;
                         while slot < tape.len() {
@@ -1207,8 +1220,8 @@ mod tests {
                     });
                     let mut omitted = None;
                     let mut typed_name = None;
-                    for index in 0..lazy.statements.len() {
-                        for p in lazy.decode(document.text.as_bytes(), index) {
+                    for index in 0..parsed.statements.len() {
+                        for p in parsed.decode(document.text.as_bytes(), index) {
                             if !p.span.range().contains(&offset) {
                                 continue;
                             }
@@ -1249,7 +1262,7 @@ mod tests {
     fn lowercase_names_are_accepted_only_for_typed_values() {
         let document =
             parse_document("DATA;#1=IFCX(ifclabel('a'),ifcCountMeasure(3),typed_1(.T.));ENDSEC;");
-        assert!(document.lazy.as_ref().unwrap().errors.is_empty());
+        assert!(document.statement_index.as_ref().unwrap().errors.is_empty());
         let collection = instances(&document);
         let names: Vec<_> = collection.instances[0]
             .parameters
@@ -1266,7 +1279,10 @@ mod tests {
             "DATA;#1=X(_typed(.T.));ENDSEC;",
         ] {
             let rejected = parse_document(text);
-            assert!(!rejected.lazy.as_ref().unwrap().errors.is_empty(), "{text}");
+            assert!(
+                !rejected.statement_index.as_ref().unwrap().errors.is_empty(),
+                "{text}"
+            );
         }
     }
 
@@ -1274,23 +1290,23 @@ mod tests {
     fn documents_with_syntax_errors_recover_after_edit_and_regress_after_undo() {
         let invalid = "DATA;\n#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL'x'),$);\n#2=IFCPROPERTYSET('g',#3,'n',$,(#1));\nENDSEC;\n";
         let mut document = parse_document(invalid);
-        assert!(!document.lazy.as_ref().unwrap().errors.is_empty());
+        assert!(!document.statement_index.as_ref().unwrap().errors.is_empty());
 
         let label = Position::new(1, 43);
         let edit = |range: Range, text: &str| vec![change(Some(range), text)];
         document
             .apply_content_changes(&edit(Range::new(label, label), "("))
             .unwrap();
-        assert!(document.lazy.as_ref().unwrap().errors.is_empty());
+        assert!(document.statement_index.as_ref().unwrap().errors.is_empty());
         assert_eq!(instances(&document).instances.len(), 2);
 
         document
             .apply_content_changes(&edit(Range::new(label, Position::new(1, 44)), ""))
             .unwrap();
         assert_eq!(document.text.as_str(), invalid);
-        assert!(!document.lazy.as_ref().unwrap().errors.is_empty());
+        assert!(!document.statement_index.as_ref().unwrap().errors.is_empty());
         assert_eq!(
-            document.lazy.as_deref(),
+            document.statement_index.as_deref(),
             Some(&step::Document::parse(invalid.as_bytes(), false))
         );
     }
@@ -1332,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn unload_parse_state_preserves_text_index_and_clears_ast_state() {
+    fn unload_parse_state_preserves_text_index_and_clears_statement_index() {
         let text = "#1=IFCWALL(#2);";
         let mut document = parse_document(text);
 
@@ -1367,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_index_stays_in_step_with_edits() {
+    fn statement_index_stays_in_step_with_edits() {
         let mut document =
             Document::new_unloaded("DATA;\n#1=IFCWALL('a');\n#2=IFCSLAB($);\nENDSEC;\n".into());
         document.reload_parse_state();
@@ -1383,7 +1399,7 @@ mod tests {
                 .apply_content_changes(&[change(Some(Range::new(start, end)), text)])
                 .expect("change should be valid");
             assert_eq!(
-                document.lazy.as_deref(),
+                document.statement_index.as_deref(),
                 Some(&step::Document::parse(document.text.as_bytes(), false)),
                 "{:?}",
                 document.text

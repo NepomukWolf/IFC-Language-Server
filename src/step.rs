@@ -863,7 +863,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nested_values_and_lazy_decoding_agree() {
+    fn nested_values_decode_the_same_eagerly_and_on_demand() {
         let text = b"ISO-10303-21;HEADER;FILE_DESCRIPTION(('x''y'),'2;1');ENDSEC;DATA;#7=X((#1,$,(1,.T.)),typed('abc'),/*x*/-3.2E-4,*);ENDSEC;END-ISO-10303-21;";
         let tape = Document::parse(text, true);
         let index = Document::parse(text, false);

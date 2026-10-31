@@ -1,5 +1,5 @@
 //! Lightweight STEP and schema-aware completions.
-//! Completion context is derived from document text and schema docs without loading AST state.
+//! Completion context is derived from document text and schema docs without the statement index.
 
 use std::collections::{HashMap, HashSet};
 
