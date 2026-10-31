@@ -571,3 +571,537 @@ fn format_attribute_name(name: &str) -> String {
 fn format_attribute_type(type_name: &str) -> String {
     format!("`{}`", escape_table_cell(type_name).replace('`', "\\`"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::schema::EntityAttributeDoc;
+
+    /// Helper function to parse a document and return the result.
+    fn parse_document(text: &str) -> Document {
+        Document::parse(text.to_string())
+    }
+
+    /// Helper function to find the position of a substring in a document.
+    fn position_at(text: &str, needle: &str) -> Position {
+        let offset = text.find(needle).expect("needle should exist") as u32;
+        Position::new(0, offset)
+    }
+
+    /// Helper function to find the last occurence of a substring in a document.
+    /// This is helpful since "#1" can appear multiple times in different contexts (e.g., as a definition vs as a reference)
+    fn position_at_last(text: &str, needle: &str) -> Position {
+        let offset = text.rfind(needle).expect("needle should exist") as u32;
+        let prefix = &text[..offset as usize];
+        let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+        let column = prefix
+            .rsplit_once('\n')
+            .map(|(_, tail)| tail.len() as u32)
+            .unwrap_or(offset);
+        Position::new(line, column)
+    }
+
+    #[test]
+    fn hover_decodes_only_the_statements_it_reads() {
+        let mut text = String::from("DATA;\n");
+        for id in 1..=2000 {
+            text.push_str(&format!(
+                "#{id}=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n"
+            ));
+        }
+        let document = parse_document(&text);
+        let star = text.find("#1000=").unwrap() + "#1000=IFCSIUNIT(".len();
+        let position = document.offset_to_position(star).unwrap();
+        crate::document::DECODED_STATEMENTS.with(|count| count.set(0));
+
+        let value = hover_text(
+            hover(&document, position, &empty_schema_docs(), None).expect("hover exists"),
+        );
+
+        assert!(value.contains("IfcDimensionalExponents(1, 0, 0, 0, 0, 0, 0)"));
+        let decoded = crate::document::DECODED_STATEMENTS.with(|count| count.get());
+        assert!(decoded <= 4, "decoded {decoded} statements");
+    }
+
+    /// Helper function to extract the hover text from a hover response.
+    fn hover_text(hover: Hover) -> String {
+        match hover.contents {
+            HoverContents::Markup(markup) => markup.value,
+            contents => panic!("unexpected hover contents: {contents:?}"),
+        }
+    }
+
+    fn empty_schema_docs() -> SchemaDocCollection {
+        SchemaDocCollection::empty()
+    }
+
+    /// Helper function to create a schema document collection with a wall entity.
+    fn schema_docs_with_wall() -> SchemaDocCollection {
+        let source = r#"
+        SCHEMA IFC4;
+          TYPE IfcGloballyUniqueId = STRING(22) FIXED;
+          END_TYPE;
+          TYPE IfcWallTypeEnum = ENUMERATION OF (MOVABLE, USERDEFINED);
+          END_TYPE;
+          ENTITY IfcRoot;
+            GlobalId : IfcGloballyUniqueId;
+          END_ENTITY;
+          ENTITY IfcWall
+            SUBTYPE OF (IfcRoot);
+            PredefinedType : OPTIONAL IfcWallTypeEnum;
+          END_ENTITY;
+        END_SCHEMA;
+        "#;
+        let schema = crate::schema::load_express(crate::schema::IfcVersion::Ifc4Add2Tc1, source)
+            .expect("fixture schema should parse");
+        SchemaDocCollection::from_docs([("IFC4".to_string(), schema)])
+    }
+
+    /// Test that hover returns schema docs for entity names with detected version in the text.
+    /// Partial hover text assertion since this should only test the schema docs are returned, not the exact text.
+    #[test]
+    fn hover_returns_schema_docs_for_entity_names_with_detected_version() {
+        let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;#1=IFCWALL($);ENDSEC;END-ISO-10303-21;";
+        let document = Document::new_unloaded(text.to_string());
+
+        let hover = hover(
+            &document,
+            position_at(text, "IFCWALL"),
+            &schema_docs_with_wall(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# IfcWall"));
+        assert!(value.contains("Official documentation"));
+    }
+
+    #[test]
+    fn hover_returns_schema_docs_for_inline_defined_types() {
+        let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));ENDSEC;END-ISO-10303-21;";
+        let schema = crate::schema::load_express(
+            crate::schema::IfcVersion::Ifc4Add2Tc1,
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcLabel = STRING(255);
+              END_TYPE;
+            END_SCHEMA;
+            "#,
+        )
+        .expect("fixture schema should parse");
+        let schema_docs = SchemaDocCollection::from_docs([("IFC4".to_string(), schema)]);
+        let document = parse_document(text);
+
+        let hover = hover(&document, position_at(text, "IFCLABEL"), &schema_docs, None)
+            .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# IfcLabel"));
+        assert!(value.contains("Alias of `STRING(255)`"));
+    }
+
+    #[test]
+    fn hover_returns_enum_options_for_attribute_value() {
+        let text = "#1=IFCWALL($,.USERDEFINED.);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, ".USERDEFINED."),
+            &schema_docs_with_wall(),
+            Some("IFC4"),
+        )
+        .expect("hover should exist");
+        let range = hover.range.expect("hover should have a range");
+        let value = hover_text(hover);
+
+        assert_eq!(range.start, Position::new(0, 13));
+        assert_eq!(range.end, Position::new(0, 26));
+        assert!(value.contains("# IfcWallTypeEnum"));
+        assert!(value.contains("Attribute: `PredefinedType`"));
+        assert!(!value.contains("Current value:"));
+        assert!(value.contains("- `.MOVABLE.`"));
+        assert!(value.contains("- `.USERDEFINED.`"));
+    }
+
+    #[test]
+    fn hover_returns_enum_options_after_non_ascii_text() {
+        let text = "#1=IFCWALL('Wänd',.USERDEFINED.);";
+        let document = parse_document(text);
+        let enum_offset = text.find(".USERDEFINED.").expect("enum value should exist");
+        let position = document
+            .offset_to_position(enum_offset)
+            .expect("enum offset should convert to an LSP position");
+
+        let hover = hover(&document, position, &schema_docs_with_wall(), Some("IFC4"))
+            .expect("hover should exist");
+        let range = hover.range.expect("hover should have a range");
+
+        assert_eq!(range.start, position);
+        assert!(hover_text(hover).contains("# IfcWallTypeEnum"));
+    }
+
+    #[test]
+    fn hover_returns_enum_options_with_bundled_ifc4_schema() {
+        let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;#1=IFCWALL('id',$,$,$,$,$,$,$,.STANDARD.);ENDSEC;END-ISO-10303-21;";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, ".STANDARD."),
+            &SchemaDocCollection::new(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# IfcWallTypeEnum"));
+        assert!(value.contains("Attribute: `PredefinedType`"));
+        assert!(value.contains("- `.STANDARD.`"));
+    }
+
+    #[test]
+    fn hover_returns_enum_options_for_typed_enum_value() {
+        let text = "#1=IFCTHING($,IFCWALLTYPEENUM(.MOVABLE.));";
+        let schema = crate::schema::load_express(
+            crate::schema::IfcVersion::Ifc4Add2Tc1,
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcWallTypeEnum = ENUMERATION OF (MOVABLE, USERDEFINED);
+              END_TYPE;
+              ENTITY IfcThing;
+                Name : OPTIONAL STRING;
+                PredefinedType : IfcWallTypeEnum;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        )
+        .expect("fixture schema should parse");
+        let schema_docs = SchemaDocCollection::from_docs([("IFC4".to_string(), schema)]);
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, ".MOVABLE."),
+            &schema_docs,
+            Some("IFC4"),
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("# IfcWallTypeEnum"));
+        assert!(value.contains("Attribute: `PredefinedType`"));
+        assert!(!value.contains("Current value:"));
+        assert!(value.contains("- `.USERDEFINED.`"));
+    }
+
+    #[test]
+    fn hover_returns_none_for_enum_value_without_schema() {
+        let text = "#1=IFCWALL($,.USERDEFINED.);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, ".USERDEFINED."),
+            &empty_schema_docs(),
+            Some("IFC4"),
+        );
+
+        assert!(hover.is_none());
+    }
+
+    #[test]
+    fn typed_value_name_detection_finds_inline_type_name() {
+        let text = "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));";
+        let document = parse_document(text);
+
+        let (name, range) = typed_value_name_at_position(&document, position_at(text, "IFCLABEL"))
+            .expect("inline typed value should resolve");
+
+        assert_eq!(name, "IFCLABEL");
+        assert_eq!(range.start, Position::new(0, 35));
+        assert_eq!(range.end, Position::new(0, 43));
+    }
+
+    #[test]
+    fn typed_value_name_detection_ignores_entity_definition_name() {
+        let text = "#1=IFCWALL($);";
+        let document = parse_document(text);
+
+        assert!(typed_value_name_at_position(&document, position_at(text, "IFCWALL")).is_none());
+    }
+
+    /// Test that omitted values resolve through the handwritten parameter index.
+    #[test]
+    fn omitted_value_context_finds_instance_and_parameter() {
+        let text = "#15=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);";
+        let document = parse_document(text);
+        let offset = document.position_to_offset(position_at(text, "*")).unwrap();
+        let (instance, parameter_index) =
+            parameter_at_offset(&document, offset).expect("context should resolve from index");
+
+        assert_eq!(instance.id, Some(15));
+        assert_eq!(instance.entity_name, "IFCSIUNIT");
+        assert_eq!(parameter_index, 0);
+    }
+
+    #[test]
+    fn hover_returns_definition_preview_for_references() {
+        let text = "#1=IFCWALL($);\n#2=IFCDOOR(#1);";
+        let document = Document::new_unloaded(text.to_string());
+
+        let hover = hover(
+            &document,
+            position_at_last(text, "#1"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover exists");
+        let value = hover_text(hover);
+
+        assert!(value.contains("#1=IFCWALL($);"));
+    }
+
+    /// Test that hover does not return definition preview for definition IDs (as opposed to reference IDs).
+    #[test]
+    fn hover_does_not_return_definition_preview_for_definition_ids() {
+        let text = "#1=IFCWALL($);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, "#1"),
+            &empty_schema_docs(),
+            None,
+        );
+        assert!(hover.is_none());
+    }
+
+    /// Test that hover returns the resolved value for an IFC SI unit with omitted dimensions.
+    #[test]
+    fn hover_returns_resolved_value_for_ifc_si_unit_omitted_dimensions() {
+        let text = "#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, "*"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("Dimensions"));
+        assert!(value.contains("IfcDimensionalExponents(1, 0, 0, 0, 0, 0, 0)"));
+    }
+
+    #[test]
+    fn hover_returns_resolved_zero_dimensions_for_radian() {
+        let text = "#18=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, "*"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("Dimensions"));
+        assert!(value.contains("IfcDimensionalExponents(0, 0, 0, 0, 0, 0, 0)"));
+    }
+
+    #[test]
+    fn hover_resolves_subcontext_value_from_parent_context() {
+        let text = "#7=IFCAXIS2PLACEMENT3D();\n#11=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#7,$);\n#12=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#11,$,.MODEL_VIEW.,$);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at_last(text, "*"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("TrueNorth"));
+        assert!(value.contains("TrueNorth: `$`"));
+    }
+
+    #[test]
+    fn hover_resolves_subcontext_reference_from_parent_context() {
+        let text = "#7=IFCAXIS2PLACEMENT3D();\n#11=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,$,#7,$);\n#12=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#11,$,.MODEL_VIEW.,$);";
+        let document = parse_document(text);
+        let first_star = text.match_indices('*').nth(2).expect("third star exists").0 as u32;
+        let prefix = &text[..first_star as usize];
+        let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+        let column = prefix
+            .rsplit_once('\n')
+            .map(|(_, tail)| tail.len() as u32)
+            .unwrap_or(first_star);
+
+        let hover = hover(
+            &document,
+            Position::new(line, column),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("WorldCoordinateSystem"));
+        assert!(value.contains("`#7`"));
+        assert!(value.contains("#7=IFCAXIS2PLACEMENT3D();"));
+    }
+
+    #[test]
+    fn hover_explains_unresolved_parent_context() {
+        let text = "#12=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#99,$,.MODEL_VIEW.,$);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, "*"),
+            &empty_schema_docs(),
+            None,
+        )
+        .expect("hover should exist");
+        let value = hover_text(hover);
+
+        assert!(value.contains("CoordinateSpaceDimension"));
+        assert!(value.contains("derived value"));
+    }
+
+    #[test]
+    fn hover_ignores_unsupported_omitted_values() {
+        let text = "#1=IFCWALL(*);";
+        let document = parse_document(text);
+
+        assert!(
+            hover(
+                &document,
+                position_at(text, "*"),
+                &empty_schema_docs(),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn hover_returns_none_for_definition_id_without_a_syntax_tree() {
+        let document = Document::new_unloaded("#1=IFCWALL($);".to_string());
+
+        assert!(hover(&document, Position::new(0, 0), &empty_schema_docs(), None).is_none());
+    }
+
+    #[test]
+    fn hover_returns_enum_value_without_a_syntax_tree() {
+        let text = "#1=IFCWALL($,.USERDEFINED.);";
+        let document = Document::new_unloaded(text.to_string());
+
+        let hover = hover(
+            &document,
+            position_at(text, ".USERDEFINED."),
+            &schema_docs_with_wall(),
+            Some("IFC4"),
+        );
+
+        let value = hover_text(hover.expect("handwritten index should resolve enum context"));
+        assert!(value.contains("# IfcWallTypeEnum"));
+    }
+
+    /// Test that the markdown rendering for entity hover includes inherited and direct attribute tables.
+    /// This test breaks when markdown shape changes.
+    #[test]
+    fn render_entity_hover_renders_inherited_and_direct_attribute_tables() {
+        // Create fake EntityDoc with inherited and direct attributes
+        let entity = EntityDoc {
+            name: "IfcWall".to_string(),
+            attributes: vec![
+                EntityAttributeDoc {
+                    name: "GlobalId".to_string(),
+                    type_name: "IfcGloballyUniqueId".to_string(),
+                    declared_in: "IfcRoot".to_string(),
+                    ty: crate::schema::TypeRef::Primitive(crate::schema::PrimitiveType::String {
+                        width: None,
+                        fixed: false,
+                    }),
+                    optional: false,
+                    allows_omitted: false,
+                },
+                EntityAttributeDoc {
+                    name: "PredefinedType".to_string(),
+                    type_name: "OPTIONAL IfcWallTypeEnum".to_string(),
+                    declared_in: "IfcWall".to_string(),
+                    ty: crate::schema::TypeRef::Named(crate::schema::NamedTypeRef {
+                        name: "IFCWALLTYPEENUM".to_string(),
+                        kind: crate::schema::NamedTypeKind::Type,
+                    }),
+                    optional: true,
+                    allows_omitted: false,
+                },
+            ],
+            url: "https://example.invalid/IfcWall.htm".to_string(),
+            all_supertypes: HashSet::new(),
+        };
+
+        let markdown = render_entity_hover(&entity);
+
+        assert!(markdown.contains("## Inherited Attributes"));
+        assert!(markdown.contains("| 1 | *GlobalId* | `IfcGloballyUniqueId` |"));
+        assert!(markdown.contains("## Attributes Declared In This Entity"));
+        assert!(markdown.contains("| 2 | *PredefinedType* | `OPTIONAL IfcWallTypeEnum` |"));
+        assert!(!markdown.contains("Declared In |"));
+        assert!(markdown.contains("[Official documentation](https://example.invalid/IfcWall.htm)"));
+    }
+
+    /// Test that the markdown rendering for entity hover omits the inherited table when it is empty.
+    #[test]
+    fn render_entity_hover_omits_empty_inherited_table() {
+        // Create fake EntityDoc with empty inherited table
+        let entity = EntityDoc {
+            name: "IfcRoot".to_string(),
+            attributes: vec![EntityAttributeDoc {
+                name: "GlobalId".to_string(),
+                type_name: "IfcGloballyUniqueId".to_string(),
+                declared_in: "IfcRoot".to_string(),
+                ty: crate::schema::TypeRef::Primitive(crate::schema::PrimitiveType::String {
+                    width: None,
+                    fixed: false,
+                }),
+                optional: false,
+                allows_omitted: false,
+            }],
+            url: "https://example.invalid/IfcRoot.htm".to_string(),
+            all_supertypes: HashSet::new(),
+        };
+
+        let markdown = render_entity_hover(&entity);
+
+        assert!(!markdown.contains("## Inherited Attributes"));
+        assert!(markdown.contains("## Attributes Declared In This Entity"));
+        assert!(markdown.contains("| 1 | *GlobalId* | `IfcGloballyUniqueId` |"));
+    }
+
+    #[test]
+    fn render_type_hover_renders_alias_types() {
+        let markdown = render_type_hover(&TypeDoc::Alias(crate::schema::AliasTypeDef {
+            name: "IfcLabel".to_string(),
+            target: crate::schema::TypeRef::Primitive(crate::schema::PrimitiveType::String {
+                width: Some(255),
+                fixed: false,
+            }),
+        }));
+
+        assert!(markdown.contains("# IfcLabel"));
+        assert!(markdown.contains("Alias of `STRING(255)`"));
+    }
+}
