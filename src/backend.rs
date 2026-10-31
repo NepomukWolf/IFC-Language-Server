@@ -47,12 +47,16 @@ impl Default for ConfigState {
     }
 }
 
+const DIAGNOSTICS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     schema_docs: Arc<RwLock<SchemaDocCollection>>,
     config: Arc<RwLock<ConfigState>>,
     unknown_schema_warned: Arc<RwLock<HashMap<Url, Option<String>>>>,
+    last_change: Arc<RwLock<HashMap<Url, tokio::time::Instant>>>,
     diagnostic_scheduler: DiagnosticScheduler,
     instance_cache: Arc<EntityInstanceCache>,
 }
@@ -66,6 +70,7 @@ impl Backend {
             schema_docs: Arc::new(RwLock::new(SchemaDocCollection::new())),
             config: Arc::new(RwLock::new(ConfigState::default())),
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
+            last_change: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
             instance_cache: Arc::new(EntityInstanceCache::default()),
         }
@@ -171,13 +176,18 @@ impl Backend {
         mut documents: RwLockWriteGuard<'_, HashMap<Url, Document>>,
         uri: &Url,
         changes: Vec<TextDocumentContentChangeEvent>,
-    ) -> Option<DiagnosticSnapshot> {
+    ) -> Option<std::time::Duration> {
         unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
         if let Err(error) = document.apply_content_changes(&changes) {
             warn!(?error, "received invalid incremental document change");
         }
+        let now = tokio::time::Instant::now();
+        let delay = match self.last_change.write().await.insert(uri.clone(), now) {
+            Some(previous) if now - previous < DIAGNOSTICS_DEBOUNCE => DIAGNOSTICS_DEBOUNCE,
+            _ => std::time::Duration::ZERO,
+        };
 
         info!(
             text_len = document.text.len(),
@@ -186,11 +196,47 @@ impl Backend {
             reference_id_count = document.references.len(),
             "updated active document"
         );
-        let snapshot = DiagnosticSnapshot::from_document(document);
         drop(documents);
+        Some(delay)
+    }
 
-        self.check_schema_support(uri, snapshot.schema_name()).await;
-        Some(snapshot)
+    async fn current_snapshot(
+        &self,
+        uri: &Url,
+        ticket: &DiagnosticTicket,
+    ) -> Option<DiagnosticSnapshot> {
+        if !self.diagnostic_scheduler.is_current(ticket).await {
+            return None;
+        }
+        let mut documents = self.documents.write().await;
+        if !self.diagnostic_scheduler.is_current(ticket).await {
+            return None;
+        }
+        if let Some(reloaded) = self.ensure_document_loaded(&mut documents, uri).await? {
+            return Some(reloaded);
+        }
+        Some(DiagnosticSnapshot::from_document(documents.get(uri)?))
+    }
+
+    fn schedule_debounced_diagnostics(
+        &self,
+        ticket: DiagnosticTicket,
+        uri: Url,
+        delay: std::time::Duration,
+    ) {
+        let backend = self.clone();
+        crate::rt::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let Some(snapshot) = backend.current_snapshot(&uri, &ticket).await else {
+                return;
+            };
+            backend
+                .check_schema_support(&uri, snapshot.schema_name())
+                .await;
+            backend.schedule_diagnostics(ticket, snapshot).await;
+        });
     }
 
     #[instrument(skip(self, documents), fields(uri = %uri))]
@@ -235,6 +281,15 @@ impl Backend {
     async fn request_time_diagnostics(&self, snapshot: Option<DiagnosticSnapshot>, uri: &Url) {
         if let Some(snapshot) = snapshot {
             let schema = self.resolve_schema(snapshot.schema_name()).await;
+            let documents = self.documents.read().await;
+            if !documents
+                .get(uri)
+                .is_some_and(|document| Arc::ptr_eq(&document.text, snapshot.shared_text()))
+            {
+                drop(documents);
+                crate::document::drop_on_blocking_thread(snapshot);
+                return;
+            }
             self.diagnostic_scheduler
                 .schedule_if_inputs_changed(uri.clone(), snapshot, schema)
                 .await;
@@ -586,11 +641,11 @@ impl LanguageServer for Backend {
             let documents = self.documents.write().await;
             self.instance_cache.clear();
             let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
-            if let Some(snapshot) = self
+            if let Some(delay) = self
                 .apply_changes_to_active_document(documents, &uri, changes)
                 .await
             {
-                self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
+                self.schedule_debounced_diagnostics(diagnostic_ticket, uri, delay);
             } else {
                 warn!("received document change for an unopened document");
             }
@@ -609,6 +664,7 @@ impl LanguageServer for Backend {
         }
 
         self.unknown_schema_warned.write().await.remove(&uri);
+        self.last_change.write().await.remove(&uri);
         self.diagnostic_scheduler.invalidate(&uri).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
         info!("document closed");
@@ -1436,6 +1492,229 @@ mod tests {
             panic!("hover on `#1` in the changed text");
         };
         assert!(markup.value.contains("#1=IFCWALL($);"), "{}", markup.value);
+    }
+
+    async fn change_document(backend: &Backend, uri: &Url, version: i32, range: Range, text: &str) {
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(range),
+                    range_length: None,
+                    text: text.to_string(),
+                }],
+            })
+            .await;
+    }
+
+    type ClientOutput = tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>;
+
+    async fn read_message(output: &mut ClientOutput) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let mut header = String::new();
+        output.read_line(&mut header).await.unwrap();
+        let length: usize = header
+            .trim()
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        header.clear();
+        output.read_line(&mut header).await.unwrap();
+        let mut body = vec![0; length];
+        output.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn next_publication(output: &mut ClientOutput) -> serde_json::Value {
+        loop {
+            let message = read_message(output).await;
+            if message["method"] == "textDocument/publishDiagnostics" {
+                return message;
+            }
+        }
+    }
+
+    /// Serves a backend over an in-memory transport and completes the `initialize` exchange.
+    async fn serve_initialized() -> (Backend, ClientOutput, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let (service, socket) = LspService::new(Backend::new);
+        let backend = service.inner().clone();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server =
+            tokio::spawn(tower_lsp::Server::new(server_read, server_write, socket).serve(service));
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut output = BufReader::new(client_read);
+        let initialize =
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+        client_write
+            .write_all(
+                format!("Content-Length: {}\r\n\r\n{}", initialize.len(), initialize).as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_message(&mut output).await["id"], 1);
+        (backend, output, server)
+    }
+
+    fn fresh_diagnostics(text: &str) -> serde_json::Value {
+        let fresh = Document::parse(text.to_string());
+        serde_json::to_value(crate::diagnostics::collect(
+            &DiagnosticSnapshot::from_document(&fresh),
+            None,
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_burst_publishes_on_its_first_and_after_its_last_edit() {
+        for interval in [DIAGNOSTICS_DEBOUNCE / 5, DIAGNOSTICS_DEBOUNCE * 4 / 5] {
+            let (backend, mut output, server) = serve_initialized().await;
+            let uri = Url::parse("file:///tmp/burst.ifc").unwrap();
+            let (sender, mut publications) = tokio::sync::mpsc::unbounded_channel();
+            let reader = tokio::spawn(async move {
+                loop {
+                    let publication = next_publication(&mut output).await;
+                    if sender
+                        .send((tokio::time::Instant::now(), publication))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            open_document(&backend, &uri, "#1=IFCWALL('');\n#2=IFCDOOR(#1);\n").await;
+            publications.recv().await.unwrap();
+
+            let first_edit = tokio::time::Instant::now();
+            let mut last_edit = first_edit;
+            for index in 0..15 {
+                last_edit = tokio::time::Instant::now();
+                change_document(
+                    &backend,
+                    &uri,
+                    index + 2,
+                    Range::new(
+                        Position::new(0, 12 + index as u32),
+                        Position::new(0, 12 + index as u32),
+                    ),
+                    if index == 14 { "'" } else { "a" },
+                )
+                .await;
+                tokio::time::sleep(interval).await;
+            }
+            tokio::time::sleep(DIAGNOSTICS_DEBOUNCE * 3).await;
+            let mut published = Vec::new();
+            while let Ok(publication) = publications.try_recv() {
+                published.push(publication);
+            }
+
+            assert_eq!(published.len(), 2, "interval {interval:?}");
+            assert!(published[0].0 - first_edit < interval);
+            let after_last_edit = published[1].0 - last_edit;
+            assert!(
+                after_last_edit >= DIAGNOSTICS_DEBOUNCE
+                    && after_last_edit < DIAGNOSTICS_DEBOUNCE + interval,
+                "{after_last_edit:?}"
+            );
+            let documents = backend.documents.read().await;
+            let document = &documents[&uri];
+            let fresh = Document::parse(document.text.to_string());
+            assert_eq!(document.references, fresh.references);
+            assert_eq!(
+                document.entity_instance_by_id(2),
+                fresh.entity_instance_by_id(2)
+            );
+            let expected = fresh_diagnostics(&document.text);
+            assert_ne!(expected, serde_json::json!([]));
+            assert_eq!(published[1].1["params"]["diagnostics"], expected);
+            drop(documents);
+            reader.abort();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_between_edits_sees_current_text_and_index() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/current.ifc").unwrap();
+        open_document(
+            backend,
+            &uri,
+            "#3=IFCWALL($);\n#4=IFCSLAB($);\n#2=IFCDOOR(#3);\n",
+        )
+        .await;
+        for (version, id, line) in [(2, "4", 1), (3, "3", 0)] {
+            change_document(
+                backend,
+                &uri,
+                version,
+                Range::new(Position::new(2, 12), Position::new(2, 13)),
+                id,
+            )
+            .await;
+            let params = GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams::new(
+                    TextDocumentIdentifier::new(uri.clone()),
+                    Position::new(2, 12),
+                ),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            assert_eq!(
+                backend.goto_definition(params).await.unwrap(),
+                Some(GotoDefinitionResponse::Scalar(Location::new(
+                    uri.clone(),
+                    Range::new(Position::new(line, 0), Position::new(line, 2))
+                )))
+            );
+            let documents = backend.documents.read().await;
+            let document = &documents[&uri];
+            assert!(document.definitions.contains_key(&id.parse().unwrap()));
+            assert_eq!(
+                document.entity_instance_by_id(2).unwrap().parameters[0],
+                crate::document::ParameterValue::Reference {
+                    id: id.parse().unwrap(),
+                    range: Range::new(Position::new(2, 11), Position::new(2, 13)),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_edits_never_publish_diagnostics() {
+        let (backend, mut output, server) = serve_initialized().await;
+        let uri = Url::parse("file:///tmp/superseded.ifc").unwrap();
+        open_document(&backend, &uri, "#1=IFCWALL($);\n").await;
+        next_publication(&mut output).await;
+        let old_snapshot = {
+            let documents = backend.documents.read().await;
+            DiagnosticSnapshot::from_document(&documents[&uri])
+        };
+        change_document(
+            &backend,
+            &uri,
+            2,
+            Range::new(Position::new(0, 13), Position::new(0, 14)),
+            "",
+        )
+        .await;
+        backend
+            .request_time_diagnostics(Some(old_snapshot), &uri)
+            .await;
+
+        let publication = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            next_publication(&mut output),
+        )
+        .await
+        .unwrap();
+        let expected = fresh_diagnostics("#1=IFCWALL($)\n");
+        assert_ne!(expected, serde_json::json!([]));
+        assert_eq!(publication["params"]["diagnostics"], expected);
+        server.abort();
     }
 
     #[test]
