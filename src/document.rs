@@ -1724,6 +1724,8 @@ mod tests {
                 (Some(5), "IFCDIRECTION", 1),
                 (Some(6), "IFCWALL", 2),
                 (Some(7), "IFCCARTESIANPOINT", 1),
+                (Some(8), "IFCWALL", 5),
+                (Some(9), "IFCDIRECTION", 1),
             ]
         );
     }
