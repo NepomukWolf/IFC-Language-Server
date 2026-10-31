@@ -9,6 +9,6 @@ mod document_index;
 mod features;
 mod rt;
 mod schema;
-mod step;
+pub mod step;
 
 pub use backend::Backend;
