@@ -32,9 +32,13 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn follows_unclosed_string(unclosed_strings: &[UnclosedString], offset: usize) -> bool {
-    let index = unclosed_strings.partition_point(|string| string.quote <= offset);
-    index > 0 && unclosed_strings[index - 1].end >= offset
+fn overlaps_unclosed_string(
+    unclosed_strings: &[UnclosedString],
+    node: &tree_sitter::Node<'_>,
+) -> bool {
+    let reach = node.end_byte().saturating_sub(1).max(node.start_byte());
+    let index = unclosed_strings.partition_point(|string| string.quote <= reach);
+    index > 0 && unclosed_strings[index - 1].end >= node.start_byte()
 }
 
 fn unclosed_string_diagnostic(
@@ -75,7 +79,7 @@ fn collect_error_nodes(
     loop {
         let node = cursor.node();
 
-        if !follows_unclosed_string(unclosed_strings, node.start_byte())
+        if !overlaps_unclosed_string(unclosed_strings, &node)
             && let Some(diagnostic) = syntax_diagnostic_for_node(&node)
         {
             diagnostics.push(diagnostic);
@@ -325,6 +329,52 @@ mod tests {
             diagnostics,
             [(
                 Position::new(2, 11),
+                "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_an_unclosed_string_in_a_header_entity_to_the_end_of_its_line() {
+        let doc = parse_document("ISO-10303-21;\nHEADER;\nFILE_NAME('unterminated);\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(2, 10), Position::new(2, 25)),
+                "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_string_in_the_header_leaves_the_data_section_alone() {
+        let doc = parse_document(concat!(
+            "ISO-10303-21;\n",
+            "HEADER;\n",
+            "FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');\n",
+            "FILE_NAME('unterminated,'2026-10-31T00:00:00',(''),(''),'','','');\n",
+            "FILE_SCHEMA(('IFC4'));\n",
+            "ENDSEC;\n",
+            "DATA;\n",
+            "#1=IFCWALL('a',$,$,$,'Wall',$,$,$,$);\n",
+            "#2=IFCWALL('b',$,$,$,'Wall',$,$,$,$);\n",
+            "ENDSEC;\n",
+            "END-ISO-10303-21;\n",
+        ));
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range.start, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Position::new(3, 10),
                 "Unclosed string; expected `'`".to_string()
             )]
         );
