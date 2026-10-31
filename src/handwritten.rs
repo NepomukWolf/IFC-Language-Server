@@ -432,6 +432,11 @@ struct Reader<'a, 'p> {
     skipped: Vec<ParseError>,
 }
 
+/// Deepest nesting of lists and typed values read. Decoded values are walked recursively, so this
+/// keeps every consumer within a small (wasm) stack.
+pub(crate) const MAX_NESTING: usize = 256;
+pub(crate) const NESTING_TOO_DEEP: &str = "nesting too deep";
+
 /// Errors confined to one scalar value, which `Reader::skip` can step over.
 const SKIPPABLE: [&str; 7] = [
     "expected parameter",
@@ -493,8 +498,14 @@ impl Reader<'_, '_> {
         self.list_body(start, kind)
     }
     fn list_body(&mut self, start: usize, kind: Kind) -> Result<(), ParseError> {
-        if self.depth >= 256 {
-            return Err(self.error("nesting exceeds prototype limit"));
+        if self.depth >= MAX_NESTING {
+            return Err(ParseError {
+                span: Span {
+                    start: start as u32,
+                    end: start as u32 + 1,
+                },
+                message: NESTING_TOO_DEEP,
+            });
         }
         self.depth += 1;
         let slot = self.params.len();

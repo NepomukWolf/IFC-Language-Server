@@ -634,6 +634,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn values_nested_to_the_limit_parse_and_validate_within_a_wasm_sized_stack() {
+        let depth = crate::handwritten::MAX_NESTING - 1;
+        let text = format!(
+            "DATA;\n#1=IFCWALL('g',{}1{});\nENDSEC;\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let doc = parse_document(&text);
+                let snapshot = crate::diagnostics::DiagnosticSnapshot::from_document(&doc);
+                assert_eq!(crate::diagnostics::syntax::collect(&snapshot), []);
+                let instance = doc.entity_instance_by_id(1).expect("instance decodes");
+                assert_eq!(instance.parameters.len(), 2);
+                assert_eq!(collect(&doc, &test_schema(), None).len(), 1);
+            })
+            .expect("thread spawns")
+            .join()
+            .expect("decoding and validation fit the stack");
+    }
+
     /// Test that the datatype validator accepts valid values.
     #[test]
     fn datatype_validator_accepts_valid_values() {

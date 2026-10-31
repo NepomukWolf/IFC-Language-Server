@@ -3,6 +3,7 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::diagnostics::DiagnosticSnapshot;
+use crate::handwritten;
 
 #[tracing::instrument(skip_all)]
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
@@ -11,7 +12,7 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
         .map_or_else(Vec::new, |lazy| collect_lazy(lazy, snapshot.text()))
 }
 
-fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnostic> {
+fn collect_lazy(lazy: &handwritten::Document, text: &str) -> Vec<Diagnostic> {
     lazy.errors
         .iter()
         .map(|error| {
@@ -45,6 +46,17 @@ fn collect_lazy(lazy: &crate::handwritten::Document, text: &str) -> Vec<Diagnost
                     range: Range::new(at, at),
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: format!("Missing `{token}`"),
+                    ..Default::default()
+                };
+            }
+            if error.message == handwritten::NESTING_TOO_DEEP {
+                return Diagnostic {
+                    range: Range::new(position(text, start), position(text, end)),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!(
+                        "Values nested more than {} levels deep are not supported",
+                        handwritten::MAX_NESTING
+                    ),
                     ..Default::default()
                 };
             }
@@ -185,6 +197,28 @@ mod tests {
                 range: Range::new(Position::new(1, 27), Position::new(1, 28)),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: "Invalid IFC STEP syntax".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_values_nested_beyond_the_limit_as_unsupported() {
+        let depth = handwritten::MAX_NESTING;
+        let text = format!(
+            "DATA;\n#1=IFCWALL({}1{});\nENDSEC;\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&parse_document(&text)));
+
+        let start = "#1=IFCWALL(".len() as u32 + depth as u32 - 1;
+        assert_eq!(
+            diagnostics,
+            vec![Diagnostic {
+                range: Range::new(Position::new(1, start), Position::new(1, start + 1)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Values nested more than 256 levels deep are not supported".to_string(),
                 ..Default::default()
             }]
         );

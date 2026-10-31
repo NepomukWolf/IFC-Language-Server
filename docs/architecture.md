@@ -150,6 +150,8 @@ ranges. Features decode only the statements they need.
 - A malformed scalar value (a stray token, a bad number, reference or enumeration) is skipped up to
   its next `,`, `)` or `;` and reported; the statement keeps its other parameters.
 - A statement missing only its outer `)` before `;` keeps its parameters.
+- Values nest at most 256 levels deep, which keeps the recursive consumers of decoded values within
+  a wasm stack. Deeper nesting is reported as unsupported.
 - Any other error, such as an unclosed string, drops the statement's parameters. Its id and name
   stay indexed.
 
