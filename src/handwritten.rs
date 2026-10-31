@@ -140,6 +140,7 @@ impl Document {
                         params: &mut doc.params,
                         retain,
                         depth: 0,
+                        recovered: false,
                     };
                     let result = reader.list(Kind::List).and_then(|()| reader.expect(b';'));
                     if let Err(mut error) = result {
@@ -196,6 +197,7 @@ impl Document {
             params: &mut self.params,
             retain: self.retain,
             depth: 0,
+            recovered: false,
         };
         let result = (|| {
             let id_start = r.p;
@@ -225,8 +227,12 @@ impl Document {
             }
             Ok(())
         })();
+        let recovered = r.recovered;
         if let Err(error) = result {
             self.errors.push(error);
+            if !recovered {
+                self.params.truncate(param_start as usize);
+            }
         }
         statement.param_len = self.params.len() as u32 - param_start;
         self.statements.push(statement);
@@ -251,8 +257,11 @@ impl Document {
             params: &mut params,
             retain: true,
             depth: 0,
+            recovered: false,
         };
-        let _ = r.list(Kind::List);
+        if r.list(Kind::List).is_err() && !r.recovered {
+            params.clear();
+        }
         params
     }
 
@@ -320,9 +329,7 @@ impl Document {
             param.next = (param.next as i64 + param_delta) as u32;
         }
         for param in &mut local.params {
-            if param.next != 0 {
-                param.next += a;
-            }
+            param.next += a;
         }
         for statement in &mut self.statements[last..] {
             statement.span.shift(delta);
@@ -412,6 +419,8 @@ struct Reader<'a, 'p> {
     params: &'p mut Vec<Param>,
     retain: bool,
     depth: usize,
+    /// Set when the outer list lacked only its `)` and its parameters were kept.
+    recovered: bool,
 }
 
 impl Reader<'_, '_> {
@@ -477,7 +486,7 @@ impl Reader<'_, '_> {
             });
         }
         self.p = trivia(self.text, self.p, self.end);
-        let result = if self.text.get(self.p) != Some(&b')') {
+        if self.text.get(self.p) != Some(&b')') {
             loop {
                 self.value()?;
                 self.p = trivia(self.text, self.p, self.end);
@@ -487,32 +496,27 @@ impl Reader<'_, '_> {
                     break;
                 }
             }
-            Ok(())
-        } else {
-            Ok(())
-        };
-        let result = result.and_then(|()| self.expect(b')'));
+        }
+        let closed = self.expect(b')');
+        let recoverable = self.depth == 1 && (self.p >= self.end || self.text[self.p] == b';');
+        if closed.is_err() {
+            if !recoverable {
+                return closed;
+            }
+            self.recovered = true;
+        }
         if self.retain {
-            let complete = result.is_ok() || self.params.len() > slot + 1;
             self.params[slot] = Param {
                 span: Span {
-                    start: if complete { start as u32 } else { 0 },
-                    end: if complete {
-                        self.p.min(self.end) as u32
-                    } else {
-                        0
-                    },
+                    start: start as u32,
+                    end: self.p as u32,
                 },
-                next: if complete {
-                    self.params.len() as u32
-                } else {
-                    0
-                },
+                next: self.params.len() as u32,
                 kind,
             };
         }
         self.depth -= 1;
-        result
+        closed
     }
     fn value(&mut self) -> Result<(), ParseError> {
         self.p = trivia(self.text, self.p, self.end);

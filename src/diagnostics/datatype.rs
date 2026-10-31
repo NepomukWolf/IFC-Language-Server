@@ -591,6 +591,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn datatype_validation_skips_statements_with_an_unclosed_value() {
+        let doc = parse_document(concat!(
+            "#1=IFCWALL(123,'abc);\n",
+            "#2=IFCWALL(456,(1,(2,.MOVABLE.);\n",
+            "#3=IFCWALL(789,.MOVABLE.);\n",
+        ));
+        let diagnostics = collect(&doc, &test_schema(), None);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| d.range.start.line)
+                .collect::<Vec<_>>(),
+            [2],
+            "{diagnostics:?}"
+        );
+    }
+
     /// Test that the datatype validator accepts valid values.
     #[test]
     fn datatype_validator_accepts_valid_values() {
