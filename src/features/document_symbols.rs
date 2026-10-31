@@ -520,8 +520,8 @@ fn instance_symbol(
         tags: None,
         #[allow(deprecated)]
         deprecated: None,
-        range: lsp_range(lines, item.entity_range),
-        selection_range: lsp_range(lines, item.id_range.unwrap_or(item.entity_name_range)),
+        range: item.entity_range,
+        selection_range: item.id_range.unwrap_or(item.entity_name_range),
         children: (!children.is_empty()).then_some(children),
     }
 }
@@ -585,28 +585,18 @@ fn text_for_range(lines: &[&str], range: Range) -> Option<String> {
         return None;
     }
     let line = lines.get(range.start.line as usize)?;
-    Some(
-        line.get(range.start.character as usize..range.end.character as usize)?
-            .to_string(),
-    )
-}
-fn lsp_range(lines: &[&str], range: Range) -> Range {
-    Range::new(
-        lsp_position(lines, range.start),
-        lsp_position(lines, range.end),
-    )
-}
-fn lsp_position(lines: &[&str], position: Position) -> Position {
-    let Some(prefix) = lines
-        .get(position.line as usize)
-        .and_then(|line| line.get(..position.character as usize))
-    else {
-        return position;
-    };
-    Position::new(
-        position.line,
-        prefix.encode_utf16().count().try_into().unwrap_or(u32::MAX),
-    )
+    let mut units = 0;
+    let mut start = None;
+    for (offset, character) in line.char_indices().chain([(line.len(), '\n')]) {
+        if units == range.start.character {
+            start = Some(offset);
+        }
+        if units == range.end.character {
+            return Some(line[start?..offset].to_string());
+        }
+        units += character.len_utf16() as u32;
+    }
+    None
 }
 fn symbol_kind(class: Option<Class>) -> SymbolKind {
     match class {

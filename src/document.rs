@@ -312,7 +312,7 @@ impl Document {
             text: self.text.as_bytes(),
             offset: self.line_offsets[row],
             row,
-            line_start: self.line_offsets[row],
+            column: 0,
         };
         lazy_entity_instance(lazy, &self.text, index, &mut points)
             .filter(|instance| instance.parameter_list_range.is_some())
@@ -369,13 +369,9 @@ impl Document {
             Err(next_line) => next_line.checked_sub(1)?,
         };
         let line_start = self.line_offsets[line_index];
-        let line_text = self.text.get(line_start..offset)?;
-        let character = line_text
-            .chars()
-            .map(|character| character.len_utf16() as u32)
-            .sum();
+        let character = utf16_len(&self.text.as_bytes()[line_start..offset]);
 
-        Some(Position::new(line_index as u32, character))
+        Some(Position::new(line_index as u32, character as u32))
     }
 
     pub fn range_for_offsets(&self, start: usize, end: usize) -> Option<Range> {
@@ -620,7 +616,7 @@ pub(crate) fn for_each_lazy_entity_instance_named(
         text: text.as_bytes(),
         offset: 0,
         row: 0,
-        line_start: 0,
+        column: 0,
     };
     let mut name = String::new();
     for index in 0..lazy.statements.len() {
@@ -653,7 +649,7 @@ pub(crate) fn lazy_entity_instance_relative(
         text: text.as_bytes(),
         offset: start,
         row: 0,
-        line_start: start,
+        column: 0,
     };
     lazy_entity_instance(lazy, text, index, &mut points)
         .filter(|instance| instance.parameter_list_range.is_some())
@@ -665,7 +661,7 @@ pub(crate) fn positions_of(text: &str, offsets: impl IntoIterator<Item = usize>)
         text: text.as_bytes(),
         offset: 0,
         row: 0,
-        line_start: 0,
+        column: 0,
     };
     offsets
         .into_iter()
@@ -793,24 +789,36 @@ fn lazy_parameter_values(
     values
 }
 
-/// Converts monotonically increasing byte offsets to positions with byte columns.
+/// Converts monotonically increasing byte offsets to positions with UTF-16 columns, scanning
+/// only the bytes between consecutive offsets.
 struct LinePoints<'a> {
     text: &'a [u8],
     offset: usize,
     row: usize,
-    line_start: usize,
+    column: usize,
 }
 
 impl LinePoints<'_> {
     fn position(&mut self, offset: usize) -> Position {
         let skipped = &self.text[self.offset..offset];
-        if let Some(last) = memchr::memrchr(b'\n', skipped) {
-            self.row += memchr::memchr_iter(b'\n', skipped).count();
-            self.line_start = self.offset + last + 1;
+        match memchr::memrchr(b'\n', skipped) {
+            Some(last) => {
+                self.row += memchr::memchr_iter(b'\n', skipped).count();
+                self.column = utf16_len(&skipped[last + 1..]);
+            }
+            None => self.column += utf16_len(skipped),
         }
         self.offset = offset;
-        Position::new(self.row as u32, (offset - self.line_start) as u32)
+        Position::new(self.row as u32, self.column as u32)
     }
+}
+
+/// UTF-16 code units in UTF-8 `bytes`: one per leading byte, two for a four-byte sequence.
+pub(crate) fn utf16_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .map(|&byte| usize::from(byte & 0xC0 != 0x80) + usize::from(byte >= 0xF0))
+        .sum()
 }
 
 impl EntityTypeIndex<'_> {

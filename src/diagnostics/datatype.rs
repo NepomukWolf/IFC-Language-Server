@@ -517,7 +517,7 @@ mod tests {
     use super::*;
     use crate::document::Document;
     use crate::schema::{IfcVersion, load_express};
-    use tower_lsp::lsp_types::Range;
+    use tower_lsp::lsp_types::{Position, Range};
 
     /// Helper function to parse a document and return the result.
     fn parse_document(text: &str) -> Document {
@@ -617,6 +617,21 @@ mod tests {
         let doc = parse_document("#1=IFCWALL(#,.MOVABLE.);\n#2=IFCWALL(1E,#);\n");
         let diagnostics = collect(&doc, &test_schema(), None);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn datatype_ranges_count_utf16_units_after_non_ascii_text() {
+        let prefix = "DATA;\n#1=IFCWALL('é😀',";
+        let doc = parse_document(&format!("{prefix}123);\n"));
+        let diagnostics = collect(&doc, &test_schema(), None);
+
+        let line_prefix = &prefix[prefix.find('#').unwrap()..];
+        let start = line_prefix.encode_utf16().count() as u32;
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(1, start), Position::new(1, start + 3))
+        );
     }
 
     /// Test that the datatype validator accepts valid values.

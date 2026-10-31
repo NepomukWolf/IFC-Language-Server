@@ -88,8 +88,7 @@ pub fn hover(
         });
     }
 
-    if let Some(offset) = document.position_to_offset(position)
-        && let Some((instance, parameter_index)) = parameter_at_offset(document, offset)
+    if let Some((instance, parameter_index)) = parameter_at_position(document, position)
         && let Some(value) = instance.parameters.get(parameter_index)
         && matches!(value, ParameterValue::Omitted { .. })
     {
@@ -100,16 +99,12 @@ pub fn hover(
             &instance.entity_name,
             parameter_index,
         )?;
-        let range = document.range_for_offsets(
-            range_offset(document, omitted_range)?.0,
-            range_offset(document, omitted_range)?.1,
-        )?;
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value,
             }),
-            range: Some(range),
+            range: Some(omitted_range),
         });
     }
 
@@ -196,44 +191,43 @@ fn render_header_keyword_hover(keyword: &str) -> Option<&'static str> {
     }
 }
 
-fn parameter_at_offset(document: &Document, offset: usize) -> Option<(EntityInstanceInfo, usize)> {
-    let instance = document.entity_instance_at_offset(offset)?;
+fn parameter_at_position(
+    document: &Document,
+    position: Position,
+) -> Option<(EntityInstanceInfo, usize)> {
+    let instance = document.entity_instance_at_offset(document.position_to_offset(position)?)?;
     let index = instance
         .parameters
         .iter()
-        .position(|parameter| parameter_contains_offset(document, parameter, offset))?;
+        .position(|parameter| contains(parameter.range(), position))?;
     Some((instance, index))
 }
 
-fn parameter_contains_offset(
-    document: &Document,
-    parameter: &ParameterValue,
-    offset: usize,
-) -> bool {
-    range_offset(document, parameter.range())
-        .is_some_and(|(start, end)| start <= offset && offset < end)
+fn contains(range: Range, position: Position) -> bool {
+    range.start <= position && position < range.end
 }
 
 fn typed_value_name_span(
     document: &Document,
     parameter: &ParameterValue,
+    position: Position,
     offset: usize,
 ) -> Option<(usize, usize)> {
     match parameter {
-        ParameterValue::Typed { inner, range, .. } => {
-            let (start, end) = range_offset(document, *range)?;
-            let open = document.text.get(start..end)?.find('(')? + start;
-            if start <= offset && offset < open {
+        ParameterValue::Typed { inner, range, .. } if contains(*range, position) => {
+            let start = document.position_to_offset(range.start)?;
+            let open = document.text.get(start..)?.find('(')? + start;
+            if offset < open {
                 Some((start, open))
             } else {
                 inner
                     .iter()
-                    .find_map(|item| typed_value_name_span(document, item, offset))
+                    .find_map(|item| typed_value_name_span(document, item, position, offset))
             }
         }
         ParameterValue::List { items, .. } => items
             .iter()
-            .find_map(|item| typed_value_name_span(document, item, offset)),
+            .find_map(|item| typed_value_name_span(document, item, position, offset)),
         _ => None,
     }
 }
@@ -243,70 +237,52 @@ fn enum_value_at_position<'a>(
     schema: &'a SchemaDoc,
     position: Position,
 ) -> Option<(Range, &'a EntityAttributeDoc, &'a EnumerationTypeDef)> {
-    let offset = document.position_to_offset(position)?;
-    let (instance, parameter_index) = parameter_at_offset(document, offset)?;
+    let (instance, parameter_index) = parameter_at_position(document, position)?;
     let parameter = instance.parameters.get(parameter_index)?;
     let attribute = schema
         .entity(&instance.entity_name)?
         .attributes
         .get(parameter_index)?;
-    let enum_value = enum_value_in_parameter(document, parameter, offset)?;
+    let enum_value = enum_value_in_parameter(parameter, position)?;
     let enum_def = enum_value
         .typed_name
         .and_then(|type_name| enum_type_from_type_name(schema, type_name))
         .or_else(|| enum_type_from_type_ref(schema, &attribute.ty, 0))?;
-    let range = document.range_for_offsets(enum_value.start_offset, enum_value.end_offset)?;
 
-    Some((range, attribute, enum_def))
+    Some((enum_value.range, attribute, enum_def))
 }
 
 struct EnumValueAtPosition<'a> {
-    start_offset: usize,
-    end_offset: usize,
+    range: Range,
     typed_name: Option<&'a str>,
 }
 
-fn enum_value_in_parameter<'a>(
-    document: &Document,
-    parameter: &'a ParameterValue,
-    offset: usize,
-) -> Option<EnumValueAtPosition<'a>> {
-    let (start_offset, end_offset) = range_offset(document, parameter.range())?;
-    if offset < start_offset || offset >= end_offset {
+fn enum_value_in_parameter(
+    parameter: &ParameterValue,
+    position: Position,
+) -> Option<EnumValueAtPosition<'_>> {
+    if !contains(parameter.range(), position) {
         return None;
     }
 
     match parameter {
-        ParameterValue::Enumeration { .. } => Some(EnumValueAtPosition {
-            start_offset,
-            end_offset,
+        ParameterValue::Enumeration { range, .. } => Some(EnumValueAtPosition {
+            range: *range,
             typed_name: None,
         }),
         ParameterValue::List { items, .. } => items
             .iter()
-            .find_map(|item| enum_value_in_parameter(document, item, offset)),
+            .find_map(|item| enum_value_in_parameter(item, position)),
         ParameterValue::Typed {
             type_name, inner, ..
         } => inner.iter().find_map(|item| {
-            enum_value_in_parameter(document, item, offset).map(|mut enum_value| {
+            enum_value_in_parameter(item, position).map(|mut enum_value| {
                 enum_value.typed_name = Some(type_name);
                 enum_value
             })
         }),
         _ => None,
     }
-}
-
-fn range_offset(document: &Document, range: Range) -> Option<(usize, usize)> {
-    let start = document
-        .line_offsets
-        .get(range.start.line as usize)?
-        .checked_add(range.start.character as usize)?;
-    let end = document
-        .line_offsets
-        .get(range.end.line as usize)?
-        .checked_add(range.end.character as usize)?;
-    (end <= document.text.len()).then_some((start, end))
 }
 
 fn enum_type_from_type_name<'a>(
@@ -380,9 +356,9 @@ fn typed_value_name_at_position(
     position: Position,
 ) -> Option<(String, tower_lsp::lsp_types::Range)> {
     let offset = document.position_to_offset(position)?;
-    let (instance, parameter_index) = parameter_at_offset(document, offset)?;
+    let (instance, parameter_index) = parameter_at_position(document, position)?;
     let parameter = instance.parameters.get(parameter_index)?;
-    let (start, end) = typed_value_name_span(document, parameter, offset)?;
+    let (start, end) = typed_value_name_span(document, parameter, position, offset)?;
     Some((
         document.text[start..end].to_ascii_uppercase(),
         document.range_for_offsets(start, end)?,
@@ -797,6 +773,55 @@ mod tests {
     }
 
     #[test]
+    fn hover_ranges_count_utf16_units_after_non_ascii_text() {
+        let text = "#1=IFCTHING('é😀',IFCWALLTYPEENUM(.MOVABLE.));";
+        let schema = crate::schema::load_express(
+            crate::schema::IfcVersion::Ifc4Add2Tc1,
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcWallTypeEnum = ENUMERATION OF (MOVABLE, USERDEFINED);
+              END_TYPE;
+              ENTITY IfcThing;
+                Name : OPTIONAL STRING;
+                PredefinedType : IfcWallTypeEnum;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        )
+        .expect("fixture schema should parse");
+        let schema_docs = SchemaDocCollection::from_docs([("IFC4".to_string(), schema)]);
+        let document = parse_document(text);
+        let utf16_position = |needle: &str| {
+            Position::new(
+                0,
+                text[..text.find(needle).unwrap()].encode_utf16().count() as u32,
+            )
+        };
+        let utf16_range = |needle: &str| {
+            let start = utf16_position(needle);
+            Range::new(
+                start,
+                Position::new(0, start.character + needle.encode_utf16().count() as u32),
+            )
+        };
+
+        let enum_hover = hover(
+            &document,
+            utf16_position(".MOVABLE."),
+            &schema_docs,
+            Some("IFC4"),
+        )
+        .expect("enum hover should exist");
+        let (name, type_range) =
+            typed_value_name_at_position(&document, utf16_position("IFCWALLTYPEENUM"))
+                .expect("inline typed value should resolve");
+
+        assert_eq!(enum_hover.range, Some(utf16_range(".MOVABLE.")));
+        assert_eq!(name, "IFCWALLTYPEENUM");
+        assert_eq!(type_range, utf16_range("IFCWALLTYPEENUM"));
+    }
+
+    #[test]
     fn hover_returns_none_for_enum_value_without_schema() {
         let text = "#1=IFCWALL($,.USERDEFINED.);";
         let document = parse_document(text);
@@ -837,9 +862,8 @@ mod tests {
     fn omitted_value_context_finds_instance_and_parameter() {
         let text = "#15=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);";
         let document = parse_document(text);
-        let offset = document.position_to_offset(position_at(text, "*")).unwrap();
-        let (instance, parameter_index) =
-            parameter_at_offset(&document, offset).expect("context should resolve from index");
+        let (instance, parameter_index) = parameter_at_position(&document, position_at(text, "*"))
+            .expect("context should resolve from index");
 
         assert_eq!(instance.id, Some(15));
         assert_eq!(instance.entity_name, "IFCSIUNIT");

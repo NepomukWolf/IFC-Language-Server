@@ -147,12 +147,9 @@ fn builds_spatial_tree_buckets_and_nested_assemblies() {
     assert!(all.iter().any(|n| n == "IFCWALL #7"));
     assert_eq!(
         out[0].range,
-        lsp_range(
-            &doc.text.lines().collect::<Vec<_>>(),
-            doc.entity_instance_by_id(1)
-                .expect("project instance should exist")
-                .entity_range
-        )
+        doc.entity_instance_by_id(1)
+            .expect("project instance should exist")
+            .entity_range
     );
 }
 #[test]
@@ -199,6 +196,38 @@ fn emits_all_products_and_preserves_utf16_ranges() {
     assert_eq!(
         project.range.end.character,
         statement.encode_utf16().count() as u32
+    );
+}
+#[test]
+fn outline_ranges_count_utf16_units_after_non_ascii_text() {
+    let line = "#1=IFCPROJECT('g',$,'é😀',$,$,$,$,$,$); #2=IFCSITE('g',$,'😀é',$,$,$,$,$,$);";
+    let doc = parse(&format!(
+        "DATA;\n{line}\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;"
+    ));
+    let DocumentSymbolResponse::Nested(out) = symbols(&doc, Some(&schema())).unwrap() else {
+        panic!()
+    };
+    let column = |offset: usize| line[..offset].encode_utf16().count() as u32;
+    let site_start = line.find("#2").unwrap();
+
+    let project = &out[0];
+    assert_eq!(project.detail.as_deref(), Some("é😀"));
+    let site = &project.children.as_ref().unwrap()[0];
+    assert_eq!(site.name, "IFCSITE #2");
+    assert_eq!(site.detail.as_deref(), Some("😀é"));
+    assert_eq!(
+        site.range,
+        Range::new(
+            Position::new(1, column(site_start)),
+            Position::new(1, column(line.len()))
+        )
+    );
+    assert_eq!(
+        site.selection_range,
+        Range::new(
+            Position::new(1, column(site_start)),
+            Position::new(1, column(site_start + 2))
+        )
     );
 }
 #[test]

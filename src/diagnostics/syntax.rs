@@ -101,9 +101,7 @@ fn position(text: &str, offset: usize) -> Position {
 }
 
 fn utf16_len(text: &str) -> u32 {
-    text.chars()
-        .map(|character| character.len_utf16() as u32)
-        .sum()
+    crate::document::utf16_len(text.as_bytes()) as u32
 }
 
 /// From the opening quote to the end of its line, before any `\r`.

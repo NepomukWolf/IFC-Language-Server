@@ -665,6 +665,29 @@ mod tests {
         assert_eq!(diagnostics[0].range.end, Position::new(2, 6));
     }
 
+    #[test]
+    fn diagnostics_after_non_ascii_text_on_a_shared_line_count_utf16_units() {
+        let schema = ifc4();
+        let mut document = lazy_document(
+            "DATA;\n#1=IFCCARTESIANPOINT((0.,0.)); /*é😀*/ #2=IFCCARTESIANPOINT('é😀');\nENDSEC;\n",
+        );
+        incremental(&document, &schema);
+        edit(&mut document, "#1=", "#1= ");
+        let (diagnostics, mode) = incremental(&document, &schema);
+
+        assert!(matches!(mode, Mode::Incremental { .. }), "{mode:?}");
+        assert_eq!(diagnostics, full(&document.text, &schema, "IFC4"));
+        let start = document.text.find("'é😀'").unwrap();
+        let end = start + "'é😀'".len();
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(
+                position(&document.text, start),
+                position(&document.text, end)
+            )
+        );
+    }
+
     fn samples() -> Vec<PathBuf> {
         let mut paths: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/samples"))
             .expect("samples directory")
