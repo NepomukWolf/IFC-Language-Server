@@ -49,6 +49,70 @@ Extensions for VSCode and Zed are available for local installation (though still
 
 - [Zed](https://github.com/Finradon/zed-ifc)
 
+Other editors are set up with the files in [`editors/`](editors) and an `ifc-language-server` binary on your `PATH` (see [Manual](#manual)).
+
+#### Neovim
+
+Neovim 0.11 or later. Copy the syntax, file-type and LSP files into your config and enable the server in `init.lua`:
+
+```sh
+cp -R editors/neovim/. ~/.config/nvim/
+```
+
+```lua
+vim.lsp.enable('ifc')
+```
+
+Colouring and all LSP features work on files of at least 180 MB. The file-type rule takes priority over size-based detection such as LazyVim's snacks.nvim `bigfile`. On lines of hundreds of thousands of characters, semantic colours take minutes to fill in, as Neovim's cost per token grows with line length.
+
+#### Helix
+
+Add to `~/.config/helix/languages.toml`:
+
+```toml
+[[language]]
+name = "ifc"
+scope = "source.ifc"
+file-types = ["ifc"]
+language-servers = ["ifc-language-server"]
+
+[language-server.ifc-language-server]
+command = "ifc-language-server"
+
+[[grammar]]
+name = "ifc"
+source = { git = "https://github.com/NepomukWolf/tree-sitter-ifc", rev = "168e01eba32896cfbdacea38fdb068343d43073c" }
+```
+
+Then build the grammar and install its highlight query:
+
+```sh
+hx --grammar fetch && hx --grammar build
+mkdir -p ~/.config/helix/runtime/queries/ifc
+cp ~/.config/helix/runtime/grammars/sources/ifc/queries/highlights.scm ~/.config/helix/runtime/queries/ifc/
+```
+
+LSP features work at any file size. Helix stops parsing after a fixed 500 ms, so files above roughly 8 MB stay uncoloured.
+
+#### Emacs
+
+Emacs 29 or later (tested with Emacs 31.1 and its built-in Eglot). Put `editors/emacs/ifc-mode.el` in a directory on your `load-path` and add to `init.el`:
+
+```elisp
+(require 'ifc-mode)
+(with-eval-after-load 'eglot
+  (add-to-list 'eglot-server-programs
+               '(ifc-mode . ("ifc-language-server"
+                             :initializationOptions (:semanticTokensEnabled :json-false)))))
+(add-hook 'ifc-mode-hook #'eglot-ensure)
+```
+
+Colouring, diagnostics, hover, go-to-definition, references and completion work on files of at least 56 MB. Eglot only requests full-document semantic tokens, which the server does not provide, so the snippet turns them off. The outline (`imenu`) takes seconds on a 13.6 MB file and minutes on a 56 MB one, as Eglot locates each symbol by counting lines from the top of the buffer. Emacs asks for confirmation before opening files above `large-file-warning-threshold` (10 MB by default).
+
+#### Notepad++
+
+In Notepad++, open **Language > User Defined Language > Define your language…**, click **Import…**, choose `editors/notepad++/IFC_STEP.udl.xml` and restart. `.ifc` files are coloured up to at least 56 MB. This is colouring only: NppLspClient 0.0.40, the available LSP client, does not load in Notepad++ 8.9.
+
 ### Manual
 
 Release binaries are available on the [Releases](https://github.com/NepomukWolf/IFC-Language-Server/releases) page.
