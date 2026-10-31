@@ -49,7 +49,7 @@ Extensions for VSCode and Zed are available for local installation (though still
 
 - [Zed](https://github.com/Finradon/zed-ifc)
 
-Other editors are set up with the files in [`editors/`](editors) and an `ifc-language-server` binary on your `PATH` (see [Manual](#manual)).
+Other editors are set up with the files in [`editors/`](editors) and an `ifc-language-server` binary on your `PATH` (see [Manual](#manual)). In every editor, files above the server's `astFileSizeLimitMb` (70 MB by default, see [Configuration](#configuration)) get only the features that don't need the full syntax tree.
 
 #### Neovim
 
@@ -63,7 +63,7 @@ cp -R editors/neovim/. ~/.config/nvim/
 vim.lsp.enable('ifc')
 ```
 
-Colouring and all LSP features work on files of at least 180 MB. The file-type rule takes priority over size-based detection such as LazyVim's snacks.nvim `bigfile`. On lines of hundreds of thousands of characters, semantic colours take minutes to fill in, as Neovim's cost per token grows with line length.
+Colouring and the server connection work on files of at least 180 MB. The file-type rule takes priority over size-based detection such as LazyVim's snacks.nvim `bigfile`. On lines of hundreds of thousands of characters, semantic colours take minutes to fill in, as Neovim's cost per token grows with line length.
 
 #### Helix
 
@@ -92,7 +92,7 @@ mkdir -p ~/.config/helix/runtime/queries/ifc
 cp ~/.config/helix/runtime/grammars/sources/ifc/queries/highlights.scm ~/.config/helix/runtime/queries/ifc/
 ```
 
-LSP features work at any file size. Helix stops parsing after a fixed 500 ms, so files above roughly 8 MB stay uncoloured.
+The server connection works at any file size. Helix stops parsing after a fixed 500 ms, so files above roughly 8 MB stay uncoloured.
 
 #### Emacs
 
@@ -127,11 +127,13 @@ Tested with Kate 26.11: on a 13.6 MB file, diagnostics, hover, go-to-definition,
 
 #### Sublime Text
 
-Install the LSP package through Package Control, then put both files in `Packages/User/` (**Preferences > Browse Packages…**) and restart:
+Install the LSP package through Package Control and copy the syntax into `Packages/User/` (**Preferences > Browse Packages…**):
 
 ```sh
-cp editors/sublime/IFC.sublime-syntax editors/sublime/LSP.sublime-settings "<Packages>/User/"
+cp editors/sublime/IFC.sublime-syntax "<Packages>/User/"
 ```
+
+Then open **Preferences > Package Settings > LSP > Settings**, merge the `clients.ifc-language-server` entry and `"semantic_highlighting": true` from `editors/sublime/LSP.sublime-settings` into your settings, and restart.
 
 Tested with build 4215 and the LSP package: colouring, diagnostics, completion and go-to-definition work, and Sublime requests semantic tokens for the visible range; hover, references and outline are untested. A 56 MB file opened as Plain Text; choose **View > Syntax > IFC STEP** for it.
 
