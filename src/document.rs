@@ -1451,4 +1451,68 @@ mod tests {
         );
         assert_eq!(point_after_text(Point::new(3, 7), "😀"), Point::new(3, 11));
     }
+
+    #[test]
+    fn discovers_entities_inside_error_recovery() {
+        let document = parse_document(concat!(
+            "DATA;\n",
+            "#1=IFCCARTESIANPOINT((0.,1.,2.));\n",
+            "#2=IFCPOLYLINE((#1,#4))\n",
+            "#3=IFCDIRECTION((1.,0.,0.));\n",
+            "#4=IFCWALL('a',(#2,#3);\n",
+            "#5=IFCDIRECTION((1.,0.,0.));\n",
+            "#6=IFCWALL('b',$) stray;\n",
+            "#7=IFCCARTESIANPOINT((3.,4.,5.));\n",
+            "#8=IFCWALL(g',$,.T.,IFCLABEL('x'),(#1,#2),*);\n",
+            "#9=IFCDIRECTION((1.,0.,0.));\n",
+            "ENDSEC;\n",
+        ));
+        let instances = instances(&document);
+        let discovered: Vec<_> = instances
+            .instances
+            .iter()
+            .map(|instance| {
+                (
+                    instance.id,
+                    instance.entity_name.as_str(),
+                    instance.parameters.len(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            discovered,
+            [
+                (Some(1), "IFCCARTESIANPOINT", 1),
+                (Some(2), "IFCPOLYLINE", 1),
+                (Some(3), "IFCDIRECTION", 1),
+                (Some(4), "IFCWALL", 2),
+                (Some(5), "IFCDIRECTION", 1),
+                (Some(6), "IFCWALL", 2),
+                (Some(7), "IFCCARTESIANPOINT", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovers_entities_after_malformed_syntax() {
+        let document = parse_document(concat!(
+            "DATA;\n",
+            "#1=IFCCARTESIANPOINT((0.,1.,2.));\n",
+            "#2=IFCPOLYLINE((#1,#4))\n",
+            "#3=IFCDIRECTION((1.,0.,0.));\n",
+            "#4=IFCWALL('a',IFCLABEL('x',(#2,#3));\n",
+            "#5=IFCDIRECTION((1.,0.,0.));\n",
+            "#6=IFCWALL('b',$,%);\n",
+            "#7=IFCCARTESIANPOINT((3.,4.,5.));\n",
+            "ENDSEC;\n",
+        ));
+        let ids: Vec<_> = instances(&document)
+            .instances
+            .iter()
+            .map(|instance| instance.id)
+            .collect();
+
+        assert_eq!(ids, (1..=7).map(Some).collect::<Vec<_>>());
+    }
 }
