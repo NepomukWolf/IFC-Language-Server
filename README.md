@@ -73,6 +73,23 @@ Build a release binary with:
 cargo build --release
 ```
 
+### Benchmarks
+
+```bash
+cargo bench                                            # measure the current branch
+git switch dev && cargo bench -- --save-baseline dev   # save a baseline
+git switch my-branch && cargo bench -- --baseline dev  # compare against it
+```
+
+The benches use the larger files in `samples/` and a generated property-heavy model (18 MB; `IFC_BENCH_SYNTHETIC_MB` sets another size). Set `IFC_BENCH_MODEL` to one or more paths (separated like `PATH`) to benchmark other models instead.
+
+Peak heap usage while opening and editing a model:
+
+```bash
+cargo run --release --example peak_memory                       # the generated model
+cargo run --release --example peak_memory -- path/to/model.ifc
+```
+
 ### Configuration
 
 The server accepts configuration through LSP `initializationOptions`.

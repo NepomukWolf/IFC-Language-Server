@@ -22,12 +22,27 @@ tracing = { version = "0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+criterion = "0.8"
+futures = "0.3"
+tower = "0.4"
+tokio = { version = "1", features = ["test-util"] }
+
+[lib]
+bench = false
+
+[[bin]]
+name = "ifc-language-server"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "lsp"
+harness = false
+
 [build-dependencies]
 sha2 = "0.11"
 ureq = "3"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
 
 [patch.crates-io]
 tree-sitter-ifc = { git = "https://github.com/Amixx/tree-sitter-ifc", rev = "3973552f163939b095da9f76ba1f1c035a1e4a53" }
