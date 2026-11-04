@@ -54,9 +54,9 @@ pub fn collect(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
     if let Some((schema_name, schema)) = schema {
-        let instances = crate::document::build_entity_instances(snapshot.tree(), snapshot.text());
         diagnostics.extend(datatype::collect_with_schema_name(
-            &instances,
+            snapshot.tree(),
+            snapshot.text(),
             schema,
             Some(schema_name),
         ));

@@ -74,7 +74,7 @@ pub fn outline_instances(
             instances.push(instance);
         },
     );
-    EntityInstanceCollection::new(instances)
+    EntityInstanceCollection { instances }
 }
 
 /// Holds the outline instances of one document text and schema. The entry is keyed by the text's

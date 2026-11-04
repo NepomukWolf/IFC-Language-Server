@@ -5,33 +5,42 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{
+    EntityInstanceInfo, EntityTypeIndex, ParameterValue, build_entity_type_index,
+    for_each_entity_instance,
+};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
 
 pub fn collect_with_schema_name(
-    instances: &EntityInstanceCollection,
+    tree: Option<&tree_sitter::Tree>,
+    text: &str,
     schema: &SchemaDoc,
     schema_name: Option<&str>,
 ) -> Vec<Diagnostic> {
+    let entity_types = build_entity_type_index(tree, text);
     let mut diagnostics = Vec::new();
 
-    for instance in &instances.instances {
-        let Some(entity) = schema.entity(&instance.entity_name) else {
-            diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
-            continue;
-        };
-
-        validate_instance(instances, schema, entity, instance, &mut diagnostics);
-    }
+    for_each_entity_instance(
+        tree,
+        text,
+        |_| Some(usize::MAX),
+        |instance| {
+            if let Some(entity) = schema.entity(&instance.entity_name) {
+                validate_instance(&entity_types, schema, entity, &instance, &mut diagnostics);
+            } else {
+                diagnostics.push(unknown_entity_diagnostic(&instance, schema_name));
+            }
+        },
+    );
 
     diagnostics
 }
 
 fn validate_instance(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
@@ -54,7 +63,7 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Some(message) = validate_value(instances, schema, value, attribute) {
+        if let Some(message) = validate_value(entity_types, schema, value, attribute) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -85,7 +94,7 @@ fn unknown_entity_diagnostic(
 }
 
 fn validate_value(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     value: &ParameterValue,
     attribute: &EntityAttributeDoc,
@@ -105,33 +114,33 @@ fn validate_value(
                 Some("`*` is not supported for this attribute".to_string())
             }
         }
-        _ => validate_non_null_value(instances, schema, value, &attribute.ty),
+        _ => validate_non_null_value(entity_types, schema, value, &attribute.ty),
     }
 }
 
 fn validate_non_null_value(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected: &TypeRef,
 ) -> Option<String> {
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
-        TypeRef::Aggregate(aggregate) => validate_aggregate(instances, schema, value, aggregate),
+        TypeRef::Aggregate(aggregate) => validate_aggregate(entity_types, schema, value, aggregate),
         TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => None,
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
-                validate_entity_reference(instances, schema, value, &named.name)
+                validate_entity_reference(entity_types, schema, value, &named.name)
             }
             NamedTypeKind::Type | NamedTypeKind::Unresolved => {
-                validate_named_type(instances, schema, value, &named.name)
+                validate_named_type(entity_types, schema, value, &named.name)
             }
         },
     }
 }
 
 fn validate_named_type(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     value: &ParameterValue,
     type_name: &str,
@@ -139,14 +148,14 @@ fn validate_named_type(
     let type_def = schema.type_decl(type_name)?;
     match type_def {
         TypeDoc::Alias(alias) => match unwrap_inline_typed_value(value, type_name) {
-            Ok(value) => validate_non_null_value(instances, schema, value, &alias.target),
+            Ok(value) => validate_non_null_value(entity_types, schema, value, &alias.target),
             Err(message) => Some(message),
         },
         TypeDoc::Enumeration(enum_def) => match unwrap_inline_typed_value(value, type_name) {
             Ok(value) => validate_enum_value(value, &enum_def.items),
             Err(message) => Some(message),
         },
-        TypeDoc::Select(select) => validate_select(instances, schema, value, select),
+        TypeDoc::Select(select) => validate_select(entity_types, schema, value, select),
     }
 }
 
@@ -183,7 +192,7 @@ fn unwrap_inline_typed_value<'a>(
 }
 
 fn validate_select(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     value: &ParameterValue,
     select: &SelectTypeDef,
@@ -191,7 +200,7 @@ fn validate_select(
     if select
         .options
         .iter()
-        .any(|option| validate_non_null_value(instances, schema, value, option).is_none())
+        .any(|option| validate_non_null_value(entity_types, schema, value, option).is_none())
     {
         None
     } else {
@@ -222,7 +231,7 @@ fn validate_enum_value(value: &ParameterValue, items: &[String]) -> Option<Strin
 }
 
 fn validate_aggregate(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     value: &ParameterValue,
     aggregate: &AggregateTypeRef,
@@ -257,7 +266,8 @@ fn validate_aggregate(
     }
 
     for item in items {
-        if let Some(message) = validate_non_null_value(instances, schema, item, &aggregate.item) {
+        if let Some(message) = validate_non_null_value(entity_types, schema, item, &aggregate.item)
+        {
             return Some(message);
         }
     }
@@ -266,7 +276,7 @@ fn validate_aggregate(
 }
 
 fn validate_entity_reference(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     value: &ParameterValue,
     expected_entity: &str,
@@ -279,19 +289,19 @@ fn validate_entity_reference(
         ));
     };
 
-    let Some(instance) = instances.instance_by_id(*id) else {
+    let Some(entity_name) = entity_types.entity_name_by_id(*id) else {
         return Some(format!(
             "reference `#{}` does not resolve to a local entity",
             id
         ));
     };
 
-    if schema.is_entity_compatible(&instance.entity_name, expected_entity) {
+    if schema.is_entity_compatible(entity_name, expected_entity) {
         None
     } else {
         Some(format!(
             "expected reference to `{}` but `#{}` points to `{}`",
-            expected_entity, id, instance.entity_name
+            expected_entity, id, entity_name
         ))
     }
 }
@@ -360,7 +370,7 @@ impl AggregateKindDisplay for AggregateKind {
 //*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::{Position, Range};
+    use tower_lsp::lsp_types::Position;
     use tree_sitter::Parser;
 
     use super::*;
@@ -376,8 +386,16 @@ mod tests {
         Document::parse(&mut parser, text.to_string())
     }
 
-    fn instances(document: &Document) -> EntityInstanceCollection {
-        crate::document::build_entity_instances(document.tree.as_ref(), &document.text)
+    fn diagnostics_for(text: &str, schema: &SchemaDoc) -> Vec<Diagnostic> {
+        let doc = parse_document(text);
+        collect_with_schema_name(doc.tree.as_ref(), &doc.text, schema, None)
+    }
+
+    fn messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
     }
 
     /// Helper function to load a schema from a fixture source string.
@@ -409,9 +427,7 @@ mod tests {
     /// Test that the datatype validator reports mismatched attribute types.
     #[test]
     fn datatype_validator_reports_mismatched_attribute_type() {
-        let doc = parse_document("#1=IFCWALL(123,.MOVABLE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = diagnostics_for("#1=IFCWALL(123,.MOVABLE.);", &test_schema());
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
@@ -421,9 +437,7 @@ mod tests {
     /// Test that the datatype validator accepts valid values.
     #[test]
     fn datatype_validator_accepts_valid_values() {
-        let doc = parse_document("#1=IFCWALL('gid',.MOVABLE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = diagnostics_for("#1=IFCWALL('gid',.MOVABLE.);", &test_schema());
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -431,42 +445,6 @@ mod tests {
     /// Test that the datatype validator reports unresolved references.
     #[test]
     fn datatype_validator_reports_unresolved_reference() {
-        let instances = EntityInstanceCollection::new(vec![crate::document::EntityInstanceInfo {
-            id: Some(1),
-            id_range: Some(Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 2),
-            }),
-            entity_name: "IFCWALL".to_string(),
-            entity_name_range: Range {
-                start: Position::new(0, 3),
-                end: Position::new(0, 10),
-            },
-            entity_range: Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 27),
-            },
-            parameter_list_range: Some(Range {
-                start: Position::new(0, 10),
-                end: Position::new(0, 27),
-            }),
-            parameters: vec![
-                ParameterValue::String {
-                    range: Range {
-                        start: Position::new(0, 11),
-                        end: Position::new(0, 16),
-                    },
-                },
-                ParameterValue::Reference {
-                    id: 2,
-                    range: Range {
-                        start: Position::new(0, 17),
-                        end: Position::new(0, 19),
-                    },
-                },
-            ],
-        }]);
-
         let schema = schema_from(
             r#"
             SCHEMA IFC4;
@@ -481,10 +459,109 @@ mod tests {
             "#,
         );
 
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = diagnostics_for("#1=IFCWALL('gid',#2);", &schema);
 
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("does not resolve"));
+        assert_eq!(
+            messages(&diagnostics),
+            ["Parent: reference `#2` does not resolve to a local entity"]
+        );
+    }
+
+    /// Test that references resolve against every entity in the file: forward references,
+    /// subtypes, missing targets, and the last definition of a duplicated id.
+    #[test]
+    fn datatype_validator_resolves_references_across_the_file() {
+        let schema = schema_from(
+            r#"
+            SCHEMA IFC4;
+              ENTITY IfcTarget; END_ENTITY;
+              ENTITY IfcChild SUBTYPE OF (IfcTarget); END_ENTITY;
+              ENTITY IfcOther; END_ENTITY;
+              ENTITY IfcHolder;
+                A : LIST [1:?] OF IfcTarget;
+                B : LIST [1:?] OF IfcTarget;
+                C : IfcTarget;
+                D : IfcTarget;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        );
+        let diagnostics = diagnostics_for(
+            "#1=IFCHOLDER((#2,#3),(#9),#4,#5);\n#2=IFCCHILD();\n#3=IFCOTHER();\n#4=IFCTARGET();\n#4=IFCOTHER();\n#5=IFCCHILD();",
+            &schema,
+        );
+
+        assert_eq!(
+            messages(&diagnostics),
+            [
+                "A: expected reference to `IFCTARGET` but `#3` points to `IFCOTHER`",
+                "B: reference `#9` does not resolve to a local entity",
+                "C: expected reference to `IFCTARGET` but `#4` points to `IFCOTHER`",
+            ]
+        );
+    }
+
+    /// Test that diagnostics follow source order across entities inside a full STEP file,
+    /// including unknown entities and arity mismatches.
+    #[test]
+    fn datatype_validator_reports_in_source_order_within_data_section() {
+        let text = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCWALL(123,.MOVABLE.);\n#2=IFCDOOR('gid');\n#3=IFCWALL('gid');\n#4=IFCWALL('gid',.BROKEN.);\nENDSEC;\nEND-ISO-10303-21;";
+        let doc = parse_document(text);
+        let diagnostics =
+            collect_with_schema_name(doc.tree.as_ref(), &doc.text, &test_schema(), Some("IFC4"));
+
+        assert_eq!(
+            messages(&diagnostics),
+            [
+                "GlobalId: expected string but found number",
+                "Unknown IFC entity `IFCDOOR` in selected schema `IFC4`",
+                "IfcWall expects 2 attributes but found 1",
+                "PredefinedType: expected one of [\"MOVABLE\", \"USERDEFINED\"] but found `.BROKEN.`",
+            ]
+        );
+        assert_eq!(diagnostics[0].range.start, Position::new(5, 11));
+        assert_eq!(diagnostics[1].range.start, Position::new(6, 3));
+    }
+
+    /// Test that entities error recovery groups under an `ERROR` node are still validated.
+    #[test]
+    fn datatype_validator_reports_entities_under_error_recovery() {
+        let schema = schema_from(
+            r#"
+            SCHEMA IFC4;
+              ENTITY IfcWall; END_ENTITY;
+            END_SCHEMA;
+            "#,
+        );
+        let diagnostics = diagnostics_for(
+            concat!(
+                "DATA;\n",
+                "#1=IFCCARTESIANPOINT((0.,1.,2.));\n",
+                "#2=IFCPOLYLINE((#1,#4))\n",
+                "#3=IFCDIRECTION((1.,0.,0.));\n",
+                "#4=IFCWALL('a',(#2,#3);\n",
+                "#5=IFCDIRECTION((1.,0.,0.));\n",
+                "#6=IFCWALL('b',$) stray;\n",
+                "#7=IFCCARTESIANPOINT((3.,4.,5.));\n",
+                "#8=IFCWALL(g',$,.T.,IFCLABEL('x'),(#1,#2),*);\n",
+                "#9=IFCDIRECTION((1.,0.,0.));\n",
+                "ENDSEC;\n",
+            ),
+            &schema,
+        );
+
+        assert_eq!(
+            messages(&diagnostics),
+            [
+                "Unknown IFC entity `IFCCARTESIANPOINT` in the selected schema",
+                "Unknown IFC entity `IFCPOLYLINE` in the selected schema",
+                "Unknown IFC entity `IFCDIRECTION` in the selected schema",
+                "IfcWall expects 0 attributes but found 2",
+                "Unknown IFC entity `IFCDIRECTION` in the selected schema",
+                "IfcWall expects 0 attributes but found 2",
+                "Unknown IFC entity `IFCCARTESIANPOINT` in the selected schema",
+            ]
+        );
     }
 
     /// Test that the datatype validator allows omitted (`*`) values for inherited
@@ -517,9 +594,8 @@ mod tests {
             "#,
         );
 
-        let doc = parse_document("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics =
+            diagnostics_for("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);", &schema);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -548,11 +624,10 @@ mod tests {
             "#,
         );
 
-        let doc = parse_document(
+        let diagnostics = diagnostics_for(
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));\n#2=IFCPROPERTYSINGLEVALUE('Offset',$,IFCLENGTHMEASURE(2.6));",
+            &schema,
         );
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }

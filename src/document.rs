@@ -31,7 +31,11 @@ pub struct Document {
 #[derive(Debug)]
 pub struct EntityInstanceCollection {
     pub instances: Vec<EntityInstanceInfo>,
-    instance_indexes_by_id: HashMap<u32, usize>,
+}
+
+#[derive(Debug, Default)]
+pub struct EntityTypeIndex {
+    entity_names_by_id: HashMap<u32, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -539,6 +543,7 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+#[cfg(test)]
 pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
     for_each_entity_instance(
@@ -547,7 +552,7 @@ pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstance
         |_| Some(usize::MAX),
         |instance| instances.push(instance),
     );
-    EntityInstanceCollection::new(instances)
+    EntityInstanceCollection { instances }
 }
 
 /// Visits the entity instances for which `parameter_limit`, given the upper-case entity name,
@@ -558,49 +563,50 @@ pub fn for_each_entity_instance(
     parameter_limit: impl Fn(&str) -> Option<usize>,
     mut visit: impl FnMut(EntityInstanceInfo),
 ) {
-    if let Some(tree) = tree {
-        let mut cursor = tree.root_node().walk();
-        traverse(&mut cursor, text, &parameter_limit, &mut visit);
-    }
-}
-
-impl EntityInstanceCollection {
-    pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
-        let instance_indexes_by_id = instances
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
-            .collect();
-        Self {
-            instances,
-            instance_indexes_by_id,
-        }
-    }
-
-    pub fn instance_by_id(&self, id: u32) -> Option<&EntityInstanceInfo> {
-        self.instance_indexes_by_id
-            .get(&id)
-            .and_then(|index| self.instances.get(*index))
-    }
-}
-
-fn traverse(
-    cursor: &mut TreeCursor,
-    text: &str,
-    parameter_limit: &impl Fn(&str) -> Option<usize>,
-    visit: &mut impl FnMut(EntityInstanceInfo),
-) {
-    loop {
-        let node = cursor.node();
-
-        if node.kind() == "entity_instance"
-            && let Some(instance) = parse_entity_instance(node, text, parameter_limit)
-        {
+    for_each_entity_node(tree, |node| {
+        if let Some(instance) = parse_entity_instance(node, text, &parameter_limit) {
             visit(instance);
         }
+    });
+}
 
-        if cursor.goto_first_child() {
-            traverse(cursor, text, parameter_limit, visit);
+pub fn build_entity_type_index(tree: Option<&Tree>, text: &str) -> EntityTypeIndex {
+    let mut index = EntityTypeIndex::default();
+
+    for_each_entity_node(tree, |node| {
+        if let Some(instance) = parse_entity_header(node, text)
+            && let Some(id) = instance.id
+        {
+            index.entity_names_by_id.insert(id, instance.entity_name);
+        }
+    });
+
+    index
+}
+
+impl EntityTypeIndex {
+    pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        self.entity_names_by_id.get(&id).map(String::as_str)
+    }
+}
+
+fn for_each_entity_node<'a>(tree: Option<&'a Tree>, mut visit: impl FnMut(Node<'a>)) {
+    if let Some(tree) = tree {
+        visit_entity_nodes(&mut tree.root_node().walk(), &mut visit);
+    }
+}
+
+fn visit_entity_nodes<'a>(cursor: &mut TreeCursor<'a>, visit: &mut impl FnMut(Node<'a>)) {
+    loop {
+        let node = cursor.node();
+        let is_entity = node.kind() == "entity_instance";
+        if is_entity {
+            visit(node);
+        }
+
+        // Valid entity parameters cannot contain entity instances; error recovery can.
+        if (!is_entity || node.has_error()) && cursor.goto_first_child() {
+            visit_entity_nodes(cursor, visit);
             cursor.goto_parent();
         }
 
@@ -615,12 +621,24 @@ fn parse_entity_instance(
     text: &str,
     parameter_limit: &impl Fn(&str) -> Option<usize>,
 ) -> Option<EntityInstanceInfo> {
+    let mut instance = parse_entity_header(node, text)?;
+    let limit = parameter_limit(&instance.entity_name)?;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "parameter_list" {
+            instance.parameters = parse_parameter_list(child, text, limit);
+        }
+    }
+    Some(instance)
+}
+
+fn parse_entity_header(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
     let mut entity_name = None;
     let mut entity_name_range = None;
-    let mut parameter_list = None;
+    let mut parameter_list_range = None;
 
     for child in node.children(&mut child_cursor) {
         match child.kind() {
@@ -634,23 +652,21 @@ fn parse_entity_instance(
                 entity_name = Some(name.to_ascii_uppercase());
                 entity_name_range = Some(node_range(&child));
             }
-            "parameter_list" => parameter_list = Some(child),
+            "parameter_list" => {
+                parameter_list_range = Some(node_range(&child));
+            }
             _ => {}
         }
     }
 
-    let entity_name = entity_name?;
-    let limit = parameter_limit(&entity_name)?;
     Some(EntityInstanceInfo {
         id,
         id_range,
-        entity_name,
+        entity_name: entity_name?,
         entity_name_range: entity_name_range?,
         entity_range: node_range(&node),
-        parameter_list_range: parameter_list.as_ref().map(node_range),
-        parameters: parameter_list
-            .map(|list| parse_parameter_list(list, text, limit))
-            .unwrap_or_default(),
+        parameter_list_range,
+        parameters: Vec::new(),
     })
 }
 
