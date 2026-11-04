@@ -12,25 +12,26 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
 
     let mut diagnostics = Vec::new();
     let mut cursor = tree.root_node().walk();
-    collect_error_nodes(&mut cursor, &mut diagnostics);
+    collect_error_nodes(&mut cursor, snapshot.text().as_bytes(), &mut diagnostics);
     diagnostics
 }
 
 fn collect_error_nodes(
     cursor: &mut tree_sitter::TreeCursor<'_>,
+    text: &[u8],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     loop {
         let node = cursor.node();
 
-        if let Some(diagnostic) = syntax_diagnostic_for_node(&node) {
+        if let Some(diagnostic) = syntax_diagnostic_for_node(&node, text) {
             diagnostics.push(diagnostic);
         }
 
         // An ERROR node's range covers everything nested in it, including the leaf ERROR
         // that tree-sitter creates for a token the lexer cannot recognize.
         if !node.is_error() && cursor.goto_first_child() {
-            collect_error_nodes(cursor, diagnostics);
+            collect_error_nodes(cursor, text, diagnostics);
             cursor.goto_parent();
         }
 
@@ -40,13 +41,13 @@ fn collect_error_nodes(
     }
 }
 
-fn syntax_diagnostic_for_node(node: &tree_sitter::Node<'_>) -> Option<Diagnostic> {
+fn syntax_diagnostic_for_node(node: &tree_sitter::Node<'_>, text: &[u8]) -> Option<Diagnostic> {
     let message = if node.is_error() {
         Some("Invalid IFC STEP syntax".to_string())
     } else if node.is_missing() {
         Some(missing_node_message(node))
     } else {
-        None
+        lowercase_name_message(node, text)
     }?;
 
     Some(Diagnostic {
@@ -62,6 +63,26 @@ fn missing_node_message(node: &tree_sitter::Node<'_>) -> String {
         ";" => "Missing `;`".to_string(),
         kind => format!("Missing `{kind}`"),
     }
+}
+
+/// ISO 10303-21 requires keywords and enumeration values in upper case.
+fn lowercase_name_message(node: &tree_sitter::Node<'_>, text: &[u8]) -> Option<String> {
+    let names = match node.kind() {
+        "entity_name"
+            if node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "typed_parameter") =>
+        {
+            "Typed-value names"
+        }
+        "entity_name" => "Entity names",
+        "enumeration" => "Enumeration values",
+        _ => return None,
+    };
+    text[node.byte_range()]
+        .iter()
+        .any(u8::is_ascii_lowercase)
+        .then(|| format!("{names} must be upper case"))
 }
 
 fn node_range(node: &tree_sitter::Node<'_>) -> Range {

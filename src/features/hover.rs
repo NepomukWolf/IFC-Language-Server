@@ -615,6 +615,31 @@ mod tests {
     }
 
     #[test]
+    fn hover_resolves_lowercase_names_in_a_parsed_document() {
+        let text = "#1=IfcWall($,.movable.);";
+        let document = parse_document(text);
+        let schema_docs = schema_docs_with_wall();
+
+        let entity_hover = hover(
+            &document,
+            position_at(text, "IfcWall"),
+            &schema_docs,
+            Some("IFC4"),
+        )
+        .expect("entity hover should exist");
+        let enum_hover = hover(
+            &document,
+            position_at(text, ".movable."),
+            &schema_docs,
+            Some("IFC4"),
+        )
+        .expect("enum hover should exist");
+
+        assert!(hover_text(entity_hover).contains("# IfcWall"));
+        assert!(hover_text(enum_hover).contains("# IfcWallTypeEnum"));
+    }
+
+    #[test]
     fn hover_returns_schema_docs_for_inline_defined_types() {
         let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));ENDSEC;END-ISO-10303-21;";
         let schema = crate::schema::load_express(
