@@ -12,7 +12,7 @@ use crate::document_index::{TextIndex, scan_text};
 use crate::document_tree::DocumentTree;
 use crate::step::compact::{self, CompactKind, CompactValue};
 
-pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
+pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyChangeError {

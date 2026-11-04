@@ -177,7 +177,7 @@ the newest pending snapshot for each URI.
 
 ## AST Size Limit
 
-The default AST parsing limit is `70 MiB` (`DEFAULT_AST_FILE_SIZE_LIMIT_BYTES`).
+The default AST parsing limit is `200 MiB` (`DEFAULT_AST_FILE_SIZE_LIMIT_BYTES`).
 
 Clients can override it with the LSP initialization option:
 
