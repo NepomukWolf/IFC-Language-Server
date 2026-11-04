@@ -15,7 +15,7 @@ use crate::schema::{
 };
 
 pub fn collect_with_schema_name(
-    tree: Option<&tree_sitter::Tree>,
+    tree: Option<&crate::document_tree::DocumentTree>,
     text: &str,
     schema: &SchemaDoc,
     schema_name: Option<&str>,

@@ -6,6 +6,7 @@ mod config;
 mod diagnostics;
 mod document;
 mod document_index;
+mod document_tree;
 mod features;
 mod rt;
 mod schema;

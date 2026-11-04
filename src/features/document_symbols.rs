@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, Weak};
 use crate::document::{
     EntityInstanceCollection, EntityInstanceInfo, ParameterValue, for_each_entity_instance,
 };
+use crate::document_tree::DocumentTree;
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
-use tree_sitter::Tree;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
@@ -45,7 +45,7 @@ enum ProductRenderMode {
 /// `classify` places in the outline with nothing but a string Name at index 2. `schema` must be
 /// the one later passed to `document_symbols`.
 pub fn outline_instances(
-    tree: Option<&Tree>,
+    tree: Option<&DocumentTree>,
     text: &str,
     schema: Option<&SchemaDoc>,
 ) -> EntityInstanceCollection {
