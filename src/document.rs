@@ -378,7 +378,10 @@ impl Document {
     pub fn id_token_at_position(&self, position: Position) -> Option<(u32, usize)> {
         let offset = self.position_to_offset(position)?;
         if let Some((start, _, id)) = self.id_token_at_offset(offset)
-            && self.references.get(&id).is_some_and(|offsets| offsets.contains(&start))
+            && self
+                .references
+                .get(&id)
+                .is_some_and(|offsets| offsets.contains(&start))
         {
             return Some((id, start));
         }
@@ -512,7 +515,8 @@ impl Document {
     }
 
     fn is_definition_entity_name(&self, identifier_start: usize) -> bool {
-        self.definition_id_before_entity_name(identifier_start).is_some()
+        self.definition_id_before_entity_name(identifier_start)
+            .is_some()
     }
 
     /// If `identifier_start` begins the entity name of a `#id=NAME` definition (e.g. the
