@@ -111,8 +111,8 @@ fn skip_string(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -
 
 fn skip_block_comment(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> usize {
     offset += 2;
-    while offset + 1 < bytes.len() {
-        if bytes[offset] == b'*' && bytes[offset + 1] == b'/' {
+    while offset < bytes.len() {
+        if bytes[offset] == b'*' && bytes.get(offset + 1) == Some(&b'/') {
             return offset + 2;
         }
         if bytes[offset] == b'\n' {
@@ -197,6 +197,11 @@ fn is_identifier_part(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_a_final_newline_inside_an_unterminated_comment() {
+        assert_eq!(scan_text("#1=X(1);/*\n").line_offsets, vec![0, 11]);
+    }
 
     #[test]
     fn scans_schema_definitions_references_and_lines() {
