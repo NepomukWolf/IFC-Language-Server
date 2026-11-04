@@ -49,6 +49,8 @@ Extensions for VSCode and Zed are available for local installation (though still
 
 - [Zed](https://github.com/Finradon/zed-ifc)
 
+Setups for Neovim, Helix, Emacs, Notepad++, Kate and Sublime Text are in [IFC-LS-integrations](https://github.com/Amixx/IFC-LS-integrations).
+
 ### Manual
 
 Release binaries are available on the [Releases](https://github.com/NepomukWolf/IFC-Language-Server/releases) page.
