@@ -85,7 +85,7 @@ mod tests {
     fn parse_document(text: &str) -> Document {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
         Document::parse(&mut parser, text.to_string())
     }
@@ -109,6 +109,20 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("Invalid IFC STEP syntax")),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_coordinate_number_preserves_diagnostic_range() {
+        let doc = parse_document("DATA;\n#1=IFCCARTESIANPOINT((1.0,2x,3.0));\nENDSEC;\n");
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&doc)),
+            vec![Diagnostic {
+                range: Range::new(Position::new(1, 27), Position::new(1, 28)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Invalid IFC STEP syntax".to_string(),
+                ..Default::default()
+            }]
         );
     }
 

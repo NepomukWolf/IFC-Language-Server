@@ -24,3 +24,6 @@ uuid = { version = "1", features = ["v4"] }
 [build-dependencies]
 sha2 = "0.11"
 ureq = "3"
+
+[patch.crates-io]
+tree-sitter-ifc = { git = "https://github.com/Amixx/tree-sitter-ifc", rev = "3973552f163939b095da9f76ba1f1c035a1e4a53" }

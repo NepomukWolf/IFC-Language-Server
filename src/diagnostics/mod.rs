@@ -72,7 +72,7 @@ mod tests {
     fn snapshot_of(text: &str) -> DiagnosticSnapshot {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("IFC parser language should load");
         DiagnosticSnapshot::from_document(&Document::parse(&mut parser, text.to_string()))
     }
@@ -95,7 +95,7 @@ mod tests {
     fn snapshot_retains_diagnostic_data_after_document_unloads() {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("IFC parser language should load");
         let mut document = Document::parse(&mut parser, "#1=IFCWALL('gid')".to_string());
         let snapshot = DiagnosticSnapshot::from_document(&document);
@@ -109,7 +109,7 @@ mod tests {
     fn snapshot_shares_text_and_retains_its_source_revision() {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("IFC parser language should load");
         let mut document = Document::parse(&mut parser, "#1=IFCWALL($);".to_string());
         let snapshot = DiagnosticSnapshot::from_document(&document);

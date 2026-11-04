@@ -90,11 +90,12 @@ pub fn hover(
     }
 
     if let Some(node) = document.node_at_position(position)
-        && node.kind() == "omitted_value"
+        && let Some(offset) = document.position_to_offset(position)
+        && let Some((start, end)) = ast::omitted_value_span(node, offset, &document.text)
     {
-        let context = ast::parameter_context(node, &document.text)?;
+        let context = ast::parameter_context(node, offset, &document.text)?;
         let value = derived_value_hover(document, &context)?;
-        let range = document.range_for_offsets(node.start_byte(), node.end_byte())?;
+        let range = document.range_for_offsets(start, end)?;
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -193,14 +194,14 @@ fn enum_value_at_position<'a>(
     position: Position,
 ) -> Option<(Range, &'a EntityAttributeDoc, &'a EnumerationTypeDef)> {
     let node = document.node_at_position(position)?;
-    let context = ast::parameter_context(node, &document.text)?;
+    let offset = document.position_to_offset(position)?;
+    let context = ast::parameter_context(node, offset, &document.text)?;
     let instance = document.entity_instance_by_id(context.instance_id)?;
     let parameter = instance.parameters.get(context.parameter_index)?;
     let attribute = schema
         .entity(&context.entity_name)?
         .attributes
         .get(context.parameter_index)?;
-    let offset = document.position_to_offset(position)?;
     let enum_value = enum_value_in_parameter(document, parameter, offset)?;
     let enum_def = enum_value
         .typed_name
@@ -332,16 +333,10 @@ fn typed_value_name_at_position(
 ) -> Option<(String, tower_lsp::lsp_types::Range)> {
     let offset = document.position_to_offset(position)?;
     let node = document.node_at_position(position)?;
-    let typed_parameter = ast::ancestor_with_kind(node, "typed_parameter")?;
-    let entity_name = ast::child_with_kind(typed_parameter, "entity_name")?;
-    if offset < entity_name.start_byte() || offset >= entity_name.end_byte() {
-        return None;
-    }
-
-    let text = entity_name.utf8_text(document.text.as_bytes()).ok()?;
+    let (start, end) = ast::typed_value_name_span(node, offset, &document.text)?;
     Some((
-        text.to_ascii_uppercase(),
-        document.range_for_offsets(entity_name.start_byte(), entity_name.end_byte())?,
+        document.text[start..end].to_ascii_uppercase(),
+        document.range_for_offsets(start, end)?,
     ))
 }
 
@@ -535,7 +530,7 @@ mod tests {
     fn parse_document(text: &str) -> Document {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
+            .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
             .expect("Error loading IFC parser");
 
         Document::parse(&mut parser, text.to_string())
@@ -778,7 +773,8 @@ mod tests {
             .node_at_position(position_at(text, "*"))
             .expect("omitted value node should exist");
 
-        let context = crate::step::ast::parameter_context(node, &document.text)
+        let offset = document.position_to_offset(position_at(text, "*")).unwrap();
+        let context = crate::step::ast::parameter_context(node, offset, &document.text)
             .expect("context should resolve from AST");
 
         assert_eq!(context.instance_id, 15);

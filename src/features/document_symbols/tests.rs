@@ -7,7 +7,7 @@ use tree_sitter::Parser;
 fn parse(text: &str) -> Document {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_ifc::LANGUAGE.into())
+        .set_language(&tree_sitter_ifc::LANGUAGE_COMPACT.into())
         .unwrap();
     Document::parse(&mut parser, text.to_string())
 }
