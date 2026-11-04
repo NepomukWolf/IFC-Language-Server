@@ -97,6 +97,35 @@ mod tests {
         assert!(!schema.is_entity_compatible("IFCROOT", "IFCWALL"));
     }
 
+    /// Test that schema lookups ignore the case of the requested name.
+    #[test]
+    fn schema_doc_lookups_ignore_name_case() {
+        let schema =
+            load_express(IfcVersion::Ifc4Add2Tc1, fixture_schema()).expect("schema should parse");
+
+        for name in ["IFCWALL", "IfcWall", "ifcwall"] {
+            assert_eq!(
+                schema.entity(name).map(|e| e.name.as_str()),
+                Some("IfcWall")
+            );
+        }
+        for name in ["IFCLABEL", "IfcLabel", "ifclabel"] {
+            assert!(
+                matches!(schema.type_decl(name), Some(TypeDoc::Alias(alias)) if alias.name == "IfcLabel"),
+                "{name}"
+            );
+        }
+        assert!(schema.entity("IFCLABEL").is_none());
+        assert!(schema.type_decl("IFCWALL").is_none());
+        assert!(schema.entity("IFCWALL ").is_none());
+
+        assert!(schema.is_entity_compatible("IfcWall", "ifcroot"));
+        assert!(schema.is_entity_compatible("ifcRoot", "IFCROOT"));
+        assert!(schema.is_entity_compatible("IFCUNKNOWN", "ifcunknown"));
+        assert!(!schema.is_entity_compatible("ifcroot", "IfcWall"));
+        assert!(!schema.is_entity_compatible("IFCUNKNOWN", "IFCROOT"));
+    }
+
     /// Test that the schema doc preserves derived attribute overrides.
     #[test]
     fn load_express_preserves_derived_attribute_overrides() {
