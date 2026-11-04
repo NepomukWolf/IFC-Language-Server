@@ -296,7 +296,7 @@ impl Document {
         while node.kind() != "entity_instance" {
             node = node.parent()?;
         }
-        parse_entity_instance(node, &self.text)
+        parse_entity_instance(node, &self.text, &|_| Some(usize::MAX))
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -541,13 +541,27 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
 
 pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
     let mut instances = Vec::new();
+    for_each_entity_instance(
+        tree,
+        text,
+        |_| Some(usize::MAX),
+        |instance| instances.push(instance),
+    );
+    EntityInstanceCollection::new(instances)
+}
 
+/// Visits the entity instances for which `parameter_limit`, given the upper-case entity name,
+/// returns how many leading parameters to parse; `None` skips the instance.
+pub fn for_each_entity_instance(
+    tree: Option<&Tree>,
+    text: &str,
+    parameter_limit: impl Fn(&str) -> Option<usize>,
+    mut visit: impl FnMut(EntityInstanceInfo),
+) {
     if let Some(tree) = tree {
         let mut cursor = tree.root_node().walk();
-        traverse(&mut cursor, text, &mut instances);
+        traverse(&mut cursor, text, &parameter_limit, &mut visit);
     }
-
-    EntityInstanceCollection::new(instances)
 }
 
 impl EntityInstanceCollection {
@@ -570,18 +584,23 @@ impl EntityInstanceCollection {
     }
 }
 
-fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInstanceInfo>) {
+fn traverse(
+    cursor: &mut TreeCursor,
+    text: &str,
+    parameter_limit: &impl Fn(&str) -> Option<usize>,
+    visit: &mut impl FnMut(EntityInstanceInfo),
+) {
     loop {
         let node = cursor.node();
 
         if node.kind() == "entity_instance"
-            && let Some(instance) = parse_entity_instance(node, text)
+            && let Some(instance) = parse_entity_instance(node, text, parameter_limit)
         {
-            instances.push(instance);
+            visit(instance);
         }
 
         if cursor.goto_first_child() {
-            traverse(cursor, text, instances);
+            traverse(cursor, text, parameter_limit, visit);
             cursor.goto_parent();
         }
 
@@ -591,14 +610,17 @@ fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInsta
     }
 }
 
-fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
+fn parse_entity_instance(
+    node: Node<'_>,
+    text: &str,
+    parameter_limit: &impl Fn(&str) -> Option<usize>,
+) -> Option<EntityInstanceInfo> {
     let mut child_cursor = node.walk();
     let mut id = None;
     let mut id_range = None;
     let mut entity_name = None;
     let mut entity_name_range = None;
-    let mut parameter_list_range = None;
-    let mut parameters = Vec::new();
+    let mut parameter_list = None;
 
     for child in node.children(&mut child_cursor) {
         match child.kind() {
@@ -612,26 +634,27 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
                 entity_name = Some(name.to_ascii_uppercase());
                 entity_name_range = Some(node_range(&child));
             }
-            "parameter_list" => {
-                parameter_list_range = Some(node_range(&child));
-                parameters = parse_parameter_list(child, text);
-            }
+            "parameter_list" => parameter_list = Some(child),
             _ => {}
         }
     }
 
+    let entity_name = entity_name?;
+    let limit = parameter_limit(&entity_name)?;
     Some(EntityInstanceInfo {
         id,
         id_range,
-        entity_name: entity_name?,
+        entity_name,
         entity_name_range: entity_name_range?,
         entity_range: node_range(&node),
-        parameter_list_range,
-        parameters,
+        parameter_list_range: parameter_list.as_ref().map(node_range),
+        parameters: parameter_list
+            .map(|list| parse_parameter_list(list, text, limit))
+            .unwrap_or_default(),
     })
 }
 
-fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
+fn parse_parameter_list(node: Node<'_>, text: &str, limit: usize) -> Vec<ParameterValue> {
     let mut cursor = node.walk();
     let Some(sequence) = node
         .children(&mut cursor)
@@ -644,6 +667,7 @@ fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
     sequence
         .children(&mut seq_cursor)
         .filter(|child| child.kind() == "parameter")
+        .take(limit)
         .map(|parameter| parse_parameter(parameter, text))
         .collect()
 }
@@ -728,7 +752,7 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                             .ok()
                             .map(|name| name.to_ascii_uppercase());
                     }
-                    "parameter_list" => inner = parse_parameter_list(child, text),
+                    "parameter_list" => inner = parse_parameter_list(child, text, usize::MAX),
                     _ => {}
                 }
             }
