@@ -377,8 +377,14 @@ impl Document {
 
     pub fn id_token_at_position(&self, position: Position) -> Option<(u32, usize)> {
         let offset = self.position_to_offset(position)?;
-        let (start, _, id) = self.id_token_at_offset(offset)?;
-        self.references.get(&id)?.contains(&start).then_some(())?;
+        if let Some((start, _, id)) = self.id_token_at_offset(offset)
+            && self.references.get(&id).is_some_and(|offsets| offsets.contains(&start))
+        {
+            return Some((id, start));
+        }
+
+        let (identifier_start, _) = self.identifier_at_offset(offset)?;
+        let (start, id) = self.definition_id_before_entity_name(identifier_start)?;
         Some((id, start))
     }
 
@@ -506,6 +512,13 @@ impl Document {
     }
 
     fn is_definition_entity_name(&self, identifier_start: usize) -> bool {
+        self.definition_id_before_entity_name(identifier_start).is_some()
+    }
+
+    /// If `identifier_start` begins the entity name of a `#id=NAME` definition (e.g. the
+    /// `IFCSLABTYPE` in `#266=IFCSLABTYPE(...)`), returns the offset of the `#` and the id, so
+    /// that a click on the entity name resolves to the same instance as a click on its id.
+    fn definition_id_before_entity_name(&self, identifier_start: usize) -> Option<(usize, u32)> {
         let bytes = self.text.as_bytes();
         let mut offset = identifier_start;
 
@@ -513,7 +526,7 @@ impl Document {
             offset -= 1;
         }
         if offset == 0 || bytes[offset - 1] != b'=' {
-            return false;
+            return None;
         }
         offset -= 1;
 
@@ -525,7 +538,12 @@ impl Document {
             offset -= 1;
         }
 
-        digit_end > offset && offset > 0 && bytes[offset - 1] == b'#'
+        if !(digit_end > offset && offset > 0 && bytes[offset - 1] == b'#') {
+            return None;
+        }
+
+        let id = self.text[offset..digit_end].parse().ok()?;
+        Some((offset - 1, id))
     }
 }
 
@@ -841,6 +859,22 @@ mod tests {
         assert_eq!(
             node.utf8_text(document.text.as_bytes()).ok(),
             Some("IFCWALL")
+        );
+    }
+
+    #[test]
+    fn id_token_at_position_resolves_clicks_on_the_definition_entity_name() {
+        let text = "#1=IFCWALL($);#2=IFCSLAB(#1);";
+        let document = parse_document(text);
+        let offset = |needle: &str| text.find(needle).expect("needle should exist");
+
+        assert_eq!(
+            document.id_token_at_position(position_at(text, "IFCWALL")),
+            Some((1, offset("#1=")))
+        );
+        assert_eq!(
+            document.id_token_at_position(position_at(text, "IFCSLAB")),
+            Some((2, offset("#2=")))
         );
     }
 

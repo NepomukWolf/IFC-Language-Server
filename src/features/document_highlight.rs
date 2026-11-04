@@ -79,11 +79,23 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_when_cursor_is_outside_id_token() {
-        let text = "#1=IFCWALL(#2);";
+    fn highlights_all_occurrences_when_cursor_is_on_the_definitions_entity_name() {
+        let text = "#1=IFCWALL(#2);\n#2=IFCLOCALPLACEMENT($);\n#3=IFCDOOR(#2);";
         let document = Document::new_unloaded(text.to_string());
 
-        let highlights = document_highlight(&document, position_at(&document, text, "IFCWALL"));
+        let highlights = document_highlight(&document, position_at(&document, text, "IFCWALL"))
+            .expect("highlights should exist");
+
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0].range.start, Position::new(0, 0));
+    }
+
+    #[test]
+    fn returns_none_when_cursor_is_outside_id_token() {
+        let text = "#1=IFCLOCALPLACEMENT($);";
+        let document = Document::new_unloaded(text.to_string());
+
+        let highlights = document_highlight(&document, position_at(&document, text, "$"));
 
         assert!(highlights.is_none());
     }
