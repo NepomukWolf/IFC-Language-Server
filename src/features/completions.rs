@@ -1,7 +1,7 @@
 //! Lightweight STEP and schema-aware completions.
 //! Completion context is derived from document text and schema docs without loading AST state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation,
@@ -426,19 +426,23 @@ fn reference_completions(
         .collect::<Vec<_>>();
     definitions.sort_by_key(|(id, _)| *id);
 
+    let mut compatible_by_name = HashMap::<&str, bool>::new();
     let mut matching = definitions
         .into_iter()
         .filter_map(|(id, offset)| {
             let entity_name =
                 scan_definition_entity_name(&document.text, offset, document.text.len())?;
-            if !accepts_any_entity
-                && !expected_entities
-                    .iter()
-                    .any(|expected| schema.is_entity_compatible(&entity_name, expected))
-            {
+            let compatible = accepts_any_entity
+                || *compatible_by_name.entry(entity_name).or_insert_with(|| {
+                    expected_entities
+                        .iter()
+                        .any(|expected| schema.is_entity_compatible(entity_name, expected))
+                });
+            if !compatible {
                 return None;
             }
 
+            let entity_name = normalize_name(entity_name);
             let reference = format!("#{id}");
             let mut item = completion_item(
                 reference.clone(),
@@ -1324,6 +1328,114 @@ mod tests {
         assert_eq!(narrowed_results.items.len(), 1);
         assert_eq!(narrowed_results.items[0].label, "#100");
         assert!(!narrowed_results.is_incomplete);
+    }
+
+    #[test]
+    fn reference_results_ignore_entity_name_case_and_follow_numeric_id_order() {
+        let text = "#9=IfcWall($);#3=ifcdoor($);#12=IfcOwnerHistory($);#5=IFCWALL($);\
+                    #7=ifcWallStandardCase($);#20=IFCWALL($,$,$,(#";
+        let results = items(text, Some(&schema()));
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| (item.label.as_str(), item.detail.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("#3", "IFCDOOR"),
+                ("#5", "IFCWALL"),
+                ("#7", "IFCWALLSTANDARDCASE"),
+                ("#9", "IFCWALL"),
+                ("#20", "IFCWALL"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_results_take_first_hundred_compatible_ids_among_incompatible_ones() {
+        let definitions = |ids: &mut dyn Iterator<Item = u32>| {
+            ids.map(|id| {
+                let entity = if id % 2 == 0 {
+                    "IfcWall"
+                } else {
+                    "IFCOWNERHISTORY"
+                };
+                format!("#{id}={entity}($);")
+            })
+            .collect::<String>()
+        };
+        let text = format!("{}#300=IFCWALL($,$,$,(#", definitions(&mut (1..=250).rev()));
+        let response = results(&text, Some(&schema()), false, false);
+
+        let expected = (1..=100).map(|n| format!("#{}", n * 2)).collect::<Vec<_>>();
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(response.is_incomplete);
+
+        let response = results(
+            &format!("{}#300=IFCWALL($,$,$,(#", definitions(&mut (1..=198))),
+            Some(&schema()),
+            false,
+            false,
+        );
+        assert_eq!(response.items.len(), MAX_REFERENCE_COMPLETIONS);
+        assert_eq!(response.items.last().unwrap().label, "#300");
+        assert!(!response.is_incomplete);
+    }
+
+    #[test]
+    fn reference_prefix_filters_ids_before_compatibility() {
+        let definitions = (1..=120)
+            .map(|id| {
+                let entity = if id % 3 == 0 {
+                    "IFCOWNERHISTORY"
+                } else {
+                    "IfcDoor"
+                };
+                format!("#{id}={entity}($);")
+            })
+            .collect::<String>();
+        let text = format!("{definitions}#300=IFCWALL($,$,$,(#1");
+        let labels = items(&text, Some(&schema()))
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            [
+                "#1", "#10", "#11", "#13", "#14", "#16", "#17", "#19", "#100", "#101", "#103",
+                "#104", "#106", "#107", "#109", "#110", "#112", "#113", "#115", "#116", "#118",
+                "#119"
+            ]
+        );
+    }
+
+    #[test]
+    fn bundled_schemas_filter_spatial_references_by_their_own_hierarchy() {
+        let schemas = crate::schema::SchemaDocCollection::new();
+        let text = "#1=IFCBUILDINGSTOREY($);#2=IfcSpatialZone($);#3=IFCROAD($);#4=IFCWALL($);\
+                    #5=IFCSPACE($);#9=IFCRELCONTAINEDINSPATIALSTRUCTURE('g',$,$,$,(#4),#";
+        for (schema_name, expected) in [
+            ("IFC2X3", vec!["#1", "#5"]),
+            ("IFC4", vec!["#1", "#2", "#5"]),
+            ("IFC4X3_ADD2", vec!["#1", "#2", "#3", "#5"]),
+        ] {
+            let schema = schemas
+                .get(schema_name)
+                .expect("bundled schema should load");
+            let labels = items(text, Some(schema))
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, expected, "{schema_name}");
+        }
     }
 
     #[test]
