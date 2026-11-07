@@ -7,7 +7,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use ifc_language_server::Backend;
-use tower_lsp::{LspService, Server};
+use tower_lsp::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -19,7 +19,7 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = Backend::service();
 
     Server::new(stdin, stdout, socket).serve(service).await;
 
