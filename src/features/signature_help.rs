@@ -18,7 +18,7 @@ pub fn signature_help(
     selected_schema_name: Option<&str>,
 ) -> Option<SignatureHelp> {
     let offset = document.position_to_offset(position)?;
-    let context = entity_argument_context(&document.text, offset)?;
+    let context = entity_argument_context(&document.text, &document.definitions, offset)?;
     let schema_name = selected_schema_name.or(document.schema_name.as_deref())?;
     let entity = schema_docs.get_entity_doc(schema_name, &context.entity_name)?;
     let active_parameter = active_parameter_index(context.active_parameter, entity);

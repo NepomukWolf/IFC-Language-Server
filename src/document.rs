@@ -25,6 +25,7 @@ pub struct Document {
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
+    pub sorted_definition_ids: Vec<u32>,
     pub references: HashMap<u32, Vec<usize>>,
     schema_end: Option<usize>,
 }
@@ -118,6 +119,7 @@ impl Document {
         let TextIndex {
             line_offsets,
             definitions,
+            sorted_definition_ids,
             references,
             schema_name,
             schema_end,
@@ -130,6 +132,7 @@ impl Document {
             schema_name,
             line_offsets,
             definitions,
+            sorted_definition_ids,
             references,
             schema_end,
         }
@@ -139,6 +142,7 @@ impl Document {
         let TextIndex {
             line_offsets,
             definitions,
+            sorted_definition_ids,
             references,
             schema_name,
             schema_end,
@@ -146,6 +150,7 @@ impl Document {
 
         self.line_offsets = line_offsets;
         self.definitions = definitions;
+        self.sorted_definition_ids = sorted_definition_ids;
         self.references = references;
         self.schema_name = schema_name;
         self.schema_end = schema_end;
