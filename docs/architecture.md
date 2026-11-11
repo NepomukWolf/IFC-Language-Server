@@ -24,6 +24,7 @@ The shipped LSP features are:
 - inlay hints
 - IFC boilerplate completions and code actions
 - related-entity navigation code actions
+- call hierarchy over instance references
 - range-based semantic tokens
 - schema-aware diagnostics
 
@@ -91,6 +92,7 @@ The server advertises:
 - `textDocument/definition`
 - `textDocument/documentSymbol`
 - `textDocument/references`
+- `textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`
 - `textDocument/documentHighlight`
 - `textDocument/signatureHelp`
 - `textDocument/inlayHint`
@@ -209,6 +211,7 @@ These features do not require an AST:
 - schema-backed inlay hints for STEP entity arguments
 - schema name detection from `FILE_SCHEMA(...)`
 - related-entity navigation code actions, when schema docs are available
+- call hierarchy
 - range-based semantic tokens
 
 These features require an AST:
@@ -311,6 +314,15 @@ Each action carries a `Command` executed via `workspace/executeCommand`, which c
 client with `window/showDocument` to move the cursor. This depends on the client declaring
 `window.showDocument.support`; clients that do not implement it (e.g. Zed before its
 `window/showDocument` support landed) will show the actions but the jump will not occur.
+
+### Call Hierarchy
+
+`src/features/call_hierarchy.rs` exposes local `#id` references as an LSP call hierarchy: incoming
+calls are the instances that reference an instance, outgoing calls the instances it references.
+Referrers are found through `Document::references` and `Document::enclosing_definition`, which walks
+back from a reference to its `#id=` definition, so cost does not grow with file size.
+
+`docs/instance-navigation.md` documents the call hierarchy items' `data`.
 
 ### Semantic Tokens
 
