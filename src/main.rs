@@ -1,6 +1,10 @@
 //! Binary entrypoint for the IFC language server.
 //! It binds stdin/stdout to `tower-lsp` and starts the single backend instance that serves all
 //! editor requests for the process lifetime.
+//! On wasm32 the library's `serve` is the entrypoint and this binary is empty.
+
+#![cfg_attr(target_arch = "wasm32", no_main)]
+#![cfg(not(target_arch = "wasm32"))]
 
 use ifc_language_server::Backend;
 use tower_lsp::{LspService, Server};

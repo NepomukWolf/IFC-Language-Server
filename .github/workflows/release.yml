@@ -94,8 +94,57 @@ jobs:
           path: dist/${{ matrix.asset_name }}
           if-no-files-found: error
 
+  build-wasm:
+    needs: verify
+    runs-on: ubuntu-24.04
+
+    env:
+      # tree-sitter's C sources need a clang with the wasm32 backend.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+      CFLAGS_wasm32_unknown_unknown: -Wno-error=incompatible-pointer-types -Wno-unused-parameter
+      ASSET_NAME: ifc-language-server-${{ github.ref_name }}-wasm32.tar.gz
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install LLVM
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build wasm package
+        run: wasm-pack build --profile wasm-release --target web --no-pack -- --locked
+
+      - name: Smoke test wasm package
+        run: bun wasm/smoke-test.mjs pkg
+
+      - name: Package wasm package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${ASSET_NAME}" --exclude .gitignore -C pkg .
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm32
+          path: dist/${{ env.ASSET_NAME }}
+          if-no-files-found: error
+
   publish:
-    needs: build
+    needs: [build, build-wasm]
     runs-on: ubuntu-24.04
 
     steps:
