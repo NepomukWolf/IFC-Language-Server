@@ -12,3 +12,4 @@ mod schema;
 mod step;
 
 pub use backend::Backend;
+pub use document::DEFAULT_AST_FILE_SIZE_LIMIT_BYTES;
