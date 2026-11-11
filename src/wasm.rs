@@ -11,7 +11,7 @@ use futures::future::{self, Either};
 use futures::io::AsyncWrite;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use js_sys::Uint8Array;
-use tower_lsp::{LspService, Server};
+use tower_lsp::Server;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use wasm_streams::writable::IntoSink;
@@ -63,7 +63,7 @@ pub async fn serve(
         sink: writer.into_sink(),
         failure: failure.clone(),
     };
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = Backend::service();
     let server = pin!(Server::new(input, output, socket).serve(service));
     match future::select(server, &mut failed).await {
         Either::Left(((), _)) => match failed.try_recv() {
