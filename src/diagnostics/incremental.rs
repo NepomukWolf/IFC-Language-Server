@@ -129,19 +129,21 @@ pub fn collect(
     };
 
     let mode = match replay {
-        Some((mut entries, dirty)) => {
+        Some((cached, dirty)) => {
+            let mut entries = Vec::with_capacity(cached.len());
+            let mut cached = cached.into_iter().peekable();
             for &index in &dirty {
+                while let Some(entry) = cached.next_if(|&(i, _)| i < index) {
+                    entries.push(entry);
+                }
+                cached.next_if(|&(i, _)| i == index);
                 let mut diagnostics = Vec::new();
                 validate(index, &mut diagnostics);
-                match entries.binary_search_by_key(&index, |&(i, _)| i) {
-                    Ok(at) if diagnostics.is_empty() => {
-                        entries.remove(at);
-                    }
-                    Ok(at) => entries[at].1 = diagnostics,
-                    Err(_) if diagnostics.is_empty() => {}
-                    Err(at) => entries.insert(at, (index, diagnostics)),
+                if !diagnostics.is_empty() {
+                    entries.push((index, diagnostics));
                 }
             }
+            entries.extend(cached);
             *guard = Some(Cached {
                 generation: edits.generation,
                 revision: edits.revision,
