@@ -372,12 +372,7 @@ fn skip_block_comment(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>
             end + 2
         }
         None => {
-            push_lines(
-                bytes,
-                offset + 2,
-                (bytes.len() - 1).max(offset + 2),
-                line_offsets,
-            );
+            push_lines(bytes, offset + 2, bytes.len(), line_offsets);
             bytes.len()
         }
     }
@@ -421,6 +416,11 @@ fn is_identifier_part(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_a_final_newline_inside_an_unterminated_comment() {
+        assert_eq!(scan_text("#1=X(1);/*\n").line_offsets, vec![0, 11]);
+    }
 
     #[test]
     fn scans_schema_definitions_references_and_lines() {

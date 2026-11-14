@@ -1502,6 +1502,18 @@ mod tests {
         assert!(document.is_parse_state_loaded());
     }
 
+    #[test]
+    fn applies_an_edit_on_the_empty_last_line_inside_an_unterminated_comment() {
+        let mut document = parse_document("#1=X(1);/*\n");
+        let last_line = Range::new(Position::new(1, 0), Position::new(1, 0));
+
+        let result = document.apply_content_changes(&[change(Some(last_line), "*/#2=X(#1);")]);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(document.text.as_str(), "#1=X(1);/*\n*/#2=X(#1);");
+        assert!(document.definitions.contains_key(&2));
+    }
+
     /// Whether `edit_text_index` handled the edit without a full rescan; asserts that its result
     /// equals one when it did.
     fn local_edit_matches_scan(text: &str, start: usize, end: usize, replacement: &str) -> bool {
