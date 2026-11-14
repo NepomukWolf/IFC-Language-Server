@@ -811,11 +811,16 @@ pub(crate) fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
 fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
     let mut p = start;
     let mut quote = 0;
+    let mut next_stop = None;
     while p < end {
         let rest = &text[p..end];
         p += if quote == 0 {
-            let stop = memchr::memchr3(b';', b'\'', b'"', rest).unwrap_or(rest.len());
-            memchr::memchr2(b'\n', b'/', &rest[..stop]).unwrap_or(stop)
+            let stop = match next_stop {
+                Some(stop) if stop >= p => stop,
+                _ => p + memchr::memchr3(b';', b'\'', b'"', rest).unwrap_or(rest.len()),
+            };
+            next_stop = Some(stop);
+            memchr::memchr2(b'\n', b'/', &text[p..stop]).unwrap_or(stop - p)
         } else {
             memchr::memchr3(quote, b';', b'\n', rest).unwrap_or(rest.len())
         };
@@ -964,6 +969,33 @@ mod tests {
             );
             assert_eq!(doc, Document::parse(&text, false));
         }
+    }
+
+    #[test]
+    fn a_statement_wrapped_over_many_lines_parses_in_linear_time() {
+        let parse_time = |lines: usize| {
+            let mut text = b"DATA;\n#1=IFCCARTESIANPOINTLIST3D((\n".to_vec();
+            for _ in 1..lines {
+                text.extend_from_slice(b"(0.,0.,0.),\n");
+            }
+            text.extend_from_slice(b"(0.,0.,0.)\n));\nENDSEC;\n");
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let doc = Document::parse(&text, false);
+                    let elapsed = start.elapsed();
+                    assert!(doc.errors.is_empty(), "{:?}", doc.errors);
+                    elapsed
+                })
+                .min()
+                .unwrap()
+        };
+        let small = parse_time(10_000);
+        let large = parse_time(40_000);
+        assert!(
+            large < small * 8,
+            "4x the lines took {large:?} against {small:?}"
+        );
     }
 
     #[test]
