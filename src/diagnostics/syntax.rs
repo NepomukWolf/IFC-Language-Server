@@ -13,6 +13,7 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut cursor = tree.root_node().walk();
     collect_error_nodes(&mut cursor, &mut diagnostics);
+    super::byte_columns_to_utf16(snapshot.text(), &mut diagnostics);
     diagnostics
 }
 
@@ -159,5 +160,25 @@ mod tests {
                 ((6, 16, 6, 18), "Invalid IFC STEP syntax".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn syntax_diagnostic_columns_are_utf16_code_units() {
+        let doc = parse_document(concat!(
+            "DATA;\n",
+            "#1=IFCWALL('ääää',%);\n",
+            "#2=IFCWALL('😀',%);\n",
+            "#3=IFCWALL('ab',%);\n",
+            "ENDSEC;\n",
+        ));
+        let columns: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| {
+                let Range { start, end } = diagnostic.range;
+                (start.line, start.character, end.line, end.character)
+            })
+            .collect();
+
+        assert_eq!(columns, [(1, 17, 1, 19), (2, 15, 2, 17), (3, 15, 3, 17)]);
     }
 }
