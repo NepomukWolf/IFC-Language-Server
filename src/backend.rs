@@ -152,9 +152,7 @@ impl Backend {
         let document = documents
             .entry(uri.clone())
             .or_insert_with(|| Document::new_unloaded(String::new()));
-        document.unload_parse_state();
-        document.text = Arc::new(text);
-
+        document.replace_text(text);
         document.reload_parse_state();
 
         info!(
@@ -1684,6 +1682,36 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reopening_a_document_with_fewer_statements_diagnoses_the_new_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/reopened.ifc").unwrap();
+        let header = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n";
+        let before = format!(
+            "{header}#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCCARTESIANPOINT((1.,0.));\n#3=IFCCARTESIANPOINT('x');\nENDSEC;\n"
+        );
+        let after = format!("{header}#1=IFCCARTESIANPOINT('y');\nENDSEC;\n");
+        let (name, schema) = backend
+            .resolve_schema(Some("IFC4"))
+            .await
+            .expect("IFC4 is bundled");
+        let diagnose = |snapshot: &DiagnosticSnapshot| {
+            crate::diagnostics::collect(snapshot, Some((&name, &schema)))
+        };
+
+        let opened = backend.load_text_as_active_document(&uri, before).await;
+        assert_ne!(diagnose(&opened), []);
+        let reopened = backend
+            .load_text_as_active_document(&uri, after.clone())
+            .await;
+
+        assert_eq!(
+            diagnose(&reopened),
+            diagnose(&DiagnosticSnapshot::from_document(&Document::parse(after)))
+        );
     }
 
     #[tokio::test]
