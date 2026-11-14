@@ -128,9 +128,9 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
 
     located
         .iter()
-        .zip(positions.chunks_exact(2))
-        .map(|(located, range)| Diagnostic {
-            range: Range::new(range[0], range[1]),
+        .zip(positions.as_chunks::<2>().0)
+        .map(|(located, &[start, end])| Diagnostic {
+            range: Range::new(start, end),
             severity: Some(DiagnosticSeverity::ERROR),
             message: match located.problem {
                 Problem::Invalid => "Invalid IFC STEP syntax".to_string(),
