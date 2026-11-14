@@ -702,6 +702,25 @@ mod tests {
     }
 
     #[test]
+    fn hover_counts_a_byte_order_mark_in_first_line_positions() {
+        let text = "\u{FEFF}#1=IFCWALL($,.USERDEFINED.);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            Position::new(0, 15),
+            &schema_docs_with_wall(),
+            Some("IFC4"),
+        )
+        .expect("hover should exist");
+        let range = hover.range.expect("hover should have a range");
+
+        assert_eq!(range.start, Position::new(0, 14));
+        assert_eq!(range.end, Position::new(0, 27));
+        assert!(hover_text(hover).contains("# IfcWallTypeEnum"));
+    }
+
+    #[test]
     fn hover_returns_enum_options_after_non_ascii_text() {
         let text = "#1=IFCWALL('Wänd',.USERDEFINED.);";
         let document = parse_document(text);

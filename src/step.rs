@@ -98,7 +98,11 @@ impl Document {
             retain,
         };
         let mut open_section = false;
-        let mut p = 0;
+        let mut p = if text.starts_with(b"\xEF\xBB\xBF") {
+            3
+        } else {
+            0
+        };
         while p < text.len() {
             p = match closed_trivia(text, p, text.len()) {
                 Ok(p) => p,
@@ -1205,6 +1209,15 @@ mod tests {
         assert!(doc.errors.is_empty(), "{:?}", doc.errors);
         assert_eq!(doc, Document::parse(&text, false));
         edits_match_full_parse(original);
+    }
+
+    #[test]
+    fn skips_a_leading_byte_order_mark() {
+        let text = b"\xEF\xBB\xBFDATA;\n#1=X(1);\n#2=Y('a',2);\n#3=Z(3);\nENDSEC;\n";
+        let doc = Document::parse(text, true);
+        assert!(doc.errors.is_empty(), "{:?}", doc.errors);
+        assert_eq!(doc.statements.len(), 3);
+        edits_match_full_parse(text);
     }
 
     #[test]

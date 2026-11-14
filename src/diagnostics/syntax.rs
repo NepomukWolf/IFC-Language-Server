@@ -354,6 +354,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_byte_order_mark_and_counts_it_in_first_line_positions() {
+        let doc = parse_document("\u{FEFF}#1=IFCWALL('a);\n#2=IFCWALL($);\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(0, 12), Position::new(0, 16)),
+                "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn reports_a_stray_token_right_after_a_statement() {
         let doc = parse_document("DATA;\n#1=IFCWALL($);q\r\n#2=IFCWALL($);\nENDSEC;\n");
         let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
