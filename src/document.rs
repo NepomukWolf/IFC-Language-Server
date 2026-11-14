@@ -185,6 +185,13 @@ impl Document {
         self.statement_index = Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
     }
 
+    /// Replaces the whole text, dropping the parse state and the edit log of the old one.
+    pub fn replace_text(&mut self, text: String) {
+        self.statement_index = None;
+        self.statement_edits = StatementEdits::fresh();
+        self.text = Arc::new(text);
+    }
+
     pub fn apply_content_changes(
         &mut self,
         changes: &[TextDocumentContentChangeEvent],
@@ -196,8 +203,7 @@ impl Document {
                     return Err(error);
                 }
             } else {
-                self.text = Arc::new(change.text.clone());
-                self.statement_index = None;
+                self.replace_text(change.text.clone());
                 self.reload_text_index();
             }
         }
@@ -205,7 +211,6 @@ impl Document {
         if self.statement_index.is_none() {
             self.statement_index =
                 Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
-            self.statement_edits = StatementEdits::fresh();
         }
         Ok(())
     }
@@ -238,6 +243,8 @@ impl Document {
                 },
             );
             self.statement_edits.record(outcome);
+        } else {
+            self.statement_edits = StatementEdits::fresh();
         }
         let edited = self.with_text_index(|index, text| {
             edit_text_index(index, text, start_byte, &removed, replacement.len())

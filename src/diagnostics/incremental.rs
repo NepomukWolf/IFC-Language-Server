@@ -678,6 +678,64 @@ mod tests {
     }
 
     #[test]
+    fn replacing_the_text_before_an_invalid_range_diagnoses_the_new_text() {
+        let schema = ifc4();
+        let mut document = reloaded_document(
+            "DATA;\n#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCCARTESIANPOINT((1.,0.));\n#3=IFCCARTESIANPOINT('x');\nENDSEC;\n",
+        );
+        assert_eq!(incremental(&document, &schema).0.len(), 1);
+        let replacement = "DATA;\n#1=IFCCARTESIANPOINT('y');\nENDSEC;\n";
+
+        let result = document.apply_content_changes(&[
+            TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: replacement.to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(99, 0), Position::new(99, 1))),
+                range_length: None,
+                text: String::new(),
+            },
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(document.text.as_str(), replacement);
+        let (diagnostics, _) = incremental(&document, &schema);
+        assert_eq!(diagnostics, full(replacement, &schema, "IFC4"));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn editing_an_unloaded_document_before_an_invalid_range_diagnoses_the_new_text() {
+        let schema = ifc4();
+        let mut document = reloaded_document(
+            "DATA;\n#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCCARTESIANPOINT((1.,0.));\n#3=IFCCARTESIANPOINT('x');\nENDSEC;\n",
+        );
+        assert_eq!(incremental(&document, &schema).0.len(), 1);
+        document.unload_parse_state();
+
+        let result = document.apply_content_changes(&[
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(2, 0), Position::new(4, 0))),
+                range_length: None,
+                text: String::new(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(99, 0), Position::new(99, 1))),
+                range_length: None,
+                text: String::new(),
+            },
+        ]);
+
+        assert!(result.is_err());
+        let (diagnostics, _) = incremental(&document, &schema);
+        assert_eq!(diagnostics, full(&document.text, &schema, "IFC4"));
+        assert_eq!(diagnostics, []);
+    }
+
+    #[test]
     fn diagnostics_on_later_lines_of_a_statement_starting_mid_line_keep_their_columns() {
         let schema = ifc4();
         let mut document = reloaded_document(
