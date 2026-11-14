@@ -1193,41 +1193,41 @@ mod tests {
 
     #[test]
     fn an_edit_that_keeps_ids_costs_the_same_on_a_larger_document() {
-        let edit_time = |statements: u32| {
+        let document = |statements: u32| {
             let mut text = b"DATA;\n".to_vec();
             for id in 1..=statements {
                 text.extend_from_slice(format!("#{id}=X(1);\n").as_bytes());
             }
             text.extend_from_slice(b"ENDSEC;\n");
             let digit = text.len() - b"1);\nENDSEC;\n".len();
-            let mut doc = Document::parse(&text, false);
-            let fastest = (0..100)
-                .map(|n| {
-                    let (old, new) = if n % 2 == 0 {
-                        (b"1", b"2")
-                    } else {
-                        (b"2", b"1")
-                    };
-                    text[digit] = new[0];
-                    let start = std::time::Instant::now();
-                    doc.edit(
-                        old,
-                        &text,
-                        Edit {
-                            start: digit,
-                            delete_len: 1,
-                            insert_len: 1,
-                        },
-                    );
-                    start.elapsed()
-                })
-                .min()
-                .unwrap();
-            assert_eq!(doc.find(statements), Some(statements as usize - 1));
-            fastest
+            let doc = Document::parse(&text, false);
+            (text, digit, doc)
         };
-        let small = edit_time(10_000);
-        let large = edit_time(160_000);
+        let mut documents = [document(10_000), document(160_000)];
+        let mut fastest = [std::time::Duration::MAX; 2];
+        for n in 0..200 {
+            let (old, new) = if n % 2 == 0 {
+                (b"1", b"2")
+            } else {
+                (b"2", b"1")
+            };
+            for ((text, digit, doc), fastest) in documents.iter_mut().zip(&mut fastest) {
+                text[*digit] = new[0];
+                let start = std::time::Instant::now();
+                doc.edit(
+                    old,
+                    text,
+                    Edit {
+                        start: *digit,
+                        delete_len: 1,
+                        insert_len: 1,
+                    },
+                );
+                *fastest = start.elapsed().min(*fastest);
+            }
+        }
+        assert_eq!(documents[1].2.find(160_000), Some(159_999));
+        let [small, large] = fastest;
         assert!(
             large < small * 4,
             "16x the statements took {large:?} against {small:?}"
@@ -1236,28 +1236,24 @@ mod tests {
 
     #[test]
     fn a_statement_wrapped_over_many_lines_parses_in_linear_time() {
-        let parse_time = |lines: usize| {
-            let mut text = b"DATA;\n#1=IFCCARTESIANPOINTLIST3D((\n".to_vec();
-            for _ in 1..lines {
-                text.extend_from_slice(b"(0.,0.,0.),\n");
-            }
-            text.extend_from_slice(b"(0.,0.,0.)\n));\nENDSEC;\n");
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    let doc = Document::parse(&text, false);
-                    let elapsed = start.elapsed();
-                    assert!(doc.errors.is_empty(), "{:?}", doc.errors);
-                    elapsed
-                })
-                .min()
-                .unwrap()
-        };
-        let small = parse_time(10_000);
-        let large = parse_time(40_000);
+        let growth = crate::test_support::growth_on_sixteenfold(
+            2_500,
+            |lines| {
+                let mut text = b"DATA;\n#1=IFCCARTESIANPOINTLIST3D((\n".to_vec();
+                for _ in 1..lines {
+                    text.extend_from_slice(b"(0.,0.,0.),\n");
+                }
+                text.extend_from_slice(b"(0.,0.,0.)\n));\nENDSEC;\n");
+                text
+            },
+            |text| {
+                let doc = Document::parse(text, false);
+                assert!(doc.errors.is_empty(), "{:?}", doc.errors);
+            },
+        );
         assert!(
-            large < small * 8,
-            "4x the lines took {large:?} against {small:?}"
+            growth < 4.0,
+            "16x the lines took {growth:.1}x as long as 16 inputs"
         );
     }
 
