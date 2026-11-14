@@ -14,6 +14,9 @@ pub struct TextIndex {
     pub references: FxHashMap<u32, Vec<usize>>,
     pub schema_name: Option<String>,
     pub schema_end: Option<usize>,
+    /// Strings whose lookahead for where they end read past their end, by the offset of their
+    /// opening quote: the offset where that reading stopped.
+    pub string_reaches: Vec<(usize, usize)>,
 }
 
 /// Bounds of a local rescan: how far before an edit it looks for an indexed `#id` to restart
@@ -32,6 +35,7 @@ pub fn rescan_text(text: &str, mut index: TextIndex) -> TextIndex {
     index.line_offsets.push(0);
     index.definitions.clear();
     index.definitions_by_id.clear();
+    index.string_reaches.clear();
     for offsets in index.references.values_mut() {
         offsets.clear();
     }
@@ -41,6 +45,7 @@ pub fn rescan_text(text: &str, mut index: TextIndex) -> TextIndex {
         0,
         usize::MAX,
         &mut index.line_offsets,
+        &mut index.string_reaches,
         Some(&mut schema),
         |token| {
             index
@@ -84,6 +89,7 @@ fn scan(
     mut offset: usize,
     stop_after: usize,
     line_offsets: &mut Vec<usize>,
+    string_reaches: &mut Vec<(usize, usize)>,
     mut schema: Option<&mut Option<(String, usize)>>,
     mut visit: impl FnMut(IdToken) -> bool,
 ) -> usize {
@@ -91,7 +97,9 @@ fn scan(
     while offset < bytes.len() && offset <= stop_after {
         let wants_schema = schema.as_deref().is_some_and(Option::is_none);
         match bytes[offset] {
-            b'\'' => offset = string_end(bytes, offset, line_offsets, &mut ahead).0,
+            b'\'' => {
+                offset = string_end(bytes, offset, line_offsets, string_reaches, &mut ahead).0;
+            }
             b'/' if bytes.get(offset + 1) == Some(&b'*') => {
                 offset = skip_block_comment(bytes, offset, line_offsets);
             }
@@ -143,7 +151,8 @@ fn scan(
 /// by the `inserted_len` bytes of `text` at `start`. Rescans from the last indexed `#id` before
 /// the edit until the first `#id` after it that the old scan also indexed: both scans are outside
 /// strings and comments there, so the rest of the index only shifts. Returns false, leaving
-/// `index` untouched, when the edit reaches into the header or the rescan would exceed its bounds.
+/// `index` untouched, when the edit reaches into the header, when deciding where a string before
+/// the restart ends read into the edit, or when the rescan would exceed its bounds.
 pub fn edit_text_index(
     index: &mut TextIndex,
     text: &str,
@@ -176,10 +185,21 @@ pub fn edit_text_index(
     else {
         return false;
     };
+    // A `*/` can straddle the edit's start.
+    let strings_before = index
+        .string_reaches
+        .partition_point(|&(quote, _)| quote < anchor);
+    if index.string_reaches[..strings_before]
+        .iter()
+        .any(|&(_, reach)| reach + 1 >= start)
+    {
+        return false;
+    }
 
     let new_edit_end = start + inserted_len;
     let delta = inserted_len as isize - removed.len() as isize;
     let mut new_lines = Vec::new();
+    let mut new_reaches = Vec::new();
     let mut new_tokens = Vec::new();
     let mut synced = false;
     let new_stop = scan(
@@ -187,6 +207,7 @@ pub fn edit_text_index(
         anchor,
         new_edit_end + MAX_RESCAN_PAST_EDIT,
         &mut new_lines,
+        &mut new_reaches,
         None,
         |token| {
             synced = token.offset >= new_edit_end
@@ -233,6 +254,9 @@ pub fn edit_text_index(
     let lines_to = index
         .line_offsets
         .partition_point(|&offset| offset <= old_stop);
+    let strings_to = index
+        .string_reaches
+        .partition_point(|&(quote, _)| quote < old_stop);
 
     let mut touched: Vec<u32> = old_tokens
         .iter()
@@ -263,9 +287,16 @@ pub fn edit_text_index(
             .iter_mut()
             .for_each(|(_, offset)| shift(offset));
         index.references.values_mut().flatten().for_each(shift);
+        for (quote, reach) in &mut index.string_reaches[strings_to..] {
+            shift(quote);
+            shift(reach);
+        }
     }
 
     index.line_offsets.splice(lines_from..lines_to, new_lines);
+    index
+        .string_reaches
+        .splice(strings_before..strings_to, new_reaches);
 
     touched.extend(
         new_tokens
@@ -337,50 +368,76 @@ fn is_definition(bytes: &[u8], mut offset: usize) -> bool {
 
 /// End of the string opening at `offset` and whether a quote closed it. Like
 /// `step::frame_end`, a string that runs into a line starting another statement or `ENDSEC;`
-/// ends there, so an unclosed string swallows only its own.
+/// ends there, so an unclosed string swallows only its own. Records the string in
+/// `string_reaches` when deciding where it ends read past that end.
 fn string_end(
     bytes: &[u8],
     mut offset: usize,
     line_offsets: &mut Vec<usize>,
+    string_reaches: &mut Vec<(usize, usize)>,
     ahead: &mut step::Lookahead,
 ) -> (usize, bool) {
     let len = bytes.len();
+    let quote = offset;
+    ahead.take_comment_reach();
     offset += 1;
-    while let Some(n) = memchr::memchr3(b'\n', b'\'', b';', &bytes[offset..]) {
-        offset += n;
-        match bytes[offset] {
-            b'\n' => {
-                let mut next = offset + 1;
-                while next < len && matches!(bytes[next], b' ' | b'\t' | b'\r') {
-                    next += 1;
+    let (end, closed) = 'string: {
+        while let Some(n) = memchr::memchr3(b'\n', b'\'', b';', &bytes[offset..]) {
+            offset += n;
+            match bytes[offset] {
+                b'\n' => {
+                    let mut next = offset + 1;
+                    while next < len && matches!(bytes[next], b' ' | b'\t' | b'\r') {
+                        next += 1;
+                    }
+                    if step::definition(bytes, next, len, ahead)
+                        || step::section_end(bytes, next, len, ahead)
+                    {
+                        break 'string (offset, false);
+                    }
+                    line_offsets.push(offset + 1);
+                    offset += 1;
                 }
-                if step::definition(bytes, next, len, ahead)
-                    || step::section_end(bytes, next, len, ahead)
-                {
-                    return (offset, false);
+                b'\'' => {
+                    if bytes.get(offset + 1) == Some(&b'\'') {
+                        offset += 2;
+                    } else {
+                        break 'string (offset + 1, true);
+                    }
                 }
-                line_offsets.push(offset + 1);
-                offset += 1;
-            }
-            b'\'' => {
-                if bytes.get(offset + 1) == Some(&b'\'') {
-                    offset += 2;
-                } else {
-                    return (offset + 1, true);
+                _ => {
+                    let next = step::trivia(bytes, offset + 1, len, ahead);
+                    if step::definition(bytes, next, len, ahead)
+                        && ahead.line_break(bytes, offset + 1, next)
+                    {
+                        break 'string (offset + 1, false);
+                    }
+                    offset += 1;
                 }
-            }
-            _ => {
-                let next = step::trivia(bytes, offset + 1, len, ahead);
-                if step::definition(bytes, next, len, ahead)
-                    && ahead.line_break(bytes, offset + 1, next)
-                {
-                    return (offset + 1, false);
-                }
-                offset += 1;
             }
         }
+        (len, false)
+    };
+    let comment_reach = ahead.take_comment_reach();
+    if comment_reach > end {
+        // Past its last comment, lookahead reads blanks, an `#id` and blanks, and the byte after.
+        let mut read = comment_reach;
+        let blanks = |read: &mut usize| {
+            while bytes.get(*read).is_some_and(u8::is_ascii_whitespace) {
+                *read += 1;
+            }
+        };
+        blanks(&mut read);
+        if bytes.get(read) == Some(&b'#') {
+            read += 1;
+            while bytes.get(read).is_some_and(u8::is_ascii_digit) {
+                read += 1;
+            }
+            blanks(&mut read);
+        }
+        string_reaches.push((quote, read + 1));
     }
-    (len, false)
+    (end, closed)
 }
 
 fn skip_block_comment(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> usize {
@@ -426,7 +483,7 @@ fn parse_schema_string(
     offset: usize,
     ahead: &mut step::Lookahead,
 ) -> Option<(String, usize)> {
-    let (end, closed) = string_end(bytes, offset, &mut Vec::new(), ahead);
+    let (end, closed) = string_end(bytes, offset, &mut Vec::new(), &mut Vec::new(), ahead);
     closed.then_some(())?;
     let value = std::str::from_utf8(&bytes[offset + 1..end - 1]).ok()?;
     Some((value.replace("''", "'").to_ascii_uppercase(), end))
@@ -600,6 +657,49 @@ mod tests {
     fn opening_a_comment_whose_slash_precedes_the_edit() {
         let text = "FILE_SCHEMA(('IFC4'));\n#1=X(#2/";
         edit_matches_scan(text, text.len(), text.len(), "*");
+    }
+
+    #[test]
+    fn closing_a_comment_that_a_string_before_the_restart_looked_into() {
+        for (text, appended) in [
+            (
+                "FILE_SCHEMA(('IFC4'));\n#1=X('abc\n#2 /* x' #5=Y(1); \n",
+                "*/=",
+            ),
+            (
+                "FILE_SCHEMA(('IFC4'));\n#1=X('abc\nENDSEC /* x' #5=Y(1); \n",
+                "*/;",
+            ),
+            ("FILE_SCHEMA(('IFC4'));\n#1=X('abc; /* x' #9 */\n#5 ", "="),
+        ] {
+            edit_matches_scan(text, text.len(), text.len(), appended);
+        }
+    }
+
+    #[test]
+    fn random_edits_match_a_full_scan() {
+        const PIECES: [&str; 14] = [
+            "'", ";", "\n", "/*", "*/", "#1=", "#2", "ENDSEC;", "A", "b", " ", "(", ",", "=",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut below = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        fn pieces(below: &mut impl FnMut(usize) -> usize, max: usize) -> String {
+            (0..below(max + 1))
+                .map(|_| PIECES[below(PIECES.len())])
+                .collect()
+        }
+        for _ in 0..50_000 {
+            let text = format!("FILE_SCHEMA(('IFC4'));{}", pieces(&mut below, 24));
+            let start = below(text.len() + 1);
+            let end = start + below(text.len() - start + 1).min(4);
+            let replacement = pieces(&mut below, 3);
+            edit_matches_scan(&text, start, end, &replacement);
+        }
     }
 
     #[test]
