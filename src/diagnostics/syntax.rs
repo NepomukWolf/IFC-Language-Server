@@ -78,6 +78,13 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
                     end,
                 };
             }
+            if error.message == step::SECTION_REOPENED {
+                return Located {
+                    problem: Problem::MissingSectionEnd,
+                    start,
+                    end,
+                };
+            }
             if error.message == step::NESTING_TOO_DEEP {
                 return Located {
                     problem: Problem::TooDeep,
@@ -300,6 +307,22 @@ mod tests {
                 range: Range::new(Position::new(1, 27), Position::new(1, 28)),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: "Invalid IFC STEP syntax".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_data_section_opened_inside_the_header_misses_the_header_end() {
+        let doc = parse_document(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nDATA;\n#1=IFCCARTESIANPOINT((0.,0.,0.));\nENDSEC;\nEND-ISO-10303-21;\n",
+        );
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&doc)),
+            vec![Diagnostic {
+                range: Range::new(Position::new(5, 0), Position::new(5, 4)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Missing `ENDSEC;`".to_string(),
                 ..Default::default()
             }]
         );

@@ -131,6 +131,15 @@ impl Document {
                     doc.header.start = start as u32;
                 }
                 if word.eq_ignore_ascii_case(b"HEADER") || word.eq_ignore_ascii_case(b"DATA") {
+                    if open_section {
+                        doc.errors.push(ParseError {
+                            span: Span {
+                                start: start as u32,
+                                end: word_end as u32,
+                            },
+                            message: SECTION_REOPENED,
+                        });
+                    }
                     open_section = true;
                 } else if word.eq_ignore_ascii_case(b"ENDSEC") {
                     open_section = false;
@@ -492,6 +501,7 @@ struct Reader<'a, 'p> {
 /// keeps every consumer within a small (wasm) stack.
 pub(crate) const MAX_NESTING: usize = 256;
 pub(crate) const NESTING_TOO_DEEP: &str = "nesting too deep";
+pub(crate) const SECTION_REOPENED: &str = "section opened before the previous one ended";
 
 /// Errors confined to one scalar value, which `Reader::skip` can step over.
 const SKIPPABLE: [&str; 7] = [
@@ -1275,6 +1285,39 @@ mod tests {
         }
         edits_match_full_parse(b"DATA;\n#1=X(1);\n#2=Y('a',2);\n#3=Z(3);\n#4=W(4);\n");
         edits_match_full_parse(b"DATA;\n#1=X(1);\n#2=Y('a',2);\nENDSEC;\n#3=Z(3);\n#4=W(4);\n");
+    }
+
+    #[test]
+    fn reports_a_section_opened_before_the_previous_one_ended() {
+        let reopened = |text: &[u8]| {
+            let doc = Document::parse(text, true);
+            let keyword = memchr::memmem::rfind(text, b"DATA").unwrap() as u32;
+            assert_eq!(
+                doc.errors,
+                [ParseError {
+                    span: Span {
+                        start: keyword,
+                        end: keyword + 4,
+                    },
+                    message: SECTION_REOPENED,
+                }]
+            );
+            assert!(!doc.unclosed_section);
+            assert_eq!(doc.statements.len(), 1);
+            edits_match_full_parse(text);
+        };
+        reopened(b"HEADER;\nFILE_SCHEMA(('IFC4'));\nDATA;\n#1=X(1);\nENDSEC;\n");
+        reopened(b"DATA;\nDATA;\n#1=X(1);\nENDSEC;\n");
+        for text in [
+            b"HEADER;\nENDSEC;\nDATA;\n#1=X(1);\nENDSEC;\n".as_slice(),
+            b"DATA;\n#1=X(1);\nENDSEC;\nDATA;\n#2=X(2);\nENDSEC;\n",
+            b"HEADER;\nENDSEC;\nDATA;\nENDSEC;\nDATA;\n#2=X(2);\nENDSEC;\n",
+        ] {
+            let doc = Document::parse(text, true);
+            assert!(doc.errors.is_empty(), "{:?}", doc.errors);
+            assert!(!doc.unclosed_section);
+            edits_match_full_parse(text);
+        }
     }
 
     #[test]
