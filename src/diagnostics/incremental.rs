@@ -875,19 +875,18 @@ mod tests {
             .map(|id| format!("#{id}=IFCPOLYLINE((#{},#{}));\n", id + 1, id + 2))
             .collect();
         let parsed = step::Document::parse(text.as_bytes(), false);
-        let time = |ids: &[u32]| {
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    std::hint::black_box(referrers(&parsed, &text, ids));
-                    start.elapsed()
-                })
-                .min()
-                .expect("three runs")
-        };
         let ids = |count: u32| (0..count).map(|n| 1000 + n * 1500).collect::<Vec<_>>();
+        let (few_ids, many_ids) = (ids(16), ids(128));
+        let time = |ids: &[u32]| {
+            let start = std::time::Instant::now();
+            std::hint::black_box(referrers(&parsed, &text, ids));
+            start.elapsed()
+        };
 
-        let (few, many) = (time(&ids(16)), time(&ids(128)));
+        let (few, many) = (0..7)
+            .map(|_| (time(&few_ids), time(&many_ids)))
+            .reduce(|(few, many), (f, m)| (few.min(f), many.min(m)))
+            .expect("seven rounds");
 
         assert!(many < few * 3, "16 ids {few:?}, 128 ids {many:?}");
     }
