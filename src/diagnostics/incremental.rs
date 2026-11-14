@@ -700,6 +700,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn revalidated_statements_merge_into_the_cache_like_a_full_revalidation() {
+        let schema = ifc4();
+        let mut document = reloaded_document(
+            "DATA;\n\
+             #1=IFCDIRECTION((0.,0.,1.));\n\
+             #2=IFCCARTESIANPOINT((0.,0.));\n\
+             #3=IFCPOLYLINE((#1,#1));\n\
+             #4=IFCCARTESIANPOINT('x');\n\
+             #5=IFCPOLYLINE((#2,#2));\n\
+             #6=IFCCARTESIANPOINT((0.,0.));\n\
+             #7=IFCCARTESIANPOINT('z');\n\
+             ENDSEC;\n",
+        );
+        let lines_with_diagnostics = |diagnostics: &[Diagnostic]| {
+            let mut lines: Vec<u32> = diagnostics.iter().map(|d| d.range.start.line).collect();
+            lines.dedup();
+            lines
+        };
+        assert_eq!(
+            lines_with_diagnostics(&incremental(&document, &schema).0),
+            [3, 4, 7]
+        );
+
+        edit(&mut document, "#1=IFCDIRECTION", "#1=IFCCARTESIANPOINT");
+        edit(&mut document, "#2=IFCCARTESIANPOINT", "#2=IFCDIRECTION");
+        edit(&mut document, "('x')", "(('x'))");
+        edit(
+            &mut document,
+            "#6=IFCCARTESIANPOINT((0.,0.))",
+            "#6=IFCCARTESIANPOINT('y')",
+        );
+        let (diagnostics, mode) = incremental(&document, &schema);
+        assert!(matches!(mode, Mode::Incremental { .. }), "{mode:?}");
+        assert_eq!(diagnostics, full(&document.text, &schema, "IFC4"));
+        assert_eq!(lines_with_diagnostics(&diagnostics), [4, 5, 6, 7]);
+
+        edit(
+            &mut document,
+            "#7=IFCCARTESIANPOINT('z');",
+            "#7=IFCCARTESIANPOINT('z');\n#8=IFCCARTESIANPOINT('w');",
+        );
+        let (diagnostics, mode) = incremental(&document, &schema);
+        assert!(matches!(mode, Mode::Incremental { .. }), "{mode:?}");
+        assert_eq!(diagnostics, full(&document.text, &schema, "IFC4"));
+        assert_eq!(lines_with_diagnostics(&diagnostics), [4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn clearing_diagnostics_of_many_statements_grows_linearly_with_their_number() {
+        let schema = ifc4();
+        let growth = crate::test_support::growth_on_sixteenfold(
+            4_000,
+            |polylines| {
+                let mut text = "DATA;\n#1=IFCDIRECTION((0.,0.,1.));\n".to_string();
+                for id in 2..polylines + 2 {
+                    text += &format!("#{id}=IFCPOLYLINE((#1,#1));\n");
+                }
+                text += "ENDSEC;\n";
+                let mut document = reloaded_document(&text);
+                assert!(incremental(&document, &schema).0.len() >= polylines);
+                edit(&mut document, "#1=IFCDIRECTION", "#1=IFCCARTESIANPOINT");
+                document
+            },
+            |document| {
+                let (diagnostics, mode) = incremental(document, &schema);
+                assert!(matches!(mode, Mode::Incremental { .. }), "{mode:?}");
+                assert_eq!(diagnostics, []);
+            },
+        );
+        assert!(
+            growth < 4.0,
+            "16x the cleared statements in one document took {growth:.1}x as long as in 16 documents"
+        );
+    }
+
     fn samples() -> Vec<PathBuf> {
         let mut paths: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/samples"))
             .expect("samples directory")
