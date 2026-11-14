@@ -14,6 +14,9 @@ use crate::step::{self, EditOutcome};
 
 const LOG_CAPACITY: usize = 64;
 const MAX_CHANGED_IDS: usize = 64;
+/// Up to this many ids, one substring search per id plus one for leading zeros is cheaper than
+/// visiting every `#`.
+const SEARCH_PER_ID_UP_TO: usize = 8;
 
 /// Identifies a statement index across statement-local edits. A rebuilt index gets a new generation.
 #[derive(Clone, Debug)]
@@ -85,9 +88,11 @@ struct Cached {
     generation: u64,
     revision: u64,
     schema_name: String,
-    /// Statement index and its diagnostics relative to the statement start, sorted by index.
-    entries: Vec<(usize, Vec<Diagnostic>)>,
+    entries: Entries,
 }
+
+/// Statement index and its diagnostics relative to the statement start, sorted by index.
+type Entries = Vec<(usize, Vec<Diagnostic>)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -119,7 +124,7 @@ pub fn collect(
         .take()
         .filter(|cached| cached.generation == edits.generation && cached.schema_name == schema_name)
         .and_then(|cached| edits.since(cached.revision).map(|log| (cached, log)))
-        .map(|(cached, log)| dirty_statements(parsed, text, cached, log));
+        .and_then(|(cached, log)| dirty_statements(parsed, text, cached, log));
     let validate = |index: usize, out: &mut Vec<Diagnostic>| {
         if let Some(instance) =
             crate::document::decode_entity_instance_relative(parsed, text, index)
@@ -178,13 +183,13 @@ pub fn collect(
 }
 
 /// Replays `log` over the cached entries and returns them with the statements to
-/// revalidate, ascending.
+/// revalidate, ascending, or `None` when more ids changed than are worth looking up.
 fn dirty_statements<'a>(
     parsed: &step::Document,
     text: &str,
     cached: Cached,
     log: impl Iterator<Item = &'a LoggedEdit>,
-) -> (Vec<(usize, Vec<Diagnostic>)>, Vec<usize>) {
+) -> Option<(Entries, Vec<usize>)> {
     let mut entries = cached.entries;
     let mut dirty = Vec::new();
     let mut changed_ids = Vec::new();
@@ -205,37 +210,51 @@ fn dirty_statements<'a>(
     changed_ids.sort_unstable();
     changed_ids.dedup();
     if changed_ids.len() > MAX_CHANGED_IDS {
-        dirty = (0..parsed.statements.len()).collect();
-    } else {
-        dirty.extend(referrers(parsed, text, &changed_ids));
+        return None;
     }
+    dirty.extend(referrers(parsed, text, &changed_ids));
     dirty.sort_unstable();
     dirty.dedup();
-    (entries, dirty)
+    Some((entries, dirty))
 }
 
-/// Statements whose text contains `#id` for one of `ids`, a superset of those referring to it.
+/// Statements whose text contains `#` and digits, leading zeros included, naming one of `ids`
+/// (sorted), a superset of those referring to it.
 fn referrers(parsed: &step::Document, text: &str, ids: &[u32]) -> Vec<usize> {
-    let bytes = text.as_bytes();
     let mut statements = Vec::new();
-    for id in ids {
-        let needle = format!("#{id}");
-        for at in memchr::memmem::find_iter(bytes, needle.as_bytes()) {
-            let end = at + needle.len();
-            if bytes.get(end).is_some_and(u8::is_ascii_digit) {
-                continue;
-            }
-            let index = parsed
-                .statements
-                .partition_point(|statement| (statement.span.end as usize) <= at);
-            if parsed
-                .statements
-                .get(index)
-                .is_some_and(|statement| statement.span.start as usize <= at)
-            {
-                statements.push(index);
-            }
+    if ids.is_empty() {
+        return statements;
+    }
+    let bytes = text.as_bytes();
+    let mut visit = |at: usize| {
+        let digits = &bytes[at + 1..];
+        let len = digits
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let id = digits[..len].iter().try_fold(0u32, |id, &digit| {
+            id.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+        });
+        if len == 0 || !id.is_some_and(|id| ids.binary_search(&id).is_ok()) {
+            return;
         }
+        let index = parsed
+            .statements
+            .partition_point(|statement| (statement.span.end as usize) <= at);
+        if parsed
+            .statements
+            .get(index)
+            .is_some_and(|statement| statement.span.start as usize <= at)
+        {
+            statements.push(index);
+        }
+    };
+    if ids.len() <= SEARCH_PER_ID_UP_TO {
+        for needle in ids.iter().map(|id| format!("#{id}")).chain(["#0".into()]) {
+            memchr::memmem::find_iter(bytes, needle.as_bytes()).for_each(&mut visit);
+        }
+    } else {
+        memchr::memchr_iter(b'#', bytes).for_each(visit);
     }
     statements
 }
@@ -774,6 +793,82 @@ mod tests {
             growth < 4.0,
             "16x the cleared statements in one document took {growth:.1}x as long as in 16 documents"
         );
+    }
+
+    #[test]
+    fn a_reference_with_leading_zeros_is_revalidated_when_its_target_changes_type() {
+        let schema = ifc4();
+        let mut document = reloaded_document(
+            "DATA;\n#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCCARTESIANPOINT((1.,0.));\n#3=IFCPOLYLINE((#2,#01));\nENDSEC;\n",
+        );
+        assert_eq!(incremental(&document, &schema).0, []);
+
+        edit(&mut document, "#1=IFCCARTESIANPOINT", "#1=IFCDIRECTION");
+        let (diagnostics, mode) = incremental(&document, &schema);
+
+        assert!(matches!(mode, Mode::Incremental { .. }), "{mode:?}");
+        assert_eq!(diagnostics, full(&document.text, &schema, "IFC4"));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn looking_up_referrers_of_many_ids_costs_about_as_much_as_of_a_few() {
+        let text: String = (1..=200_000u32)
+            .map(|id| format!("#{id}=IFCPOLYLINE((#{},#{}));\n", id + 1, id + 2))
+            .collect();
+        let parsed = step::Document::parse(text.as_bytes(), false);
+        let time = |ids: &[u32]| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(referrers(&parsed, &text, ids));
+                    start.elapsed()
+                })
+                .min()
+                .expect("three runs")
+        };
+        let ids = |count: u32| (0..count).map(|n| 1000 + n * 1500).collect::<Vec<_>>();
+
+        let (few, many) = (time(&ids(16)), time(&ids(128)));
+
+        assert!(many < few * 3, "16 ids {few:?}, 128 ids {many:?}");
+    }
+
+    #[test]
+    fn referrers_include_references_written_with_leading_zeros() {
+        let text = "DATA;\n#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCPOLYLINE((#001));\n#3=IFCPOLYLINE((#10));\nENDSEC;\n";
+        let parsed = step::Document::parse(text.as_bytes(), false);
+        let many: Vec<u32> = std::iter::once(1).chain(1000..1000 + 64).collect();
+
+        for ids in [&[1][..], &many] {
+            let mut found = referrers(&parsed, text, ids);
+            found.sort_unstable();
+            found.dedup();
+            assert_eq!(found, [0, 1], "{} ids", ids.len());
+        }
+    }
+
+    #[test]
+    fn more_changed_ids_than_the_limit_revalidate_everything_as_a_full_run() {
+        let schema = ifc4();
+        let points: String = (1..=MAX_CHANGED_IDS + 1)
+            .map(|id| format!("#{id}=IFCCARTESIANPOINT((0.,0.));\n"))
+            .collect();
+        let mut document = reloaded_document(&format!(
+            "DATA;\n{points}#999=IFCPOLYLINE((#1,#2));\nENDSEC;\n"
+        ));
+        incremental(&document, &schema);
+
+        edit(
+            &mut document,
+            &points,
+            &points.replace("IFCCARTESIANPOINT((0.,0.))", "IFCDIRECTION((0.,1.))"),
+        );
+        let (diagnostics, mode) = incremental(&document, &schema);
+
+        assert_eq!(mode, Mode::Full);
+        assert_eq!(diagnostics, full(&document.text, &schema, "IFC4"));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     }
 
     fn samples() -> Vec<PathBuf> {
