@@ -591,6 +591,13 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+pub(crate) fn typed_name_len(source: &str) -> usize {
+    source
+        .bytes()
+        .position(|byte| !is_identifier_part(byte))
+        .unwrap_or(source.len())
+}
+
 pub fn entity_type_index<'a>(parsed: &'a step::Document, text: &'a str) -> EntityTypeIndex<'a> {
     EntityTypeIndex {
         entity_names_by_id: Vec::new(),
