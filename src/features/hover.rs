@@ -92,7 +92,8 @@ pub fn hover(
     if let Some(node) = document.node_at_position(position)
         && node.kind() == "omitted_value"
     {
-        let context = ast::parameter_context(node, &document.text)?;
+        let root = document.tree.as_ref()?.root_node();
+        let context = ast::parameter_context(root, node, &document.text)?;
         let value = derived_value_hover(document, &context)?;
         let range = document.range_for_offsets(node.start_byte(), node.end_byte())?;
         return Some(Hover {
@@ -193,7 +194,8 @@ fn enum_value_at_position<'a>(
     position: Position,
 ) -> Option<(Range, &'a EntityAttributeDoc, &'a EnumerationTypeDef)> {
     let node = document.node_at_position(position)?;
-    let context = ast::parameter_context(node, &document.text)?;
+    let root = document.tree.as_ref()?.root_node();
+    let context = ast::parameter_context(root, node, &document.text)?;
     let instance = document.entity_instance_by_id(context.instance_id)?;
     let parameter = instance.parameters.get(context.parameter_index)?;
     let attribute = schema
@@ -332,7 +334,8 @@ fn typed_value_name_at_position(
 ) -> Option<(String, tower_lsp::lsp_types::Range)> {
     let offset = document.position_to_offset(position)?;
     let node = document.node_at_position(position)?;
-    let typed_parameter = ast::ancestor_with_kind(node, "typed_parameter")?;
+    let root = document.tree.as_ref()?.root_node();
+    let typed_parameter = ast::ancestor_with_kind(root, node, "typed_parameter")?;
     let entity_name = ast::child_with_kind(typed_parameter, "entity_name")?;
     if offset < entity_name.start_byte() || offset >= entity_name.end_byte() {
         return None;
@@ -778,12 +781,55 @@ mod tests {
             .node_at_position(position_at(text, "*"))
             .expect("omitted value node should exist");
 
-        let context = crate::step::ast::parameter_context(node, &document.text)
+        let root = document
+            .tree
+            .as_ref()
+            .expect("tree should exist")
+            .root_node();
+        let context = crate::step::ast::parameter_context(root, node, &document.text)
             .expect("context should resolve from AST");
 
         assert_eq!(context.instance_id, 15);
         assert_eq!(context.entity_name, "IFCSIUNIT");
         assert_eq!(context.parameter_index, 0);
+    }
+
+    #[test]
+    fn parameter_context_lookup_scales_linearly_with_nesting_depth() {
+        let best_lookup_time = |depth: usize| {
+            let text = format!("#1=IFCWALL({}1{});", "(".repeat(depth), ")".repeat(depth));
+            let document = parse_document(&text);
+            let root = document
+                .tree
+                .as_ref()
+                .expect("tree should exist")
+                .root_node();
+            let node = document
+                .node_at_position(Position::new(0, ("#1=IFCWALL(".len() + depth) as u32))
+                .expect("innermost value node should exist");
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let context = crate::step::ast::parameter_context(root, node, &document.text)
+                        .expect("context should resolve from AST");
+                    let typed_parameter =
+                        crate::step::ast::ancestor_with_kind(root, node, "typed_parameter");
+                    let elapsed = start.elapsed();
+                    assert_eq!(context.parameter_index, 0);
+                    assert_eq!(typed_parameter, None);
+                    elapsed
+                })
+                .min()
+                .expect("three timings")
+        };
+
+        let small = best_lookup_time(2_000);
+        let large = best_lookup_time(8_000);
+        assert!(
+            large < small * 8,
+            "4x the depth took {:.1}x as long ({small:?} -> {large:?})",
+            large.as_secs_f64() / small.as_secs_f64()
+        );
     }
 
     #[test]

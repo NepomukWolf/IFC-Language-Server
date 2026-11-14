@@ -7,8 +7,12 @@ pub struct ParameterContext {
     pub parameter_index: usize,
 }
 
-pub fn parameter_context(node: tree_sitter::Node<'_>, text: &str) -> Option<ParameterContext> {
-    let entity_instance = ancestor_with_kind(node, "entity_instance")?;
+pub fn parameter_context(
+    root: tree_sitter::Node<'_>,
+    node: tree_sitter::Node<'_>,
+    text: &str,
+) -> Option<ParameterContext> {
+    let entity_instance = ancestor_with_kind(root, node, "entity_instance")?;
     let parameter_sequence = entity_parameter_sequence(entity_instance)?;
     let parameter_index = parameter_sequence
         .named_children(&mut parameter_sequence.walk())
@@ -22,16 +26,23 @@ pub fn parameter_context(node: tree_sitter::Node<'_>, text: &str) -> Option<Para
     })
 }
 
-/// Walks up from `node` to the nearest ancestor (or `node` itself) with `expected_kind`.
+/// The nearest ancestor of `node` (or `node` itself) with `expected_kind`. It walks down from
+/// `root` because `Node::parent` searches down from the root on every call.
 pub(crate) fn ancestor_with_kind<'tree>(
-    mut node: tree_sitter::Node<'tree>,
+    root: tree_sitter::Node<'tree>,
+    node: tree_sitter::Node<'tree>,
     expected_kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
+    let mut ancestor = None;
+    let mut current = root;
     loop {
-        if node.kind() == expected_kind {
-            return Some(node);
+        if current.kind() == expected_kind {
+            ancestor = Some(current);
         }
-        node = node.parent()?;
+        if current == node {
+            return ancestor;
+        }
+        current = current.child_with_descendant(node)?;
     }
 }
 
