@@ -793,9 +793,7 @@ fn decode_parameter_values(
             Kind::Omitted => ParameterValue::Omitted { range },
             Kind::Invalid => ParameterValue::Malformed { range },
             Kind::Typed => ParameterValue::Typed {
-                type_name: source[..source.find('(').unwrap_or(source.len())]
-                    .trim_end()
-                    .to_ascii_uppercase(),
+                type_name: source[..typed_name_len(source)].to_ascii_uppercase(),
                 inner: children,
                 range,
             },
