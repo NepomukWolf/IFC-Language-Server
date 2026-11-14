@@ -237,7 +237,7 @@ fn self_entity_id(
     position: Position,
     sorted_defs: &mut Option<Vec<(usize, u32)>>,
 ) -> Option<u32> {
-    if let Some((id, _)) = document.id_token_at_position(position) {
+    if let Some(id) = document.instance_id_at_position(position) {
         return Some(id);
     }
 
