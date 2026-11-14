@@ -355,10 +355,13 @@ fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) ->
                     return (offset + 1, true);
                 }
             }
-            _ if step::definition(bytes, step::trivia(bytes, offset + 1, len), len) => {
-                return (offset + 1, false);
+            _ => {
+                let next = step::trivia(bytes, offset + 1, len);
+                if bytes[offset + 1..next].contains(&b'\n') && step::definition(bytes, next, len) {
+                    return (offset + 1, false);
+                }
+                offset += 1;
             }
-            _ => offset += 1,
         }
     }
     (len, false)
@@ -486,6 +489,18 @@ mod tests {
             index.line_offsets,
             vec![0, at("#2="), at("#3="), at("  #4=")]
         );
+    }
+
+    #[test]
+    fn a_semicolon_and_a_definition_on_one_line_stay_inside_a_string() {
+        let text = "#1=X(';#9=',#2);\n#2=Y(1);";
+        let index = scan_text(text);
+
+        assert_eq!(
+            index.definitions_by_id,
+            vec![(1, 0), (2, text.find("#2=").unwrap())]
+        );
+        assert!(!index.references.contains_key(&9));
     }
 
     #[test]
