@@ -103,32 +103,25 @@ impl Document {
         } else {
             0
         };
+        let mut unclosed_comment = None;
         while p < text.len() {
             p = match closed_trivia(text, p, text.len()) {
                 Ok(p) => p,
                 Err(comment) => {
-                    doc.errors.push(ParseError {
-                        span: Span {
-                            start: comment as u32,
-                            end: comment as u32 + 2,
-                        },
-                        message: "unclosed comment",
-                    });
-                    // The comment may hide the section's `ENDSEC;`.
-                    open_section = false;
+                    unclosed_comment = Some(comment);
                     break;
                 }
             };
             if p == text.len() {
                 break;
             }
+            let errors = doc.errors.len();
+            let frame = frame_end(text, p, text.len());
+            let end = frame.unwrap_or_else(|comment| comment);
             if text[p] == b'#' {
-                let end = frame_end(text, p, text.len());
                 doc.statement(text, p, end);
-                p = end;
             } else {
                 let start = p;
-                let end = frame_end(text, p, text.len());
                 let word_end = text[start..end]
                     .iter()
                     .position(|b| !b.is_ascii_alphanumeric() && *b != b'-' && *b != b'_')
@@ -186,8 +179,24 @@ impl Document {
                     }
                     doc.params.truncate(saved);
                 }
-                p = end;
             }
+            p = end;
+            if let Err(comment) = frame {
+                doc.errors.truncate(errors);
+                unclosed_comment = Some(comment);
+                break;
+            }
+        }
+        if let Some(comment) = unclosed_comment {
+            doc.errors.push(ParseError {
+                span: Span {
+                    start: comment as u32,
+                    end: comment as u32 + 2,
+                },
+                message: "unclosed comment",
+            });
+            // The comment may hide the section's `ENDSEC;`.
+            open_section = false;
         }
         doc.unclosed_section = open_section;
         doc.errors
@@ -349,11 +358,13 @@ impl Document {
             if p == end {
                 break;
             }
-            let next = frame_end(new, p, new.len());
-            if new[p] != b'#' || next > end {
-                *self = Self::parse(new, self.retain);
-                return EditOutcome::Rebuilt;
-            }
+            let next = match frame_end(new, p, new.len()) {
+                Ok(next) if new[p] == b'#' && next <= end => next,
+                _ => {
+                    *self = Self::parse(new, self.retain);
+                    return EditOutcome::Rebuilt;
+                }
+            };
             local.statement(new, p, next);
             p = next;
         }
@@ -861,7 +872,9 @@ fn section_end(text: &[u8], p: usize, end: usize) -> bool {
         && text.get(trivia(text, p + 6, end)) == Some(&b';')
 }
 
-fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
+/// Where the statement at `start` ends, or the start of a comment that opens in it and doesn't
+/// close.
+fn frame_end(text: &[u8], start: usize, end: usize) -> Result<usize, usize> {
     let mut p = start;
     let mut quote = 0;
     let mut next_stop = None;
@@ -900,7 +913,7 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
                 next += 1;
             }
             if definition(text, next, end) || section_end(text, next, end) {
-                return next;
+                return Ok(next);
             }
         }
         if quote != 0 {
@@ -913,23 +926,23 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
             } else if text[p] == b';' {
                 let next = trivia(text, p + 1, end);
                 if text[p + 1..next].contains(&b'\n') && definition(text, next, end) {
-                    return p + 1;
+                    return Ok(p + 1);
                 }
             }
         } else {
             match text[p] {
                 b'\'' | b'"' => quote = text[p],
                 b'/' if text.get(p + 1) == Some(&b'*') => {
-                    p = trivia(text, p, end);
+                    p = closed_trivia(text, p, end)?;
                     continue;
                 }
-                b';' => return p + 1,
+                b';' => return Ok(p + 1),
                 _ => {}
             }
         }
         p += 1;
     }
-    end
+    Ok(end)
 }
 
 #[cfg(test)]
@@ -1204,6 +1217,36 @@ mod tests {
         );
         assert_eq!(doc.statements.len(), 1);
         edits_match_full_parse(text);
+    }
+
+    #[test]
+    fn reports_an_unclosed_comment_inside_a_statement_at_its_opening() {
+        for (text, ids) in [
+            (
+                b"DATA;\n#1=X(1);\n#2=Y(1, /* never closed\n#3=Z(#2);\nENDSEC;\n".as_slice(),
+                [1, 2].as_slice(),
+            ),
+            (
+                b"HEADER;\nFILE_NAME('a', /* never closed\nENDSEC;\nDATA;\n#1=X(1);\nENDSEC;\n",
+                [].as_slice(),
+            ),
+        ] {
+            let doc = Document::parse(text, true);
+            let comment = memchr::memmem::find(text, b"/*").unwrap() as u32;
+            assert_eq!(
+                doc.errors,
+                [ParseError {
+                    span: Span {
+                        start: comment,
+                        end: comment + 2,
+                    },
+                    message: "unclosed comment",
+                }]
+            );
+            assert!(!doc.unclosed_section);
+            assert_eq!(doc.statements.iter().map(|s| s.id).collect::<Vec<_>>(), ids);
+            edits_match_full_parse(text);
+        }
     }
 
     #[test]
