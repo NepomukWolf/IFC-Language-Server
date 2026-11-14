@@ -842,6 +842,9 @@ impl Reader<'_, '_> {
 pub(crate) struct Lookahead {
     comment_close: Option<Found>,
     line_break: Option<Found>,
+    /// The furthest offset a comment search has read up to: past the `*/` it found, or the end
+    /// it searched to.
+    comment_reach: usize,
 }
 
 /// The first match at or after `from` starts at `at`, or nowhere in the text when `at` is `None`.
@@ -856,10 +859,17 @@ impl Lookahead {
     #[cold]
     #[inline(never)]
     fn comment_end(&mut self, text: &[u8], p: usize, end: usize) -> Option<usize> {
-        first_match(&mut self.comment_close, text, p + 2, end, 2, |hay| {
+        let found = first_match(&mut self.comment_close, text, p + 2, end, 2, |hay| {
             memchr::memmem::find(hay, b"*/")
         })
-        .map(|at| at + 2)
+        .map(|at| at + 2);
+        self.comment_reach = self.comment_reach.max(found.unwrap_or(end));
+        found
+    }
+
+    /// The furthest offset comment searches have read up to since the last call.
+    pub(crate) fn take_comment_reach(&mut self) -> usize {
+        std::mem::take(&mut self.comment_reach)
     }
 
     /// Whether a line break lies in `text[from..to]`.

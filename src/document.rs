@@ -30,6 +30,7 @@ pub struct Document {
     pub definitions_by_id: Vec<(u32, usize)>,
     pub references: FxHashMap<u32, Vec<usize>>,
     schema_end: Option<usize>,
+    string_reaches: Vec<(usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -135,6 +136,7 @@ impl Document {
             references,
             schema_name,
             schema_end,
+            string_reaches,
         } = scan_text(&text);
 
         let parsed = Arc::new(step::Document::parse(text.as_bytes(), false));
@@ -149,6 +151,7 @@ impl Document {
             definitions_by_id,
             references,
             schema_end,
+            string_reaches,
         }
     }
 
@@ -164,6 +167,7 @@ impl Document {
             references: std::mem::take(&mut self.references),
             schema_name: self.schema_name.take(),
             schema_end: self.schema_end.take(),
+            string_reaches: std::mem::take(&mut self.string_reaches),
         };
         let result = update(&mut index, &self.text);
         self.line_offsets = index.line_offsets;
@@ -172,6 +176,7 @@ impl Document {
         self.references = index.references;
         self.schema_name = index.schema_name;
         self.schema_end = index.schema_end;
+        self.string_reaches = index.string_reaches;
         result
     }
 
@@ -264,6 +269,7 @@ impl Document {
             references: self.references.clone(),
             schema_name: self.schema_name.clone(),
             schema_end: self.schema_end,
+            string_reaches: self.string_reaches.clone(),
         };
         assert!(
             index == scan_text(&self.text),
