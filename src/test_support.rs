@@ -11,25 +11,23 @@ pub fn build_entity_instances(parsed: Option<&Document>, text: &str) -> EntityIn
 }
 
 /// How much longer `run` takes on one input of size `16 * n` than on sixteen inputs of size `n`
-/// that `prepare` builds, each the best of five timings: about 1 for linear cost, 16 for quadratic.
+/// that `prepare` builds: about 1 for linear cost, 16 for quadratic. Each side is the best of
+/// five timings, taken in turns.
 pub fn growth_on_sixteenfold<T>(
     n: usize,
     prepare: impl Fn(usize) -> T,
     mut run: impl FnMut(&mut T),
 ) -> f64 {
-    let mut best_of_five = |count: usize, size: usize| {
-        (0..5)
-            .map(|_| {
-                let mut inputs: Vec<T> = (0..count).map(|_| prepare(size)).collect();
-                let started = std::time::Instant::now();
-                inputs.iter_mut().for_each(&mut run);
-                started.elapsed()
-            })
-            .min()
-            .expect("five runs")
+    let mut time = |count: usize, size: usize| {
+        let mut inputs: Vec<T> = (0..count).map(|_| prepare(size)).collect();
+        let started = std::time::Instant::now();
+        inputs.iter_mut().for_each(&mut run);
+        started.elapsed()
     };
-    let sixteen_small = best_of_five(16, n);
-    let one_large = best_of_five(1, 16 * n);
+    let (sixteen_small, one_large) = (0..5)
+        .map(|_| (time(16, n), time(1, 16 * n)))
+        .reduce(|best, round| (best.0.min(round.0), best.1.min(round.1)))
+        .expect("five rounds");
     one_large.as_secs_f64() / sixteen_small.as_secs_f64()
 }
 
