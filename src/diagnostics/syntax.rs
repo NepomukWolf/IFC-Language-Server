@@ -12,6 +12,7 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     })
 }
 
+#[derive(Clone, Copy)]
 enum Problem {
     Invalid,
     Missing(char),
@@ -21,6 +22,7 @@ enum Problem {
     MissingSectionEnd,
 }
 
+#[derive(Clone, Copy)]
 struct Located {
     problem: Problem,
     start: usize,
@@ -28,6 +30,7 @@ struct Located {
 }
 
 fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnostic> {
+    let mut last_statement_quote: Option<(usize, Option<Located>)> = None;
     let mut located: Vec<Located> = parsed
         .errors
         .iter()
@@ -41,10 +44,19 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
                 let statement = parsed.statements[index];
                 (start < statement.span.end as usize).then_some(statement)
             });
-            if let Some(offset) = statement
-                .and_then(|statement| unclosed_quote(text.as_bytes(), statement.span.range()))
-            {
-                return unclosed(text, offset, Problem::UnclosedString);
+            if let Some(statement) = statement {
+                let unclosed = match last_statement_quote {
+                    Some((index, unclosed)) if index == statement_index => unclosed,
+                    _ => {
+                        let unclosed = unclosed_quote(text.as_bytes(), statement.span.range())
+                            .map(|offset| unclosed(text, offset, Problem::UnclosedString));
+                        last_statement_quote = Some((statement_index, unclosed));
+                        unclosed
+                    }
+                };
+                if let Some(located) = unclosed {
+                    return located;
+                }
             }
             if error.message == "unclosed string" {
                 return unclosed(text, start, Problem::UnclosedString);
@@ -207,6 +219,26 @@ mod tests {
                     .collect();
                 let parsed = step::Document::parse(text.as_bytes(), false);
                 assert_eq!(parsed.errors.len(), 2 * lines);
+                (parsed, text)
+            },
+            |(parsed, text)| {
+                assert!(!parse_error_diagnostics(parsed, text).is_empty());
+            },
+        );
+        assert!(growth < 8.0, "4x the errors took {growth:.1}x as long");
+    }
+
+    #[test]
+    fn errors_within_one_statement_grow_linearly_with_their_number() {
+        let growth = crate::test_support::growth_on_quadrupling(
+            4_000,
+            |values| {
+                let text = format!(
+                    "DATA;\n#1=IFCFOO({});\nENDSEC;\n",
+                    vec!["@x"; values].join(",")
+                );
+                let parsed = step::Document::parse(text.as_bytes(), false);
+                assert_eq!(parsed.errors.len(), values);
                 (parsed, text)
             },
             |(parsed, text)| {
