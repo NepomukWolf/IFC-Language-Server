@@ -190,6 +190,8 @@ impl Document {
             }
         }
         doc.unclosed_section = open_section;
+        doc.errors
+            .sort_by_key(|e| (e.span.start, e.span.end, e.message));
         doc.reindex();
         doc
     }
@@ -400,7 +402,8 @@ impl Document {
             }
         }
         self.errors.extend(local.errors);
-        self.errors.sort_by_key(|e| e.span.start);
+        self.errors
+            .sort_by_key(|e| (e.span.start, e.span.end, e.message));
         if !same_ids {
             self.reindex();
         }
@@ -931,6 +934,26 @@ mod tests {
         assert_eq!(tape.decode(text, 0), index.decode(text, 0));
         assert_eq!(tape.params[0].next as usize, tape.params.len());
         assert!(tape.params.iter().any(|p| p.kind == Kind::Typed));
+    }
+
+    #[test]
+    fn a_local_edit_orders_errors_like_a_full_parse() {
+        let original = "#1321=IFCMATERIALLAYER(#1319=IFCAXIS2PLACEMENT3D('Concrete Masonry,10303-21;\nFILE_DESCRIPTION ((''), '2;\u{a0}1');\n";
+        let text = original.replacen("(#", "(##", 1);
+        let mut doc = Document::parse(original.as_bytes(), false);
+
+        let outcome = doc.edit(
+            b"",
+            text.as_bytes(),
+            Edit {
+                start: 23,
+                delete_len: 0,
+                insert_len: 1,
+            },
+        );
+
+        assert!(matches!(outcome, EditOutcome::Local { .. }), "{outcome:?}");
+        assert_eq!(doc, Document::parse(text.as_bytes(), false));
     }
 
     #[test]
