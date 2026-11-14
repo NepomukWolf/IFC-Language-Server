@@ -59,6 +59,8 @@ pub struct Document {
     pub params: Vec<Param>,
     pub errors: Vec<ParseError>,
     pub header: Span,
+    /// A `HEADER` or `DATA` section is still open where the text ends.
+    pub unclosed_section: bool,
     pub retain: bool,
 }
 
@@ -92,8 +94,10 @@ impl Document {
             params: Vec::new(),
             errors: Vec::new(),
             header: Span::default(),
+            unclosed_section: false,
             retain,
         };
+        let mut open_section = false;
         let mut p = 0;
         while p < text.len() {
             p = match closed_trivia(text, p, text.len()) {
@@ -106,6 +110,8 @@ impl Document {
                         },
                         message: "unclosed comment",
                     });
+                    // The comment may hide the section's `ENDSEC;`.
+                    open_section = false;
                     break;
                 }
             };
@@ -126,6 +132,11 @@ impl Document {
                 let word = &text[start..word_end];
                 if word.eq_ignore_ascii_case(b"HEADER") {
                     doc.header.start = start as u32;
+                }
+                if word.eq_ignore_ascii_case(b"HEADER") || word.eq_ignore_ascii_case(b"DATA") {
+                    open_section = true;
+                } else if word.eq_ignore_ascii_case(b"ENDSEC") {
+                    open_section = false;
                 }
                 if word.eq_ignore_ascii_case(b"ENDSEC")
                     && doc.header.end == 0
@@ -174,6 +185,7 @@ impl Document {
                 p = end;
             }
         }
+        doc.unclosed_section = open_section;
         doc.reindex();
         doc
     }
@@ -311,6 +323,7 @@ impl Document {
             params: Vec::new(),
             errors: Vec::new(),
             header: self.header,
+            unclosed_section: self.unclosed_section,
             retain: self.retain,
         };
         let mut p = start;
@@ -827,6 +840,13 @@ pub(crate) fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
     p > start && text.get(trivia(text, p, end)) == Some(&b'=')
 }
 
+/// Whether `ENDSEC ;` starts at `p`.
+fn section_end(text: &[u8], p: usize, end: usize) -> bool {
+    text.get(p..p + 6)
+        .is_some_and(|word| word.eq_ignore_ascii_case(b"ENDSEC"))
+        && text.get(trivia(text, p + 6, end)) == Some(&b';')
+}
+
 fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
     let mut p = start;
     let mut quote = 0;
@@ -846,13 +866,14 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
         if p == end {
             break;
         }
-        // A definition-shaped line inside a string is treated as recovery, not string content.
+        // A definition-shaped or `ENDSEC;` line inside a string is treated as recovery, not string
+        // content.
         if text[p] == b'\n' {
             let mut next = p + 1;
             while next < end && matches!(text[next], b' ' | b'\t' | b'\r') {
                 next += 1;
             }
-            if definition(text, next, end) {
+            if definition(text, next, end) || section_end(text, next, end) {
                 return next;
             }
         }
@@ -1112,6 +1133,34 @@ mod tests {
         );
         assert_eq!(doc.statements.len(), 1);
         edits_match_full_parse(text);
+    }
+
+    #[test]
+    fn flags_a_section_left_open_where_the_text_ends() {
+        for (text, open) in [
+            (b"HEADER;\nENDSEC;\nDATA;\n#1=X(1);\n".as_slice(), true),
+            (b"HEADER;\nFILE_SCHEMA(('IFC4'));\n", true),
+            (b"HEADER;\nENDSEC;\nDATA;\n", true),
+            (b"HEADER;\nENDSEC;\nDATA;\n#1=X(1);\nENDSEC;\n", false),
+            (b"HEADER;\nENDSEC;\n", false),
+            (b"", false),
+            (b"DATA;\n#1=X('a);\nENDSEC;\n", false),
+            (b"DATA;\n#1=X(1\n  endsec ;\n", false),
+            (
+                b"HEADER;\nFILE_NAME('a);\nENDSEC;\nDATA;\n#1=X(1);\nENDSEC;\n",
+                false,
+            ),
+            (b"DATA;\n#1=X(1);\n/* ENDSEC;\n", false),
+        ] {
+            assert_eq!(
+                Document::parse(text, false).unclosed_section,
+                open,
+                "{:?}",
+                std::str::from_utf8(text)
+            );
+        }
+        edits_match_full_parse(b"DATA;\n#1=X(1);\n#2=Y('a',2);\n#3=Z(3);\n#4=W(4);\n");
+        edits_match_full_parse(b"DATA;\n#1=X(1);\n#2=Y('a',2);\nENDSEC;\n#3=Z(3);\n#4=W(4);\n");
     }
 
     #[test]

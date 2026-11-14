@@ -13,7 +13,7 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
 }
 
 fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnostic> {
-    parsed
+    let mut diagnostics = parsed
         .errors
         .iter()
         .map(|error| {
@@ -87,7 +87,21 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
                 diagnostics.push(diagnostic);
             }
             diagnostics
-        })
+        });
+    if parsed.unclosed_section {
+        let at = position(
+            text,
+            text.trim_end_matches(|c: char| c.is_ascii_whitespace())
+                .len(),
+        );
+        diagnostics.push(Diagnostic {
+            range: Range::new(at, at),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "Missing `ENDSEC;`".to_string(),
+            ..Default::default()
+        });
+    }
+    diagnostics
 }
 
 /// The first quote of a statement whose quotes, outside comments, never balance.
@@ -305,6 +319,38 @@ mod tests {
                 "Unclosed comment; expected `*/`".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn reports_a_missing_endsec_after_the_last_token() {
+        for (text, line, character) in [
+            ("DATA;\n#1=IFCWALL($);\n\n", 1, 14),
+            ("HEADER;\nFILE_SCHEMA(('IFC4'));\r\n", 1, 22),
+            ("DATA;\n#1=IFCWALL($);\n/* end */ \n", 2, 9),
+        ] {
+            let at = Position::new(line, character);
+            assert_eq!(
+                collect(&DiagnosticSnapshot::from_document(&parse_document(text))),
+                [Diagnostic {
+                    range: Range::new(at, at),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: "Missing `ENDSEC;`".to_string(),
+                    ..Default::default()
+                }],
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_string_before_endsec_leaves_the_section_closed() {
+        let doc = parse_document("DATA;\n#1=IFCWALL('a);\nENDSEC;\nEND-ISO-10303-21;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+
+        assert_eq!(diagnostics, ["Unclosed string; expected `'`"]);
     }
 
     #[test]
