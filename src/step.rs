@@ -350,6 +350,10 @@ impl Document {
         }
         self.params.splice(a as usize..b as usize, local.params);
         let new_len = local.statements.len();
+        let same_ids = self.statements[first..last]
+            .iter()
+            .map(|s| s.id)
+            .eq(local.statements.iter().map(|s| s.id));
         self.statements.splice(first..last, local.statements);
         // A replaced statement's error can end at `old_end` but never past it.
         self.errors
@@ -361,7 +365,9 @@ impl Document {
         }
         self.errors.extend(local.errors);
         self.errors.sort_by_key(|e| e.span.start);
-        self.reindex();
+        if !same_ids {
+            self.reindex();
+        }
         EditOutcome::Local {
             first,
             old_len: last - first,
@@ -969,6 +975,88 @@ mod tests {
             );
             assert_eq!(doc, Document::parse(&text, false));
         }
+    }
+
+    #[test]
+    fn id_lookups_after_an_edit_match_a_full_parse() {
+        let original = b"DATA;\n#1=X(1);\n#2=Y(#1);\n#3=Z(#2);\n#4=W(4);\nENDSEC;".as_slice();
+        for (from, to) in [
+            (b"#2=Y".as_slice(), b"#9=Y".as_slice()),
+            (b"#2=Y(#1);", b"#2=Y(#1);\n#5=V(5);"),
+            (b"\n#2=Y(#1);", b""),
+            (b"#2=Y(#1);\n#3", b"#3=Y(#1);\n#2"),
+            (b"Y(#1)", b"Y(#3)"),
+        ] {
+            let start = original
+                .windows(from.len())
+                .position(|w| w == from)
+                .unwrap();
+            let mut text = original.to_vec();
+            text.splice(start..start + from.len(), to.iter().copied());
+            let mut doc = Document::parse(original, false);
+            let outcome = doc.edit(
+                from,
+                &text,
+                Edit {
+                    start,
+                    delete_len: from.len(),
+                    insert_len: to.len(),
+                },
+            );
+            assert!(matches!(outcome, EditOutcome::Local { .. }));
+            let fresh = Document::parse(&text, false);
+            for id in 0..12 {
+                assert_eq!(
+                    doc.find(id),
+                    fresh.find(id),
+                    "#{id} after {:?}",
+                    String::from_utf8_lossy(to)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_that_keeps_ids_costs_the_same_on_a_larger_document() {
+        let edit_time = |statements: u32| {
+            let mut text = b"DATA;\n".to_vec();
+            for id in 1..=statements {
+                text.extend_from_slice(format!("#{id}=X(1);\n").as_bytes());
+            }
+            text.extend_from_slice(b"ENDSEC;\n");
+            let digit = text.len() - b"1);\nENDSEC;\n".len();
+            let mut doc = Document::parse(&text, false);
+            let fastest = (0..100)
+                .map(|n| {
+                    let (old, new) = if n % 2 == 0 {
+                        (b"1", b"2")
+                    } else {
+                        (b"2", b"1")
+                    };
+                    text[digit] = new[0];
+                    let start = std::time::Instant::now();
+                    doc.edit(
+                        old,
+                        &text,
+                        Edit {
+                            start: digit,
+                            delete_len: 1,
+                            insert_len: 1,
+                        },
+                    );
+                    start.elapsed()
+                })
+                .min()
+                .unwrap();
+            assert_eq!(doc.find(statements), Some(statements as usize - 1));
+            fastest
+        };
+        let small = edit_time(10_000);
+        let large = edit_time(160_000);
+        assert!(
+            large < small * 4,
+            "16x the statements took {large:?} against {small:?}"
+        );
     }
 
     #[test]
