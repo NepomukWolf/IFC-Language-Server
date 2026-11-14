@@ -29,10 +29,13 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
             if let Some(offset) = statement
                 .and_then(|statement| unclosed_quote(text.as_bytes(), statement.span.range()))
             {
-                return unclosed_string_diagnostic(text, offset);
+                return unclosed_diagnostic(text, offset, "Unclosed string; expected `'`");
             }
             if error.message == "unclosed string" {
-                return unclosed_string_diagnostic(text, start);
+                return unclosed_diagnostic(text, start, "Unclosed string; expected `'`");
+            }
+            if error.message == "unclosed comment" {
+                return unclosed_diagnostic(text, start, "Unclosed comment; expected `*/`");
             }
             let missing = match error.message {
                 "expected ;" => Some(';'),
@@ -117,8 +120,8 @@ fn utf16_len(text: &str) -> u32 {
     crate::document::utf16_len(text.as_bytes()) as u32
 }
 
-/// From the opening quote to the end of its line, before any `\r`.
-fn unclosed_string_diagnostic(text: &str, offset: usize) -> Diagnostic {
+/// From the opening delimiter at `offset` to the end of its line, before any `\r`.
+fn unclosed_diagnostic(text: &str, offset: usize, message: &str) -> Diagnostic {
     let start = position(text, offset);
     let line_end = memchr::memchr(b'\n', &text.as_bytes()[offset..])
         .map_or(text.len(), |newline| offset + newline);
@@ -137,7 +140,7 @@ fn unclosed_string_diagnostic(text: &str, offset: usize) -> Diagnostic {
             ),
         ),
         severity: Some(DiagnosticSeverity::ERROR),
-        message: "Unclosed string; expected `'`".to_string(),
+        message: message.to_string(),
         ..Default::default()
     }
 }
@@ -282,6 +285,24 @@ mod tests {
             [(
                 Range::new(Position::new(0, 5), Position::new(0, 14)),
                 "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_an_unclosed_comment_from_its_opening_to_the_end_of_its_line() {
+        let doc =
+            parse_document("DATA;\n#1=IFCWALL($);\n/* never closed\r\n#2=IFCWALL(#3);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(2, 0), Position::new(2, 15)),
+                "Unclosed comment; expected `*/`".to_string()
             )]
         );
     }

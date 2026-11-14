@@ -96,7 +96,19 @@ impl Document {
         };
         let mut p = 0;
         while p < text.len() {
-            p = trivia(text, p, text.len());
+            p = match closed_trivia(text, p, text.len()) {
+                Ok(p) => p,
+                Err(comment) => {
+                    doc.errors.push(ParseError {
+                        span: Span {
+                            start: comment as u32,
+                            end: comment as u32 + 2,
+                        },
+                        message: "unclosed comment",
+                    });
+                    break;
+                }
+            };
             if p == text.len() {
                 break;
             }
@@ -303,7 +315,7 @@ impl Document {
         };
         let mut p = start;
         while p < end {
-            let Some(after_trivia) = closed_trivia(new, p, end) else {
+            let Ok(after_trivia) = closed_trivia(new, p, end) else {
                 *self = Self::parse(new, self.retain);
                 return EditOutcome::Rebuilt;
             };
@@ -787,18 +799,19 @@ fn comment_end(text: &[u8], p: usize, end: usize) -> Option<usize> {
     memchr::memmem::find(&text[p + 2..end], b"*/").map(|n| p + n + 4)
 }
 
-/// `trivia` up to `end`, or `None` when a comment that opens before `end` doesn't close before it.
-fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Option<usize> {
+/// `trivia` up to `end`, or the start of a comment that opens before `end` and doesn't close
+/// before it.
+fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Result<usize, usize> {
     while p < end {
         if text[p].is_ascii_whitespace() {
             p += 1;
         } else if text.get(p..p + 2) == Some(b"/*") {
-            p = comment_end(text, p, end)?;
+            p = comment_end(text, p, end).ok_or(p)?;
         } else {
             break;
         }
     }
-    Some(p)
+    Ok(p)
 }
 
 /// Whether `#<digits> =` starts at `p`.
@@ -1084,6 +1097,21 @@ mod tests {
             large < small * 8,
             "4x the lines took {large:?} against {small:?}"
         );
+    }
+
+    #[test]
+    fn reports_an_unclosed_comment_at_its_opening() {
+        let text = b"DATA;\n#1=X(1);\n/* never closed\n#2=Y(#3);\nENDSEC;\n";
+        let doc = Document::parse(text, true);
+        assert_eq!(
+            doc.errors,
+            [ParseError {
+                span: Span { start: 15, end: 17 },
+                message: "unclosed comment",
+            }]
+        );
+        assert_eq!(doc.statements.len(), 1);
+        edits_match_full_parse(text);
     }
 
     #[test]
