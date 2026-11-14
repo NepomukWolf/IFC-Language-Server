@@ -473,3 +473,118 @@ fn real_selection_ranges_are_local_and_buckets_select_their_first_child() {
         verify(symbol);
     }
 }
+
+fn storey_chain(length: usize) -> Document {
+    let mut text = String::from("DATA;\n");
+    for id in 1..=length {
+        text.push_str(&format!(
+            "#{id}=IFCBUILDINGSTOREY('g',$,'L',$,$,$,$,$,$);\n"
+        ));
+    }
+    for id in 2..=length {
+        text.push_str(&format!(
+            "#{}=IFCRELAGGREGATES('g',$,$,$,#{},(#{id}));\n",
+            length + id,
+            id - 1
+        ));
+    }
+    text.push_str("ENDSEC;\n");
+    parse(&text)
+}
+
+fn depth_and_names(symbols: &[DocumentSymbol]) -> (usize, Vec<String>) {
+    let mut depth = 0;
+    let mut names = Vec::new();
+    let mut pending: Vec<(&DocumentSymbol, usize)> = symbols.iter().rev().map(|s| (s, 1)).collect();
+    while let Some((symbol, level)) = pending.pop() {
+        depth = depth.max(level);
+        names.push(symbol.name.clone());
+        pending.extend(
+            symbol
+                .children
+                .iter()
+                .flatten()
+                .rev()
+                .map(|c| (c, level + 1)),
+        );
+    }
+    (depth, names)
+}
+
+fn storey_names(ids: std::ops::RangeInclusive<usize>) -> Vec<String> {
+    ids.map(|id| format!("IFCBUILDINGSTOREY #{id}")).collect()
+}
+
+#[test]
+fn a_chain_deeper_than_the_limit_is_flat_below_it_and_keeps_every_instance() {
+    let length = 50_000;
+    let symbols = nested_symbols(&storey_chain(length));
+    let (depth, names) = depth_and_names(&symbols);
+    assert_eq!(depth, MAX_OUTLINE_DEPTH);
+    assert_eq!(names, storey_names(1..=length));
+
+    let mut last_nested = &symbols[0];
+    for _ in 2..MAX_OUTLINE_DEPTH {
+        last_nested = &last_nested.children.as_ref().unwrap()[0];
+    }
+    let flat: Vec<&str> = last_nested
+        .children
+        .iter()
+        .flatten()
+        .map(|child| child.name.as_str())
+        .collect();
+    assert_eq!(flat, storey_names(MAX_OUTLINE_DEPTH..=length));
+}
+
+#[test]
+fn a_chain_as_deep_as_the_limit_nests_fully() {
+    for length in [MAX_OUTLINE_DEPTH - 1, MAX_OUTLINE_DEPTH] {
+        let symbols = nested_symbols(&storey_chain(length));
+        let (depth, names) = depth_and_names(&symbols);
+        assert_eq!(depth, length);
+        assert_eq!(names, storey_names(1..=length));
+    }
+}
+
+fn growth_on_sixteenfold<T>(
+    n: usize,
+    prepare: impl Fn(usize) -> T,
+    mut run: impl FnMut(&mut T),
+) -> f64 {
+    let mut best_of_five = |count: usize, size: usize| {
+        (0..5)
+            .map(|_| {
+                let mut inputs: Vec<T> = (0..count).map(|_| prepare(size)).collect();
+                let started = std::time::Instant::now();
+                inputs.iter_mut().for_each(&mut run);
+                started.elapsed()
+            })
+            .min()
+            .expect("five runs")
+    };
+    let sixteen_small = best_of_five(16, n);
+    let one_large = best_of_five(1, 16 * n);
+    one_large.as_secs_f64() / sixteen_small.as_secs_f64()
+}
+
+#[test]
+fn outline_time_grows_linearly_with_chain_length() {
+    let schema = schema();
+    let growth = growth_on_sixteenfold(
+        500,
+        |length| {
+            let doc = storey_chain(length);
+            let instances = build_entity_instances(doc.tree.as_ref(), &doc.text);
+            (doc, instances)
+        },
+        |(doc, instances)| {
+            assert!(
+                document_symbols(&doc.text, instances, doc.ast_skipped, Some(&schema)).is_some()
+            );
+        },
+    );
+    assert!(
+        growth < 4.0,
+        "a 16x longer chain took {growth:.1}x as long as 16 short ones"
+    );
+}
