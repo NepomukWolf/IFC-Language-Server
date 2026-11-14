@@ -945,7 +945,7 @@ pub(crate) fn definition(text: &[u8], mut p: usize, end: usize, ahead: &mut Look
 }
 
 /// Whether `ENDSEC ;` starts at `p`.
-fn section_end(text: &[u8], p: usize, end: usize, ahead: &mut Lookahead) -> bool {
+pub(crate) fn section_end(text: &[u8], p: usize, end: usize, ahead: &mut Lookahead) -> bool {
     text.get(p..p + 6)
         .is_some_and(|word| word.eq_ignore_ascii_case(b"ENDSEC"))
         && text.get(trivia(text, p + 6, end, ahead)) == Some(&b';')
