@@ -795,6 +795,32 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
+    #[test]
+    fn datatype_validator_reads_the_type_name_before_whitespace_and_comments() {
+        let schema = schema_from(
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcLabel = STRING(255);
+              END_TYPE;
+              TYPE IfcValue = SELECT (IfcLabel);
+              END_TYPE;
+              ENTITY IfcProp;
+                NominalValue : IfcValue;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        );
+        let doc = parse_document(concat!(
+            "#1=IFCPROP(IFCLABEL('x'));\n",
+            "#2=IFCPROP(IFCLABEL ('x'));\n",
+            "#3=IFCPROP(IFCLABEL/*c*/('x'));\n",
+            "#4=IFCPROP(IFCLABEL/*(*/('x'));\n",
+        ));
+        let diagnostics = collect(&doc, &schema, None);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
     fn select_schema() -> SchemaDoc {
         schema_from(
             r#"
