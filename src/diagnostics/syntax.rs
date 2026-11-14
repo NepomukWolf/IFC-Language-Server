@@ -211,12 +211,10 @@ mod tests {
 
     #[test]
     fn locating_errors_grows_linearly_with_their_number() {
-        let growth = crate::test_support::growth_on_quadrupling(
+        let growth = crate::test_support::growth_on_sixteenfold(
             2_500,
             |lines| {
-                let text: String = (1..=lines)
-                    .map(|id| format!("#{id}=IFCFOO('{:40}',(;\n", ""))
-                    .collect();
+                let text: String = (1..=lines).map(|id| format!("#{id}=IFCFOO((;\n")).collect();
                 let parsed = step::Document::parse(text.as_bytes(), false);
                 assert_eq!(parsed.errors.len(), 2 * lines);
                 (parsed, text)
@@ -225,13 +223,16 @@ mod tests {
                 assert!(!parse_error_diagnostics(parsed, text).is_empty());
             },
         );
-        assert!(growth < 8.0, "4x the errors took {growth:.1}x as long");
+        assert!(
+            growth < 4.0,
+            "16x the errors in one input took {growth:.1}x as long as in 16 inputs"
+        );
     }
 
     #[test]
     fn errors_within_one_statement_grow_linearly_with_their_number() {
-        let growth = crate::test_support::growth_on_quadrupling(
-            4_000,
+        let growth = crate::test_support::growth_on_sixteenfold(
+            2_000,
             |values| {
                 let text = format!(
                     "DATA;\n#1=IFCFOO({});\nENDSEC;\n",
@@ -245,7 +246,10 @@ mod tests {
                 assert!(!parse_error_diagnostics(parsed, text).is_empty());
             },
         );
-        assert!(growth < 8.0, "4x the errors took {growth:.1}x as long");
+        assert!(
+            growth < 4.0,
+            "16x the errors in one input took {growth:.1}x as long as in 16 inputs"
+        );
     }
 
     #[test]
