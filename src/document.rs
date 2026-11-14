@@ -667,12 +667,13 @@ fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInsta
 
         // The grammar never nests entity instances, so only error recovery can put one inside another.
         if (!is_entity_instance || node.has_error()) && cursor.goto_first_child() {
-            traverse(cursor, text, instances);
-            cursor.goto_parent();
+            continue;
         }
 
-        if !cursor.goto_next_sibling() {
-            break;
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
         }
     }
 }
@@ -1460,5 +1461,23 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn discovers_entities_after_errors_inside_deeply_nested_values() {
+        for depth in [4_000, 100_000] {
+            let document = parse_document(&format!(
+                "DATA;\n#1=IFCWALL({}%{});\n#2=IFCWALL($);\nENDSEC;\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            ));
+            let ids: Vec<_> = instances(&document)
+                .instances
+                .iter()
+                .map(|instance| instance.id)
+                .collect();
+
+            assert_eq!(ids, [Some(1), Some(2)]);
+        }
     }
 }
