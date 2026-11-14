@@ -31,12 +31,13 @@ fn collect_error_nodes(
         // that tree-sitter creates for a token the lexer cannot recognize. `has_error` is also
         // true on every ancestor of a MISSING node.
         if !node.is_error() && node.has_error() && cursor.goto_first_child() {
-            collect_error_nodes(cursor, diagnostics);
-            cursor.goto_parent();
+            continue;
         }
 
-        if !cursor.goto_next_sibling() {
-            break;
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
         }
     }
 }
@@ -159,5 +160,28 @@ mod tests {
                 ((6, 16, 6, 18), "Invalid IFC STEP syntax".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn reports_errors_inside_deeply_nested_values() {
+        for depth in [4_000, 100_000] {
+            let text = format!(
+                "DATA;\n#1=IFCWALL({}%{});\nENDSEC;\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            let diagnostics = collect(&DiagnosticSnapshot::from_document(&parse_document(&text)));
+
+            let start = ("#1=IFCWALL(".len() + depth) as u32;
+            assert_eq!(
+                diagnostics,
+                vec![Diagnostic {
+                    range: Range::new(Position::new(1, start), Position::new(1, start + 1)),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: "Invalid IFC STEP syntax".to_string(),
+                    ..Default::default()
+                }]
+            );
+        }
     }
 }
