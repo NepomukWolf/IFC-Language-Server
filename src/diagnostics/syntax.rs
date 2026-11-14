@@ -12,8 +12,23 @@ pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
     })
 }
 
+enum Problem {
+    Invalid,
+    Missing(char),
+    TooDeep,
+    UnclosedString,
+    UnclosedComment,
+    MissingSectionEnd,
+}
+
+struct Located {
+    problem: Problem,
+    start: usize,
+    end: usize,
+}
+
 fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnostic> {
-    let mut diagnostics = parsed
+    let mut located: Vec<Located> = parsed
         .errors
         .iter()
         .map(|error| {
@@ -29,13 +44,13 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
             if let Some(offset) = statement
                 .and_then(|statement| unclosed_quote(text.as_bytes(), statement.span.range()))
             {
-                return unclosed_diagnostic(text, offset, "Unclosed string; expected `'`");
+                return unclosed(text, offset, Problem::UnclosedString);
             }
             if error.message == "unclosed string" {
-                return unclosed_diagnostic(text, start, "Unclosed string; expected `'`");
+                return unclosed(text, start, Problem::UnclosedString);
             }
             if error.message == "unclosed comment" {
-                return unclosed_diagnostic(text, start, "Unclosed comment; expected `*/`");
+                return unclosed(text, start, Problem::UnclosedComment);
             }
             let missing = match error.message {
                 "expected ;" => Some(';'),
@@ -45,23 +60,17 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
             if let Some(token) = missing
                 && start == end
             {
-                let at = position(text, start);
-                return Diagnostic {
-                    range: Range::new(at, at),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("Missing `{token}`"),
-                    ..Default::default()
+                return Located {
+                    problem: Problem::Missing(token),
+                    start,
+                    end,
                 };
             }
             if error.message == step::NESTING_TOO_DEEP {
-                return Diagnostic {
-                    range: Range::new(position(text, start), position(text, end)),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!(
-                        "Values nested more than {} levels deep are not supported",
-                        step::MAX_NESTING
-                    ),
-                    ..Default::default()
+                return Located {
+                    problem: Problem::TooDeep,
+                    start,
+                    end,
                 };
             }
             if let Some(statement) = statement
@@ -75,33 +84,61 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
             while !text.is_char_boundary(end) {
                 end += 1;
             }
-            Diagnostic {
-                range: Range::new(position(text, start), position(text, end)),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: "Invalid IFC STEP syntax".to_string(),
-                ..Default::default()
+            Located {
+                problem: Problem::Invalid,
+                start,
+                end,
             }
+        })
+        .collect();
+    if parsed.unclosed_section {
+        let at = text
+            .trim_end_matches(|c: char| c.is_ascii_whitespace())
+            .len();
+        located.push(Located {
+            problem: Problem::MissingSectionEnd,
+            start: at,
+            end: at,
+        });
+    }
+
+    let offsets: Vec<usize> = located
+        .iter()
+        .flat_map(|located| [located.start, located.end])
+        .collect();
+    let mut order: Vec<usize> = (0..offsets.len()).collect();
+    order.sort_unstable_by_key(|&slot| offsets[slot]);
+    let mut positions = vec![Position::default(); offsets.len()];
+    let ascending = crate::document::positions_of(text, order.iter().map(|&slot| offsets[slot]));
+    for (&slot, position) in order.iter().zip(ascending) {
+        positions[slot] = position;
+    }
+
+    located
+        .iter()
+        .zip(positions.chunks_exact(2))
+        .map(|(located, range)| Diagnostic {
+            range: Range::new(range[0], range[1]),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: match located.problem {
+                Problem::Invalid => "Invalid IFC STEP syntax".to_string(),
+                Problem::Missing(token) => format!("Missing `{token}`"),
+                Problem::TooDeep => format!(
+                    "Values nested more than {} levels deep are not supported",
+                    step::MAX_NESTING
+                ),
+                Problem::UnclosedString => "Unclosed string; expected `'`".to_string(),
+                Problem::UnclosedComment => "Unclosed comment; expected `*/`".to_string(),
+                Problem::MissingSectionEnd => "Missing `ENDSEC;`".to_string(),
+            },
+            ..Default::default()
         })
         .fold(Vec::new(), |mut diagnostics, diagnostic| {
             if diagnostics.last() != Some(&diagnostic) {
                 diagnostics.push(diagnostic);
             }
             diagnostics
-        });
-    if parsed.unclosed_section {
-        let at = position(
-            text,
-            text.trim_end_matches(|c: char| c.is_ascii_whitespace())
-                .len(),
-        );
-        diagnostics.push(Diagnostic {
-            range: Range::new(at, at),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: "Missing `ENDSEC;`".to_string(),
-            ..Default::default()
-        });
-    }
-    diagnostics
+        })
 }
 
 /// The first quote of a statement whose quotes, outside comments, never balance.
@@ -124,19 +161,8 @@ fn unclosed_quote(text: &[u8], span: std::ops::Range<usize>) -> Option<usize> {
     quoted.then_some(first).flatten()
 }
 
-fn position(text: &str, offset: usize) -> Position {
-    let line = memchr::memchr_iter(b'\n', &text.as_bytes()[..offset]).count() as u32;
-    let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
-    Position::new(line, utf16_len(&text[line_start..offset]))
-}
-
-fn utf16_len(text: &str) -> u32 {
-    crate::document::utf16_len(text.as_bytes()) as u32
-}
-
 /// From the opening delimiter at `offset` to the end of its line, before any `\r`.
-fn unclosed_diagnostic(text: &str, offset: usize, message: &str) -> Diagnostic {
-    let start = position(text, offset);
+fn unclosed(text: &str, offset: usize, problem: Problem) -> Located {
     let line_end = memchr::memchr(b'\n', &text.as_bytes()[offset..])
         .map_or(text.len(), |newline| offset + newline);
     let line_end = if text[..line_end].ends_with('\r') {
@@ -144,18 +170,10 @@ fn unclosed_diagnostic(text: &str, offset: usize, message: &str) -> Diagnostic {
     } else {
         line_end
     };
-
-    Diagnostic {
-        range: Range::new(
-            start,
-            Position::new(
-                start.line,
-                start.character + utf16_len(&text[offset..line_end]),
-            ),
-        ),
-        severity: Some(DiagnosticSeverity::ERROR),
-        message: message.to_string(),
-        ..Default::default()
+    Located {
+        problem,
+        start: offset,
+        end: line_end,
     }
 }
 
@@ -177,6 +195,25 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].range.start, Position::new(2, 0));
         assert_eq!(diagnostics[0].range.end, Position::new(2, 5));
+    }
+
+    #[test]
+    fn locating_errors_grows_linearly_with_their_number() {
+        let growth = crate::test_support::growth_on_quadrupling(
+            2_500,
+            |lines| {
+                let text: String = (1..=lines)
+                    .map(|id| format!("#{id}=IFCFOO('{:40}',(;\n", ""))
+                    .collect();
+                let parsed = step::Document::parse(text.as_bytes(), false);
+                assert_eq!(parsed.errors.len(), 2 * lines);
+                (parsed, text)
+            },
+            |(parsed, text)| {
+                assert!(!parse_error_diagnostics(parsed, text).is_empty());
+            },
+        );
+        assert!(growth < 8.0, "4x the errors took {growth:.1}x as long");
     }
 
     #[test]
