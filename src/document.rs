@@ -11,6 +11,7 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree, TreeCursor};
 use crate::document_index::{TextIndex, index_neutral_edit, scan_text};
 
 pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
+pub const MAX_PARAMETER_NESTING: usize = 256;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyChangeError {
@@ -44,6 +45,9 @@ pub struct EntityInstanceInfo {
     pub entity_range: Range,
     pub parameter_list_range: Option<Range>,
     pub parameters: Vec<ParameterValue>,
+    /// The first value nested more than `MAX_PARAMETER_NESTING` levels deep, kept as
+    /// `ParameterValue::Unknown`.
+    pub too_deeply_nested: Option<Range>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -681,6 +685,7 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
     let mut entity_name_range = None;
     let mut parameter_list_range = None;
     let mut parameters = Vec::new();
+    let mut too_deeply_nested = None;
 
     for child in node.children(&mut child_cursor) {
         match child.kind() {
@@ -696,7 +701,7 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
             }
             "parameter_list" => {
                 parameter_list_range = Some(node_range(&child));
-                parameters = parse_parameter_list(child, text);
+                parameters = parse_parameter_list(child, text, 1, &mut too_deeply_nested);
             }
             _ => {}
         }
@@ -710,10 +715,16 @@ fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInf
         entity_range: node_range(&node),
         parameter_list_range,
         parameters,
+        too_deeply_nested,
     })
 }
 
-fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
+fn parse_parameter_list(
+    node: Node<'_>,
+    text: &str,
+    depth: usize,
+    too_deeply_nested: &mut Option<Range>,
+) -> Vec<ParameterValue> {
     let mut cursor = node.walk();
     let Some(sequence) = node
         .children(&mut cursor)
@@ -726,11 +737,16 @@ fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
     sequence
         .children(&mut seq_cursor)
         .filter(|child| child.kind() == "parameter")
-        .map(|parameter| parse_parameter(parameter, text))
+        .map(|parameter| parse_parameter(parameter, text, depth, too_deeply_nested))
         .collect()
 }
 
-fn parse_parameter(node: Node<'_>, text: &str) -> ParameterValue {
+fn parse_parameter(
+    node: Node<'_>,
+    text: &str,
+    depth: usize,
+    too_deeply_nested: &mut Option<Range>,
+) -> ParameterValue {
     let mut cursor = node.walk();
     let Some(value_node) = node.children(&mut cursor).find(|child| child.is_named()) else {
         return ParameterValue::Unknown {
@@ -738,10 +754,15 @@ fn parse_parameter(node: Node<'_>, text: &str) -> ParameterValue {
         };
     };
 
-    parse_parameter_value(value_node, text)
+    parse_parameter_value(value_node, text, depth, too_deeply_nested)
 }
 
-fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
+fn parse_parameter_value(
+    node: Node<'_>,
+    text: &str,
+    depth: usize,
+    too_deeply_nested: &mut Option<Range>,
+) -> ParameterValue {
     match node.kind() {
         "reference" => {
             let range = node_range(&node);
@@ -779,6 +800,11 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
         "omitted_value" => ParameterValue::Omitted {
             range: node_range(&node),
         },
+        "list" | "typed_parameter" if depth >= MAX_PARAMETER_NESTING => {
+            let range = node_range(&node);
+            too_deeply_nested.get_or_insert(range);
+            ParameterValue::Unknown { range }
+        }
         "list" => {
             let range = node_range(&node);
             let mut cursor = node.walk();
@@ -790,7 +816,9 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                     sequence
                         .children(&mut seq_cursor)
                         .filter(|child| child.kind() == "parameter")
-                        .map(|parameter| parse_parameter(parameter, text))
+                        .map(|parameter| {
+                            parse_parameter(parameter, text, depth + 1, too_deeply_nested)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -810,7 +838,9 @@ fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
                             .ok()
                             .map(|name| name.to_ascii_uppercase());
                     }
-                    "parameter_list" => inner = parse_parameter_list(child, text),
+                    "parameter_list" => {
+                        inner = parse_parameter_list(child, text, depth + 1, too_deeply_nested)
+                    }
                     _ => {}
                 }
             }
@@ -1370,5 +1400,65 @@ mod tests {
             .collect();
 
         assert_eq!(ids, (1..=7).map(Some).collect::<Vec<_>>());
+    }
+
+    fn list_nesting(value: &ParameterValue) -> (usize, &ParameterValue) {
+        let mut levels = 0;
+        let mut value = value;
+        while let ParameterValue::List { items, .. } = value {
+            levels += 1;
+            value = &items[0];
+        }
+        (levels, value)
+    }
+
+    #[test]
+    fn keeps_values_nested_beyond_the_limit_as_unknown() {
+        for depth in [4_000, 100_000] {
+            let document = parse_document(&format!(
+                "#1=IFCWALL({}1{});",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            ));
+            let instances = instances(&document);
+            let instance = &instances.instances[0];
+
+            let start = ("#1=IFCWALL(".len() + MAX_PARAMETER_NESTING - 1) as u32;
+            let end = start + 2 * (depth - MAX_PARAMETER_NESTING + 1) as u32 + 1;
+            let too_deep = Range::new(Position::new(0, start), Position::new(0, end));
+            assert_eq!(instance.too_deeply_nested, Some(too_deep));
+            assert_eq!(
+                list_nesting(&instance.parameters[0]),
+                (
+                    MAX_PARAMETER_NESTING - 1,
+                    &ParameterValue::Unknown { range: too_deep }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn parses_values_nested_up_to_the_limit() {
+        let depth = MAX_PARAMETER_NESTING - 1;
+        let document = parse_document(&format!(
+            "#1=IFCWALL({}1{});",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        ));
+        let instances = instances(&document);
+        let instance = &instances.instances[0];
+
+        let column = ("#1=IFCWALL(".len() + depth) as u32;
+        assert_eq!(instance.too_deeply_nested, None);
+        assert_eq!(
+            list_nesting(&instance.parameters[0]),
+            (
+                depth,
+                &ParameterValue::Number {
+                    text: "1".to_string(),
+                    range: Range::new(Position::new(0, column), Position::new(0, column + 1)),
+                }
+            )
+        );
     }
 }

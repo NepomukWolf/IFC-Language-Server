@@ -7,7 +7,9 @@ use std::fmt;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{
+    EntityInstanceCollection, EntityInstanceInfo, MAX_PARAMETER_NESTING, ParameterValue,
+};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
@@ -21,6 +23,17 @@ pub fn collect_with_schema_name(
     let mut diagnostics = Vec::new();
 
     for instance in &instances.instances {
+        if let Some(range) = instance.too_deeply_nested {
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!(
+                    "Values nested more than {MAX_PARAMETER_NESTING} levels deep are not supported"
+                ),
+                ..Default::default()
+            });
+        }
+
         let Some(entity) = schema.entity(&instance.entity_name) else {
             diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
             continue;
@@ -538,6 +551,37 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
+    #[test]
+    fn datatype_validator_reports_values_nested_beyond_the_limit() {
+        let nested = |depth: usize| {
+            let doc = parse_document(&format!(
+                "#1=IFCWALL('gid',{}.MOVABLE.{});",
+                "IFCWALLTYPEENUM(".repeat(depth),
+                ")".repeat(depth)
+            ));
+            collect_with_schema_name(&instances(&doc), &test_schema(), None)
+                .into_iter()
+                .map(|diagnostic| (diagnostic.range.start.character, diagnostic.message))
+                .collect::<Vec<_>>()
+        };
+        let too_deep_start = ("#1=IFCWALL('gid',".len()
+            + "IFCWALLTYPEENUM(".len() * (MAX_PARAMETER_NESTING - 1))
+            as u32;
+        let below_limit = nested(MAX_PARAMETER_NESTING - 1);
+
+        assert_eq!(below_limit.len(), 1, "{below_limit:?}");
+        assert_eq!(
+            nested(MAX_PARAMETER_NESTING),
+            [(
+                too_deep_start,
+                "Values nested more than 256 levels deep are not supported".to_string()
+            )]
+            .into_iter()
+            .chain(below_limit)
+            .collect::<Vec<_>>()
+        );
+    }
+
     /// Test that the datatype validator reports unresolved references.
     #[test]
     fn datatype_validator_reports_unresolved_reference() {
@@ -575,6 +619,7 @@ mod tests {
                     },
                 },
             ],
+            too_deeply_nested: None,
         }]);
 
         let schema = schema_from(
