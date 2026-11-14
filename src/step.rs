@@ -859,10 +859,14 @@ impl Lookahead {
     #[cold]
     #[inline(never)]
     fn comment_end(&mut self, text: &[u8], p: usize, end: usize) -> Option<usize> {
-        let found = first_match(&mut self.comment_close, text, p + 2, end, 2, |hay| {
-            memchr::memmem::find(hay, b"*/")
-        })
-        .map(|at| at + 2);
+        let found = (p + 2 <= end)
+            .then(|| {
+                first_match(&mut self.comment_close, text, p + 2, end, 2, |hay| {
+                    memchr::memmem::find(hay, b"*/")
+                })
+            })
+            .flatten()
+            .map(|at| at + 2);
         self.comment_reach = self.comment_reach.max(found.unwrap_or(end));
         found
     }
@@ -1122,6 +1126,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_comment_opening_cut_by_the_end_of_the_range_is_unclosed_within_it() {
+        let text = b" /*x*/";
+        assert_eq!(trivia(text, 0, 2, &mut Lookahead::default()), 2);
+        assert_eq!(closed_trivia(text, 0, 2, &mut Lookahead::default()), Err(1));
     }
 
     #[test]
