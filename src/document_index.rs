@@ -209,32 +209,44 @@ pub fn edit_text_index(
     old_window.extend_from_slice(removed);
     old_window.extend_from_slice(&bytes[new_edit_end..new_stop]);
     let old_stop = anchor + old_window.len();
-    let mut old_lines = Vec::new();
     let mut old_tokens = Vec::new();
-    scan(&old_window, 0, usize::MAX, &mut old_lines, None, |token| {
-        old_tokens.push(token);
-        old_tokens.len() <= MAX_REPLACED_TOKENS
-    });
-    if old_tokens.len() > MAX_REPLACED_TOKENS {
-        return false;
+    for at in memchr::memchr_iter(b'#', &old_window) {
+        let Some((id, _)) = parse_id(&old_window, at) else {
+            continue;
+        };
+        let offset = anchor + at;
+        if index
+            .references
+            .get(&id)
+            .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
+        {
+            old_tokens.push((id, offset));
+            if old_tokens.len() > MAX_REPLACED_TOKENS {
+                return false;
+            }
+        }
     }
+    let lines_from = index
+        .line_offsets
+        .partition_point(|&offset| offset <= anchor);
+    let lines_to = index
+        .line_offsets
+        .partition_point(|&offset| offset <= old_stop);
 
     let mut touched: Vec<u32> = old_tokens
         .iter()
-        .filter(|token| token.definition)
-        .map(|token| token.id)
+        .filter(|&&(id, offset)| index.definitions.get(&id) == Some(&offset))
+        .map(|&(id, _)| id)
         .collect();
-    let mut old_ids: Vec<u32> = old_tokens.iter().map(|token| token.id).collect();
+    let mut old_ids: Vec<u32> = old_tokens.iter().map(|&(id, _)| id).collect();
     old_ids.sort_unstable();
     old_ids.dedup();
     for id in old_ids {
-        let offsets = index
-            .references
-            .get_mut(&id)
-            .expect("an old token is indexed");
-        offsets.retain(|&offset| offset < anchor || offset >= old_stop);
-        if offsets.is_empty() {
-            index.references.remove(&id);
+        if let Some(offsets) = index.references.get_mut(&id) {
+            offsets.retain(|&offset| offset < anchor || offset >= old_stop);
+            if offsets.is_empty() {
+                index.references.remove(&id);
+            }
         }
     }
     let shift = |offset: &mut usize| {
@@ -252,10 +264,6 @@ pub fn edit_text_index(
         index.references.values_mut().flatten().for_each(shift);
     }
 
-    let lines_from = index
-        .line_offsets
-        .partition_point(|&offset| offset <= anchor);
-    let lines_to = lines_from + old_lines.len();
     index.line_offsets.splice(lines_from..lines_to, new_lines);
 
     touched.extend(
@@ -557,6 +565,34 @@ mod tests {
         assert!(index == scan_text(&without_quote));
         assert!(edit_text_index(&mut index, &text, quote, b"", 1));
         assert!(index == scan_text(&text));
+    }
+
+    /// Applies an edit as the document does, rescanning in full when the local edit declines it.
+    fn edit_matches_scan(text: &str, start: usize, end: usize, replacement: &str) {
+        let mut index = scan_text(text);
+        let mut edited = text.to_string();
+        edited.replace_range(start..end, replacement);
+        let removed = &text.as_bytes()[start..end];
+        if !edit_text_index(&mut index, &edited, start, removed, replacement.len()) {
+            index = rescan_text(&edited, index);
+        }
+        assert_eq!(
+            index,
+            scan_text(&edited),
+            "{text:?} {start}..{end} {replacement:?}"
+        );
+    }
+
+    #[test]
+    fn closing_a_comment_before_an_id_the_old_text_hid_in_it() {
+        let text = "FILE_SCHEMA(('IFC4'));ENDSEC;\n\
+                    #4170=IFCCARTESIANPOFNT'((0.,0.,0.));\n\
+                    /*#4171=IFC'CARTESIANT((0.,0.,0ENDSEC;\n\
+                    #4174=IFCCARTESIANPOFNT'((0.,0.,0.));\n\
+                    /* \u{1D538} \u{1D538} */\n\
+                    #4222=IFCCARTESIANPOFNT'((0.,0.,0.));";
+        let at = text.find("#4174").unwrap();
+        edit_matches_scan(text, at, at, "*/");
     }
 
     #[test]
