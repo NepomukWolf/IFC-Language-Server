@@ -10,7 +10,7 @@ pub fn document_highlight(
     document: &Document,
     position: Position,
 ) -> Option<Vec<DocumentHighlight>> {
-    let (id, _) = document.id_token_at_position(position)?;
+    let id = document.instance_id_at_position(position)?;
     let offsets = document.references.get(&id)?;
 
     let mut highlights = Vec::new();

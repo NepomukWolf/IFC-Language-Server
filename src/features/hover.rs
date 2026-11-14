@@ -578,6 +578,21 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_a_duplicated_definitions_entity_name_does_not_show_the_other_definition() {
+        let text = "#1=IFCCARTESIANPOINT((0.,0.));#1=IFCWALL($);";
+        let document = parse_document(text);
+
+        let hover = hover(
+            &document,
+            position_at(text, "IFCCARTESIANPOINT"),
+            &empty_schema_docs(),
+            None,
+        );
+
+        assert!(hover.is_none(), "{hover:?}");
+    }
+
+    #[test]
     fn hover_decodes_only_the_statements_it_reads() {
         let mut text = String::from("DATA;\n");
         for id in 1..=2000 {

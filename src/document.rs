@@ -394,18 +394,25 @@ impl Document {
 
     pub fn id_token_at_position(&self, position: Position) -> Option<(u32, usize)> {
         let offset = self.position_to_offset(position)?;
-        if let Some((start, _, id)) = self.id_token_at_offset(offset)
-            && self
-                .references
-                .get(&id)
-                .is_some_and(|offsets| offsets.contains(&start))
-        {
-            return Some((id, start));
-        }
+        let (start, _, id) = self.id_token_at_offset(offset)?;
+        self.occurs(id, start).then_some((id, start))
+    }
 
+    /// The instance under the cursor: an id token, or the entity name of a definition.
+    pub fn instance_id_at_position(&self, position: Position) -> Option<u32> {
+        if let Some((id, _)) = self.id_token_at_position(position) {
+            return Some(id);
+        }
+        let offset = self.position_to_offset(position)?;
         let (identifier_start, _) = self.identifier_at_offset(offset)?;
         let (start, id) = self.definition_id_before_entity_name(identifier_start)?;
-        Some((id, start))
+        self.occurs(id, start).then_some(id)
+    }
+
+    fn occurs(&self, id: u32, start: usize) -> bool {
+        self.references
+            .get(&id)
+            .is_some_and(|offsets| offsets.contains(&start))
     }
 
     pub fn entity_name_at_position(&self, position: Position) -> Option<(String, Range)> {
@@ -1176,18 +1183,43 @@ mod tests {
     }
 
     #[test]
-    fn id_token_at_position_resolves_clicks_on_the_definition_entity_name() {
+    fn instance_id_at_position_resolves_clicks_on_the_definition_entity_name() {
         let text = "#1=IFCWALL($);#2=IFCSLAB(#1);";
         let document = parse_document(text);
-        let offset = |needle: &str| text.find(needle).expect("needle should exist");
 
         assert_eq!(
-            document.id_token_at_position(position_at(text, "IFCWALL")),
-            Some((1, offset("#1=")))
+            document.instance_id_at_position(position_at(text, "IFCWALL")),
+            Some(1)
         );
         assert_eq!(
-            document.id_token_at_position(position_at(text, "IFCSLAB")),
-            Some((2, offset("#2=")))
+            document.instance_id_at_position(position_at(text, "IFCSLAB")),
+            Some(2)
+        );
+        assert_eq!(
+            document.instance_id_at_position(position_at(text, "#1)")),
+            Some(1)
+        );
+        assert_eq!(
+            document.id_token_at_position(position_at(text, "IFCWALL")),
+            None
+        );
+    }
+
+    #[test]
+    fn instance_id_at_position_ignores_a_definition_written_in_a_comment_or_string() {
+        let text = "#1=IFCWALL($);/* #1=IFCDOOR($); */#2=IFCSLAB('#1=IFCROOF');";
+        let document = parse_document(text);
+
+        for name in ["IFCDOOR", "IFCROOF"] {
+            assert_eq!(
+                document.instance_id_at_position(position_at(text, name)),
+                None,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            document.instance_id_at_position(position_at(text, "IFCWALL")),
+            Some(1)
         );
     }
 

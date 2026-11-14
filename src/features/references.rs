@@ -12,7 +12,7 @@ pub fn find_references(
     document: &Document,
     position: Position,
 ) -> Option<Vec<Location>> {
-    let (id, _) = document.id_token_at_position(position)?;
+    let id = document.instance_id_at_position(position)?;
 
     let mut locations = Vec::new();
 
