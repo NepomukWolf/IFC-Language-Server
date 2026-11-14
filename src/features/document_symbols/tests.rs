@@ -527,3 +527,92 @@ fn outline_json_objects_are_insertion_ordered_maps() {
         .collect();
     assert_eq!(keys.first(), Some(&"name"));
 }
+
+fn storey_chain(length: usize) -> Document {
+    let mut text = String::from("DATA;\n");
+    for id in 1..=length {
+        text.push_str(&format!(
+            "#{id}=IFCBUILDINGSTOREY('g',$,'L',$,$,$,$,$,$);\n"
+        ));
+    }
+    for id in 2..=length {
+        text.push_str(&format!(
+            "#{}=IFCRELAGGREGATES('g',$,$,$,#{},(#{id}));\n",
+            length + id,
+            id - 1
+        ));
+    }
+    text.push_str("ENDSEC;\n");
+    parse(&text)
+}
+fn depth_and_names(symbols: &[DocumentSymbol]) -> (usize, Vec<String>) {
+    let mut depth = 0;
+    let mut names = Vec::new();
+    let mut pending: Vec<(&DocumentSymbol, usize)> = symbols.iter().rev().map(|s| (s, 1)).collect();
+    while let Some((symbol, level)) = pending.pop() {
+        depth = depth.max(level);
+        names.push(symbol.name.clone());
+        pending.extend(
+            symbol
+                .children
+                .iter()
+                .flatten()
+                .rev()
+                .map(|c| (c, level + 1)),
+        );
+    }
+    (depth, names)
+}
+fn storey_names(ids: std::ops::RangeInclusive<usize>) -> Vec<String> {
+    ids.map(|id| format!("IFCBUILDINGSTOREY #{id}")).collect()
+}
+
+#[test]
+fn a_chain_deeper_than_the_limit_is_flat_below_it_and_keeps_every_instance() {
+    let length = 50_000;
+    let symbols = nested_symbols(&storey_chain(length));
+    let (depth, names) = depth_and_names(&symbols);
+    assert_eq!(depth, MAX_OUTLINE_DEPTH);
+    assert_eq!(names, storey_names(1..=length));
+
+    let mut last_nested = &symbols[0];
+    for _ in 2..MAX_OUTLINE_DEPTH {
+        last_nested = &last_nested.children.as_ref().unwrap()[0];
+    }
+    let flat: Vec<&str> = last_nested
+        .children
+        .iter()
+        .flatten()
+        .map(|child| child.name.as_str())
+        .collect();
+    assert_eq!(flat, storey_names(MAX_OUTLINE_DEPTH..=length));
+}
+
+#[test]
+fn a_chain_as_deep_as_the_limit_nests_fully() {
+    let symbols = nested_symbols(&storey_chain(MAX_OUTLINE_DEPTH));
+    let (depth, names) = depth_and_names(&symbols);
+    assert_eq!(depth, MAX_OUTLINE_DEPTH);
+    assert_eq!(names, storey_names(1..=MAX_OUTLINE_DEPTH));
+}
+
+#[test]
+fn outline_time_grows_linearly_with_chain_length() {
+    let schema = schema();
+    let growth = crate::test_support::growth_on_sixteenfold(
+        500,
+        |length| {
+            let doc = storey_chain(length);
+            let instances =
+                outline_instances(doc.statement_index.as_deref(), &doc.text, Some(&schema));
+            (doc, instances)
+        },
+        |(doc, instances)| {
+            assert!(document_symbols(&doc.text, instances, Some(&schema)).is_some());
+        },
+    );
+    assert!(
+        growth < 4.0,
+        "a 16x longer chain took {growth:.1}x as long as 16 short ones"
+    );
+}
