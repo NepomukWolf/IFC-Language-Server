@@ -1584,6 +1584,7 @@ mod tests {
             "FILE_SCHEMA(('IFC4'));\n/*\n#1=ABC('fake');\n*/\n#1=ABC('real');\n#1=ABC('last');",
             "FILE_SCHEMA(('IFC4'));\n#1=ABC('unterminated\n#2=ABC('x');",
             "FILE_SCHEMA(('IFC4'));\n#1=ABC(12);/* unterminated\n#2=ABC(3);\n",
+            "FILE_SCHEMA(('IFC4'));\n#1=ABC(12);/* a*x/ #5=ABC(#1); */\n",
             "FILE_SCHEMA(('IFC4'));\n#1=ABC#2=XYZ#1;\n#3=ABC(12#2);",
             "FILE_SCHEMA(('IFC4'));\n#1=ABC('','''abc',#2);\n#2=ABC(1);",
         ];
