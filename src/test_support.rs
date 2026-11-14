@@ -10,25 +10,25 @@ pub fn build_entity_instances(parsed: Option<&Document>, text: &str) -> EntityIn
     EntityInstanceCollection { instances }
 }
 
-/// Best of three timings of `run` on the input `prepare` builds for size `n` and for `4 * n`,
-/// as the ratio of the larger to the smaller: about 4 for linear cost, 16 for quadratic.
-pub fn growth_on_quadrupling<T>(
+/// How much longer `run` takes on one input of size `16 * n` than on sixteen inputs of size `n`
+/// that `prepare` builds, each the best of five timings: about 1 for linear cost, 16 for quadratic.
+pub fn growth_on_sixteenfold<T>(
     n: usize,
     prepare: impl Fn(usize) -> T,
     mut run: impl FnMut(&mut T),
 ) -> f64 {
-    let mut best_of_three = |size: usize| {
-        (0..3)
+    let mut best_of_five = |count: usize, size: usize| {
+        (0..5)
             .map(|_| {
-                let mut input = prepare(size);
+                let mut inputs: Vec<T> = (0..count).map(|_| prepare(size)).collect();
                 let started = std::time::Instant::now();
-                run(&mut input);
+                inputs.iter_mut().for_each(&mut run);
                 started.elapsed()
             })
             .min()
-            .expect("three runs")
+            .expect("five runs")
     };
-    let small = best_of_three(n);
-    let large = best_of_three(4 * n);
-    large.as_secs_f64() / small.as_secs_f64()
+    let sixteen_small = best_of_five(16, n);
+    let one_large = best_of_five(1, 16 * n);
+    one_large.as_secs_f64() / sixteen_small.as_secs_f64()
 }
