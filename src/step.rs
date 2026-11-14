@@ -865,12 +865,24 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
     let mut p = start;
     let mut quote = 0;
     let mut next_stop = None;
+    // How far past `p` to look for the next `;` or quote. Doubling it on each miss keeps the search
+    // within about twice the frame's length, also when recovery ends the frame long before a stop.
+    let mut window = 256;
     while p < end {
         let rest = &text[p..end];
         p += if quote == 0 {
             let stop = match next_stop {
                 Some(stop) if stop >= p => stop,
-                _ => p + memchr::memchr3(b';', b'\'', b'"', rest).unwrap_or(rest.len()),
+                _ => {
+                    let ahead = &rest[..rest.len().min(window)];
+                    memchr::memchr3(b';', b'\'', b'"', ahead).map_or_else(
+                        || {
+                            window *= 2;
+                            p + ahead.len()
+                        },
+                        |n| p + n,
+                    )
+                }
             };
             next_stop = Some(stop);
             memchr::memchr2(b'\n', b'/', &text[p..stop]).unwrap_or(stop - p)
@@ -1154,6 +1166,28 @@ mod tests {
         assert!(
             large < small * 8,
             "4x the lines took {large:?} against {small:?}"
+        );
+    }
+
+    #[test]
+    fn statements_all_lacking_their_semicolon_parse_in_linear_time() {
+        let growth = crate::test_support::growth_on_sixteenfold(
+            1_000,
+            |lines| {
+                let mut text = b"DATA;\n".to_vec();
+                for id in 1..=lines {
+                    text.extend_from_slice(format!("#{id}=IFCX(1)\n").as_bytes());
+                }
+                text
+            },
+            |text| {
+                let doc = Document::parse(text, false);
+                assert_eq!(doc.errors.len(), doc.statements.len());
+            },
+        );
+        assert!(
+            growth < 4.0,
+            "16x the statements took {growth:.1}x as long as 16 inputs"
         );
     }
 
