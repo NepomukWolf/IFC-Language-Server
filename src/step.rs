@@ -306,9 +306,16 @@ impl Document {
             .partition_point(|s| s.span.start as usize <= edit.start + edit.delete_len)
             + 1)
         .min(self.statements.len());
+        let gap = first
+            .checked_sub(1)
+            .map_or(0, |previous| self.statements[previous].span.end)
+            ..self.statements.get(first).map_or(0, |s| s.span.start);
         if first >= last
             || edit.start < self.statements[first].span.start as usize
             || edit.start + edit.delete_len > self.statements[last - 1].span.end as usize
+            // Text before the first statement that failed to parse may end there only by recovery,
+            // which the edit can undo.
+            || self.errors.iter().any(|e| gap.contains(&e.span.start))
         {
             *self = Self::parse(new, self.retain);
             return EditOutcome::Rebuilt;
@@ -884,8 +891,11 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> usize {
                     continue;
                 }
                 quote = 0;
-            } else if text[p] == b';' && definition(text, trivia(text, p + 1, end), end) {
-                return p + 1;
+            } else if text[p] == b';' {
+                let next = trivia(text, p + 1, end);
+                if text[p + 1..next].contains(&b'\n') && definition(text, next, end) {
+                    return p + 1;
+                }
             }
         } else {
             match text[p] {
@@ -1161,6 +1171,40 @@ mod tests {
         }
         edits_match_full_parse(b"DATA;\n#1=X(1);\n#2=Y('a',2);\n#3=Z(3);\n#4=W(4);\n");
         edits_match_full_parse(b"DATA;\n#1=X(1);\n#2=Y('a',2);\nENDSEC;\n#3=Z(3);\n#4=W(4);\n");
+    }
+
+    #[test]
+    fn a_semicolon_and_a_definition_on_one_line_stay_inside_a_string() {
+        let text = b"DATA;\n#1=X('b',$,IFCLABEL(';#9='),$);\n#2=X('a; #8 =');\nENDSEC;\n";
+        let doc = Document::parse(text, true);
+        assert!(doc.errors.is_empty(), "{:?}", doc.errors);
+        assert_eq!(
+            doc.statements.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        edits_match_full_parse(text);
+    }
+
+    #[test]
+    fn an_edit_ending_a_recovered_header_string_reparses_the_header() {
+        let original = b"HEADER;\nFILE_NAME('a\n#4=b');\n#5=Y(2);\n#6=Z(3);\n";
+        let equals = original.iter().position(|b| *b == b'=').unwrap();
+        let mut text = original.to_vec();
+        text.remove(equals);
+        let mut doc = Document::parse(original, false);
+        assert!(!doc.errors.is_empty());
+        doc.edit(
+            b"=",
+            &text,
+            Edit {
+                start: equals,
+                delete_len: 1,
+                insert_len: 0,
+            },
+        );
+        assert!(doc.errors.is_empty(), "{:?}", doc.errors);
+        assert_eq!(doc, Document::parse(&text, false));
+        edits_match_full_parse(original);
     }
 
     #[test]
