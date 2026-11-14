@@ -157,12 +157,13 @@ pub fn edit_text_index(
     };
     let floor = schema_end.max(start.saturating_sub(MAX_ANCHOR_DISTANCE));
     let mut ahead = step::Lookahead::default();
+    let before_edit = &bytes[..start];
     // Whether a string before an `#id` ends there depends on the `=` after it, so that lookahead
     // must end before the edit.
     let indexed = (floor..start).rev().find(|&offset| {
         bytes[offset] == b'#'
             && parse_id(bytes, offset).is_some_and(|(id, end)| {
-                step::trivia(bytes, end, start, &mut ahead) < start
+                step::trivia(before_edit, end, start, &mut ahead) < start
                     && index
                         .references
                         .get(&id)
@@ -593,6 +594,12 @@ mod tests {
                     #4222=IFCCARTESIANPOFNT'((0.,0.,0.));";
         let at = text.find("#4174").unwrap();
         edit_matches_scan(text, at, at, "*/");
+    }
+
+    #[test]
+    fn opening_a_comment_whose_slash_precedes_the_edit() {
+        let text = "FILE_SCHEMA(('IFC4'));\n#1=X(#2/";
+        edit_matches_scan(text, text.len(), text.len(), "*");
     }
 
     #[test]
