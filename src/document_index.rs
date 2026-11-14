@@ -87,10 +87,11 @@ fn scan(
     mut schema: Option<&mut Option<(String, usize)>>,
     mut visit: impl FnMut(IdToken) -> bool,
 ) -> usize {
+    let mut ahead = step::Lookahead::default();
     while offset < bytes.len() && offset <= stop_after {
         let wants_schema = schema.as_deref().is_some_and(Option::is_none);
         match bytes[offset] {
-            b'\'' => offset = skip_string(bytes, offset, line_offsets),
+            b'\'' => offset = string_end(bytes, offset, line_offsets, &mut ahead).0,
             b'/' if bytes.get(offset + 1) == Some(&b'*') => {
                 offset = skip_block_comment(bytes, offset, line_offsets);
             }
@@ -122,7 +123,7 @@ fn scan(
                 if let Some(schema) = schema.as_deref_mut()
                     && bytes[ident_start..offset].eq_ignore_ascii_case(b"FILE_SCHEMA")
                 {
-                    *schema = parse_file_schema_name(bytes, offset);
+                    *schema = parse_file_schema_name(bytes, offset, &mut ahead);
                 }
             }
             _ if wants_schema => offset += 1,
@@ -155,12 +156,13 @@ pub fn edit_text_index(
         return false;
     };
     let floor = schema_end.max(start.saturating_sub(MAX_ANCHOR_DISTANCE));
+    let mut ahead = step::Lookahead::default();
     // Whether a string before an `#id` ends there depends on the `=` after it, so that lookahead
     // must end before the edit.
     let indexed = (floor..start).rev().find(|&offset| {
         bytes[offset] == b'#'
             && parse_id(bytes, offset).is_some_and(|(id, end)| {
-                step::trivia(bytes, end, start) < start
+                step::trivia(bytes, end, start, &mut ahead) < start
                     && index
                         .references
                         .get(&id)
@@ -324,14 +326,15 @@ fn is_definition(bytes: &[u8], mut offset: usize) -> bool {
     bytes.get(offset) == Some(&b'=')
 }
 
-fn skip_string(bytes: &[u8], offset: usize, line_offsets: &mut Vec<usize>) -> usize {
-    string_end(bytes, offset, line_offsets).0
-}
-
 /// End of the string opening at `offset` and whether a quote closed it. Like
 /// `step::frame_end`, a string that runs into the start of another statement ends there,
 /// so an unclosed string swallows only its own.
-fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) -> (usize, bool) {
+fn string_end(
+    bytes: &[u8],
+    mut offset: usize,
+    line_offsets: &mut Vec<usize>,
+    ahead: &mut step::Lookahead,
+) -> (usize, bool) {
     let len = bytes.len();
     offset += 1;
     while let Some(n) = memchr::memchr3(b'\n', b'\'', b';', &bytes[offset..]) {
@@ -342,7 +345,7 @@ fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) ->
                 while next < len && matches!(bytes[next], b' ' | b'\t' | b'\r') {
                     next += 1;
                 }
-                if step::definition(bytes, next, len) {
+                if step::definition(bytes, next, len, ahead) {
                     return (offset, false);
                 }
                 line_offsets.push(offset + 1);
@@ -356,8 +359,10 @@ fn string_end(bytes: &[u8], mut offset: usize, line_offsets: &mut Vec<usize>) ->
                 }
             }
             _ => {
-                let next = step::trivia(bytes, offset + 1, len);
-                if bytes[offset + 1..next].contains(&b'\n') && step::definition(bytes, next, len) {
+                let next = step::trivia(bytes, offset + 1, len, ahead);
+                if step::definition(bytes, next, len, ahead)
+                    && ahead.line_break(bytes, offset + 1, next)
+                {
                     return (offset + 1, false);
                 }
                 offset += 1;
@@ -385,10 +390,14 @@ fn push_lines(bytes: &[u8], start: usize, end: usize, line_offsets: &mut Vec<usi
     line_offsets.extend(memchr::memchr_iter(b'\n', &bytes[start..end]).map(|n| start + n + 1));
 }
 
-fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<(String, usize)> {
+fn parse_file_schema_name(
+    bytes: &[u8],
+    mut offset: usize,
+    ahead: &mut step::Lookahead,
+) -> Option<(String, usize)> {
     while offset < bytes.len() {
         match bytes[offset] {
-            b'\'' => return parse_schema_string(bytes, offset),
+            b'\'' => return parse_schema_string(bytes, offset, ahead),
             b';' => return None,
             b'/' if bytes.get(offset + 1) == Some(&b'*') => {
                 let mut ignored_line_offsets = Vec::new();
@@ -401,8 +410,12 @@ fn parse_file_schema_name(bytes: &[u8], mut offset: usize) -> Option<(String, us
     None
 }
 
-fn parse_schema_string(bytes: &[u8], offset: usize) -> Option<(String, usize)> {
-    let (end, closed) = string_end(bytes, offset, &mut Vec::new());
+fn parse_schema_string(
+    bytes: &[u8],
+    offset: usize,
+    ahead: &mut step::Lookahead,
+) -> Option<(String, usize)> {
+    let (end, closed) = string_end(bytes, offset, &mut Vec::new(), ahead);
     closed.then_some(())?;
     let value = std::str::from_utf8(&bytes[offset + 1..end - 1]).ok()?;
     Some((value.replace("''", "'").to_ascii_uppercase(), end))
@@ -488,6 +501,17 @@ mod tests {
         assert_eq!(
             index.line_offsets,
             vec![0, at("#2="), at("#3="), at("  #4=")]
+        );
+    }
+
+    #[test]
+    fn comments_opening_again_and_again_inside_strings_index_in_linear_time() {
+        let growths = crate::test_support::growth_on_repeated_comment_openings(1_000, |text| {
+            std::hint::black_box(scan_text(text));
+        });
+        assert!(
+            growths.iter().all(|&(_, growth)| growth < 4.0),
+            "16x the units took this many times as long as 16 inputs: {growths:?}"
         );
     }
 

@@ -104,8 +104,9 @@ impl Document {
             0
         };
         let mut unclosed_comment = None;
+        let mut ahead = Lookahead::default();
         while p < text.len() {
-            p = match closed_trivia(text, p, text.len()) {
+            p = match closed_trivia(text, p, text.len(), &mut ahead) {
                 Ok(p) => p,
                 Err(comment) => {
                     unclosed_comment = Some(comment);
@@ -116,7 +117,7 @@ impl Document {
                 break;
             }
             let errors = doc.errors.len();
-            let frame = frame_end(text, p, text.len());
+            let frame = frame_end(text, p, text.len(), &mut ahead);
             let end = frame.unwrap_or_else(|comment| comment);
             if text[p] == b'#' {
                 doc.statement(text, p, end);
@@ -173,6 +174,7 @@ impl Document {
                         depth: 0,
                         recovered: false,
                         skipped: Vec::new(),
+                        ahead: Lookahead::default(),
                     };
                     let result = reader.list(Kind::List).and_then(|()| reader.expect(b';'));
                     doc.errors.append(&mut reader.skipped);
@@ -251,6 +253,7 @@ impl Document {
             depth: 0,
             recovered: false,
             skipped: Vec::new(),
+            ahead: Lookahead::default(),
         };
         let result = (|| {
             let id_start = r.p;
@@ -262,7 +265,7 @@ impl Document {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| r.error("invalid instance id"))?;
             r.expect(b'=')?;
-            r.p = trivia(text, r.p, end);
+            r.p = trivia(text, r.p, end, &mut r.ahead);
             let name_start = r.p;
             r.name()?;
             statement.name = Span {
@@ -275,7 +278,7 @@ impl Document {
             }
             r.list(Kind::List)?;
             r.expect(b';')?;
-            if trivia(text, r.p, end) != end {
+            if trivia(text, r.p, end, &mut r.ahead) != end {
                 return Err(r.error("unexpected trailing text"));
             }
             Ok(())
@@ -313,6 +316,7 @@ impl Document {
             depth: 0,
             recovered: false,
             skipped: Vec::new(),
+            ahead: Lookahead::default(),
         };
         if r.list(Kind::List).is_err() && !r.recovered {
             params.clear();
@@ -358,8 +362,9 @@ impl Document {
             retain: self.retain,
         };
         let mut p = start;
+        let mut ahead = Lookahead::default();
         while p < end {
-            let Ok(after_trivia) = closed_trivia(new, p, end) else {
+            let Ok(after_trivia) = closed_trivia(new, p, end, &mut ahead) else {
                 *self = Self::parse(new, self.retain);
                 return EditOutcome::Rebuilt;
             };
@@ -367,7 +372,7 @@ impl Document {
             if p == end {
                 break;
             }
-            let next = match frame_end(new, p, new.len()) {
+            let next = match frame_end(new, p, new.len(), &mut ahead) {
                 Ok(next) if new[p] == b'#' && next <= end => next,
                 _ => {
                     *self = Self::parse(new, self.retain);
@@ -495,6 +500,7 @@ struct Reader<'a, 'p> {
     recovered: bool,
     /// Malformed values left out of their list.
     skipped: Vec<ParseError>,
+    ahead: Lookahead,
 }
 
 /// Deepest nesting of lists and typed values read. Decoded values are walked recursively, so this
@@ -526,7 +532,7 @@ impl Reader<'_, '_> {
     }
     fn expect(&mut self, byte: u8) -> Result<(), ParseError> {
         let before_trivia = self.p;
-        self.p = trivia(self.text, self.p, self.end);
+        self.p = trivia(self.text, self.p, self.end, &mut self.ahead);
         if self.p >= self.end || self.text[self.p] != byte {
             let mut error = self.error(match byte {
                 b'(' => "expected (",
@@ -558,7 +564,7 @@ impl Reader<'_, '_> {
         Ok(())
     }
     fn list(&mut self, kind: Kind) -> Result<(), ParseError> {
-        self.p = trivia(self.text, self.p, self.end);
+        self.p = trivia(self.text, self.p, self.end, &mut self.ahead);
         let start = self.p;
         self.expect(b'(')?;
         self.list_body(start, kind)
@@ -582,11 +588,11 @@ impl Reader<'_, '_> {
                 kind,
             });
         }
-        self.p = trivia(self.text, self.p, self.end);
+        self.p = trivia(self.text, self.p, self.end, &mut self.ahead);
         if self.text.get(self.p) != Some(&b')') {
             let mut comma = None;
             loop {
-                let value_start = trivia(self.text, self.p, self.end);
+                let value_start = trivia(self.text, self.p, self.end, &mut self.ahead);
                 let mark = self.params.len();
                 if let Err(error) = self.value() {
                     if !SKIPPABLE.contains(&error.message) {
@@ -606,7 +612,7 @@ impl Reader<'_, '_> {
                         });
                     }
                 }
-                self.p = trivia(self.text, self.p, self.end);
+                self.p = trivia(self.text, self.p, self.end, &mut self.ahead);
                 if self.p < self.end && !matches!(self.text[self.p], b',' | b')' | b';') {
                     self.skip(self.p)?;
                 }
@@ -647,7 +653,10 @@ impl Reader<'_, '_> {
         while self.p < self.end {
             match self.text[self.p] {
                 b'/' if self.text.get(self.p..self.p + 2) == Some(b"/*") => {
-                    self.p = comment_end(self.text, self.p, self.end).unwrap_or(self.end);
+                    self.p = self
+                        .ahead
+                        .comment_end(self.text, self.p, self.end)
+                        .unwrap_or(self.end);
                     continue;
                 }
                 byte if byte.is_ascii_whitespace() => {
@@ -693,7 +702,7 @@ impl Reader<'_, '_> {
         Ok(end)
     }
     fn value(&mut self) -> Result<(), ParseError> {
-        self.p = trivia(self.text, self.p, self.end);
+        self.p = trivia(self.text, self.p, self.end, &mut self.ahead);
         if self.p >= self.end {
             return Err(self.error("expected parameter"));
         }
@@ -827,12 +836,74 @@ impl Reader<'_, '_> {
     }
 }
 
-pub(crate) fn trivia(text: &[u8], mut p: usize, end: usize) -> usize {
+/// Forward searches that lookahead repeats from nearby offsets of one text, each remembering its
+/// last answer, so that a byte is scanned about once while the starts grow.
+#[derive(Default)]
+pub(crate) struct Lookahead {
+    comment_close: Option<Found>,
+    line_break: Option<Found>,
+}
+
+/// The first match at or after `from` starts at `at`, or nowhere in the text when `at` is `None`.
+#[derive(Clone, Copy)]
+struct Found {
+    from: usize,
+    at: Option<usize>,
+}
+
+impl Lookahead {
+    /// End of the `/*` comment at `p`, past its `*/`, if that lies within `end`.
+    #[cold]
+    #[inline(never)]
+    fn comment_end(&mut self, text: &[u8], p: usize, end: usize) -> Option<usize> {
+        first_match(&mut self.comment_close, text, p + 2, end, 2, |hay| {
+            memchr::memmem::find(hay, b"*/")
+        })
+        .map(|at| at + 2)
+    }
+
+    /// Whether a line break lies in `text[from..to]`.
+    pub(crate) fn line_break(&mut self, text: &[u8], from: usize, to: usize) -> bool {
+        first_match(&mut self.line_break, text, from, text.len(), 1, |hay| {
+            memchr::memchr(b'\n', hay)
+        })
+        .is_some_and(|at| at < to)
+    }
+}
+
+/// Start of the first `len`-byte match of `search` at or after `from` that ends within `end`.
+fn first_match(
+    found: &mut Option<Found>,
+    text: &[u8],
+    from: usize,
+    end: usize,
+    len: usize,
+    search: impl Fn(&[u8]) -> Option<usize>,
+) -> Option<usize> {
+    // What the search finds past `limit` when it finds nothing before it, if that is known.
+    let (limit, beyond) = match *found {
+        Some(known) if known.from <= from && known.at.is_none_or(|at| from <= at) => {
+            return known.at.filter(|&at| at + len <= end);
+        }
+        Some(known) if from < known.from && known.from + len - 1 < end => {
+            (known.from + len - 1, Some(known.at))
+        }
+        _ => (end, (end == text.len()).then_some(None)),
+    };
+    let at = match search(&text[from..limit]) {
+        Some(n) => Some(from + n),
+        None => beyond?,
+    };
+    *found = Some(Found { from, at });
+    at.filter(|&at| at + len <= end)
+}
+
+pub(crate) fn trivia(text: &[u8], mut p: usize, end: usize, ahead: &mut Lookahead) -> usize {
     while p < end {
         if text[p].is_ascii_whitespace() {
             p += 1;
         } else if text.get(p..p + 2) == Some(b"/*") {
-            p = comment_end(text, p, end).unwrap_or(end);
+            p = ahead.comment_end(text, p, end).unwrap_or(end);
         } else {
             break;
         }
@@ -840,21 +911,19 @@ pub(crate) fn trivia(text: &[u8], mut p: usize, end: usize) -> usize {
     p
 }
 
-/// End of the `/*` comment at `p`, past its `*/`.
-#[cold]
-#[inline(never)]
-fn comment_end(text: &[u8], p: usize, end: usize) -> Option<usize> {
-    memchr::memmem::find(&text[p + 2..end], b"*/").map(|n| p + n + 4)
-}
-
 /// `trivia` up to `end`, or the start of a comment that opens before `end` and doesn't close
 /// before it.
-fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Result<usize, usize> {
+fn closed_trivia(
+    text: &[u8],
+    mut p: usize,
+    end: usize,
+    ahead: &mut Lookahead,
+) -> Result<usize, usize> {
     while p < end {
         if text[p].is_ascii_whitespace() {
             p += 1;
         } else if text.get(p..p + 2) == Some(b"/*") {
-            p = comment_end(text, p, end).ok_or(p)?;
+            p = ahead.comment_end(text, p, end).ok_or(p)?;
         } else {
             break;
         }
@@ -863,7 +932,7 @@ fn closed_trivia(text: &[u8], mut p: usize, end: usize) -> Result<usize, usize> 
 }
 
 /// Whether `#<digits> =` starts at `p`.
-pub(crate) fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
+pub(crate) fn definition(text: &[u8], mut p: usize, end: usize, ahead: &mut Lookahead) -> bool {
     if text.get(p) != Some(&b'#') {
         return false;
     }
@@ -872,19 +941,19 @@ pub(crate) fn definition(text: &[u8], mut p: usize, end: usize) -> bool {
     while p < end && text[p].is_ascii_digit() {
         p += 1;
     }
-    p > start && text.get(trivia(text, p, end)) == Some(&b'=')
+    p > start && text.get(trivia(text, p, end, ahead)) == Some(&b'=')
 }
 
 /// Whether `ENDSEC ;` starts at `p`.
-fn section_end(text: &[u8], p: usize, end: usize) -> bool {
+fn section_end(text: &[u8], p: usize, end: usize, ahead: &mut Lookahead) -> bool {
     text.get(p..p + 6)
         .is_some_and(|word| word.eq_ignore_ascii_case(b"ENDSEC"))
-        && text.get(trivia(text, p + 6, end)) == Some(&b';')
+        && text.get(trivia(text, p + 6, end, ahead)) == Some(&b';')
 }
 
 /// Where the statement at `start` ends, or the start of a comment that opens in it and doesn't
 /// close.
-fn frame_end(text: &[u8], start: usize, end: usize) -> Result<usize, usize> {
+fn frame_end(text: &[u8], start: usize, end: usize, ahead: &mut Lookahead) -> Result<usize, usize> {
     let mut p = start;
     let mut quote = 0;
     let mut next_stop = None;
@@ -922,7 +991,7 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> Result<usize, usize> {
             while next < end && matches!(text[next], b' ' | b'\t' | b'\r') {
                 next += 1;
             }
-            if definition(text, next, end) || section_end(text, next, end) {
+            if definition(text, next, end, ahead) || section_end(text, next, end, ahead) {
                 return Ok(next);
             }
         }
@@ -934,8 +1003,8 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> Result<usize, usize> {
                 }
                 quote = 0;
             } else if text[p] == b';' {
-                let next = trivia(text, p + 1, end);
-                if text[p + 1..next].contains(&b'\n') && definition(text, next, end) {
+                let next = trivia(text, p + 1, end, ahead);
+                if definition(text, next, end, ahead) && ahead.line_break(text, p + 1, next) {
                     return Ok(p + 1);
                 }
             }
@@ -943,7 +1012,7 @@ fn frame_end(text: &[u8], start: usize, end: usize) -> Result<usize, usize> {
             match text[p] {
                 b'\'' | b'"' => quote = text[p],
                 b'/' if text.get(p + 1) == Some(&b'*') => {
-                    p = closed_trivia(text, p, end)?;
+                    p = closed_trivia(text, p, end, ahead)?;
                     continue;
                 }
                 b';' => return Ok(p + 1),
@@ -1189,6 +1258,17 @@ mod tests {
         assert!(
             large < small * 8,
             "4x the lines took {large:?} against {small:?}"
+        );
+    }
+
+    #[test]
+    fn comments_opening_again_and_again_inside_strings_parse_in_linear_time() {
+        let growths = crate::test_support::growth_on_repeated_comment_openings(1_000, |text| {
+            std::hint::black_box(Document::parse(text.as_bytes(), false));
+        });
+        assert!(
+            growths.iter().all(|&(_, growth)| growth < 4.0),
+            "16x the units took this many times as long as 16 inputs: {growths:?}"
         );
     }
 
