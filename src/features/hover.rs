@@ -6,7 +6,7 @@
 
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Range};
 
-use crate::document::{Document, EntityInstanceInfo, ParameterValue};
+use crate::document::{Document, EntityInstanceInfo, ParameterValue, typed_name_len};
 use crate::schema::{
     EntityAttributeDoc, EntityDoc, EnumerationTypeDef, NamedTypeKind, PrimitiveType, SchemaDoc,
     SchemaDocCollection, TypeDoc, TypeRef,
@@ -216,9 +216,9 @@ fn typed_value_name_span(
     match parameter {
         ParameterValue::Typed { inner, range, .. } if contains(*range, position) => {
             let start = document.position_to_offset(range.start)?;
-            let open = document.text.get(start..)?.find('(')? + start;
-            if offset < open {
-                Some((start, open))
+            let name_end = start + typed_name_len(document.text.get(start..)?);
+            if offset < name_end {
+                Some((start, name_end))
             } else {
                 inner
                     .iter()
@@ -847,6 +847,27 @@ mod tests {
         assert_eq!(name, "IFCLABEL");
         assert_eq!(range.start, Position::new(0, 35));
         assert_eq!(range.end, Position::new(0, 43));
+    }
+
+    #[test]
+    fn typed_value_name_detection_skips_whitespace_and_comments_before_the_parenthesis() {
+        for spelling in [
+            "IFCLABEL('x')",
+            "IFCLABEL ('x')",
+            "IFCLABEL/*c*/('x')",
+            "IFCLABEL/*(*/('x')",
+        ] {
+            let text = format!("#1=IFCPROPERTYSINGLEVALUE('N',$,{spelling});");
+            let document = parse_document(&text);
+
+            let (name, range) =
+                typed_value_name_at_position(&document, position_at(&text, "FCLABEL"))
+                    .unwrap_or_else(|| panic!("no typed value name in {spelling}"));
+
+            assert_eq!(name, "IFCLABEL", "{spelling}");
+            assert_eq!(range.start, Position::new(0, 32), "{spelling}");
+            assert_eq!(range.end, Position::new(0, 40), "{spelling}");
+        }
     }
 
     #[test]
