@@ -126,7 +126,7 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
         positions[slot] = position;
     }
 
-    located
+    let mut diagnostics: Vec<Diagnostic> = located
         .iter()
         .zip(positions.as_chunks::<2>().0)
         .map(|(located, &[start, end])| Diagnostic {
@@ -145,12 +145,12 @@ fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnosti
             },
             ..Default::default()
         })
-        .fold(Vec::new(), |mut diagnostics, diagnostic| {
-            if diagnostics.last() != Some(&diagnostic) {
-                diagnostics.push(diagnostic);
-            }
-            diagnostics
-        })
+        .collect();
+    diagnostics.sort_by(|a, b| {
+        (a.range.start, a.range.end, &a.message).cmp(&(b.range.start, b.range.end, &b.message))
+    });
+    diagnostics.dedup();
+    diagnostics
 }
 
 /// The first quote of a statement whose quotes, outside comments, never balance.
@@ -198,6 +198,32 @@ mod tests {
 
     fn parse_document(text: &str) -> Document {
         Document::parse(text.to_string())
+    }
+
+    #[test]
+    fn diagnostics_at_one_position_keep_their_order_after_a_local_reparse() {
+        let text = "#1321=IFCMATERIALLAYER(#1319=IFCAXIS2PLACEMENT3D('Concrete Masonry,10303-21;\nFILE_DESCRIPTION ((''), '2;\u{a0}1');\n";
+        let mut edited = parse_document(text);
+        edited
+            .apply_content_changes(&[tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 23), Position::new(0, 23))),
+                range_length: None,
+                text: "#".to_string(),
+            }])
+            .expect("change should apply");
+
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&edited));
+        let fresh = collect(&DiagnosticSnapshot::from_document(&parse_document(
+            &edited.text,
+        )));
+
+        assert_eq!(diagnostics, fresh);
+        assert!(
+            diagnostics
+                .windows(2)
+                .any(|pair| pair[0].range.start == pair[1].range.start),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
