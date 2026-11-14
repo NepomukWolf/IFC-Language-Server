@@ -327,8 +327,8 @@ fn is_definition(bytes: &[u8], mut offset: usize) -> bool {
 }
 
 /// End of the string opening at `offset` and whether a quote closed it. Like
-/// `step::frame_end`, a string that runs into the start of another statement ends there,
-/// so an unclosed string swallows only its own.
+/// `step::frame_end`, a string that runs into a line starting another statement or `ENDSEC;`
+/// ends there, so an unclosed string swallows only its own.
 fn string_end(
     bytes: &[u8],
     mut offset: usize,
@@ -345,7 +345,9 @@ fn string_end(
                 while next < len && matches!(bytes[next], b' ' | b'\t' | b'\r') {
                     next += 1;
                 }
-                if step::definition(bytes, next, len, ahead) {
+                if step::definition(bytes, next, len, ahead)
+                    || step::section_end(bytes, next, len, ahead)
+                {
                     return (offset, false);
                 }
                 line_offsets.push(offset + 1);
@@ -513,6 +515,19 @@ mod tests {
             growths.iter().all(|&(_, growth)| growth < 4.0),
             "16x the units took this many times as long as 16 inputs: {growths:?}"
         );
+    }
+
+    #[test]
+    fn an_unclosed_string_ends_at_an_endsec_line() {
+        let text = "DATA;\n#1=X('a);\nENDSEC;\nDATA; #2=Y(#1);\nENDSEC;\n";
+        let at = |needle: &str| text.find(needle).unwrap();
+        let index = scan_text(text);
+
+        assert_eq!(
+            index.definitions_by_id,
+            vec![(1, at("#1=")), (2, at("#2="))]
+        );
+        assert_eq!(index.references.get(&1), Some(&vec![at("#1="), at("#1)")]));
     }
 
     #[test]
