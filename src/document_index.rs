@@ -267,11 +267,13 @@ pub fn edit_text_index(
     old_ids.sort_unstable();
     old_ids.dedup();
     for id in old_ids {
-        if let Some(offsets) = index.references.get_mut(&id) {
-            offsets.retain(|&offset| offset < anchor || offset >= old_stop);
-            if offsets.is_empty() {
-                index.references.remove(&id);
-            }
+        let offsets = index
+            .references
+            .get_mut(&id)
+            .expect("an old token is indexed");
+        offsets.retain(|&offset| offset < anchor || offset >= old_stop);
+        if offsets.is_empty() {
+            index.references.remove(&id);
         }
     }
     let shift = |offset: &mut usize| {
