@@ -14,6 +14,7 @@ use crate::schema::{
 };
 
 pub fn collect_with_schema_name(
+    text: &str,
     instances: &EntityInstanceCollection,
     schema: &SchemaDoc,
     schema_name: Option<&str>,
@@ -29,6 +30,7 @@ pub fn collect_with_schema_name(
         validate_instance(instances, schema, entity, instance, &mut diagnostics);
     }
 
+    super::byte_columns_to_utf16(text, &mut diagnostics);
     diagnostics
 }
 
@@ -521,7 +523,7 @@ mod tests {
     fn datatype_validator_reports_mismatched_attribute_type() {
         let doc = parse_document("#1=IFCWALL(123,.MOVABLE.);");
         let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = collect_with_schema_name(&doc.text, &instances, &test_schema(), None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
@@ -533,7 +535,7 @@ mod tests {
     fn datatype_validator_accepts_valid_values() {
         let doc = parse_document("#1=IFCWALL('gid',.MOVABLE.);");
         let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = collect_with_schema_name(&doc.text, &instances, &test_schema(), None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -591,7 +593,8 @@ mod tests {
             "#,
         );
 
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics =
+            collect_with_schema_name("#1=IFCWALL('gid',#2,.MOVABLE.);", &instances, &schema, None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("does not resolve"));
@@ -629,7 +632,7 @@ mod tests {
 
         let doc = parse_document("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
         let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect_with_schema_name(&doc.text, &instances, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -662,7 +665,7 @@ mod tests {
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));\n#2=IFCPROPERTYSINGLEVALUE('Offset',$,IFCLENGTHMEASURE(2.6));",
         );
         let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect_with_schema_name(&doc.text, &instances, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -722,7 +725,7 @@ mod tests {
     fn rendered_diagnostics(text: &str) -> Vec<String> {
         let doc = parse_document(text);
         let instances = instances(&doc);
-        collect_with_schema_name(&instances, &select_schema(), Some("IFC4"))
+        collect_with_schema_name(&doc.text, &instances, &select_schema(), Some("IFC4"))
             .iter()
             .map(|diagnostic| {
                 let Range { start, end } = diagnostic.range;
@@ -842,6 +845,24 @@ mod tests {
                 "3:71-3:73 Some(Error) None Pair: expected at least 1 items but found 0",
                 "4:10-4:17 Some(Error) None IfcMisc expects 8 attributes but found 2",
                 "5:3-5:11 Some(Error) None Unknown IFC entity `IFCWALLX` in selected schema `IFC4`",
+            ]
+        );
+    }
+
+    #[test]
+    fn datatype_diagnostic_columns_are_utf16_code_units() {
+        let diagnostics = rendered_diagnostics(
+            "#1=IFCPROPERTY(IFCLABEL('ääää'),$,IFCLABEL('a'),$);
+#2=IFCPROPERTY(IFCLABEL('😀'),$,IFCLABEL('a'),$);
+#3=IFCPROPERTY(IFCLABEL('ab'),$,IFCLABEL('a'),$);",
+        );
+
+        assert_eq!(
+            diagnostics,
+            [
+                "0:34-0:47 Some(Error) None ListValues: expected list aggregate but found typed value",
+                "1:32-1:45 Some(Error) None ListValues: expected list aggregate but found typed value",
+                "2:32-2:45 Some(Error) None ListValues: expected list aggregate but found typed value",
             ]
         );
     }

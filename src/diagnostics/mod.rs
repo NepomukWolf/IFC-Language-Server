@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use tower_lsp::lsp_types::Diagnostic;
+use tower_lsp::lsp_types::{Diagnostic, Position};
 use tree_sitter::Tree;
 
 use crate::document::Document;
@@ -56,12 +56,39 @@ pub fn collect(
     if let Some((schema_name, schema)) = schema {
         let instances = crate::document::build_entity_instances(snapshot.tree(), snapshot.text());
         diagnostics.extend(datatype::collect_with_schema_name(
+            snapshot.text(),
             &instances,
             schema,
             Some(schema_name),
         ));
     }
     diagnostics
+}
+
+/// Rewrites ranges whose columns are tree-sitter byte columns into the UTF-16 columns LSP expects.
+fn byte_columns_to_utf16(text: &str, diagnostics: &mut [Diagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+        .collect();
+    let utf16_position = |position: Position| {
+        let line_start = line_starts[position.line as usize];
+        let line_prefix = &text.as_bytes()[line_start..line_start + position.character as usize];
+        let characters = line_prefix.iter().filter(|byte| **byte & 0xC0 != 0x80);
+        let supplementary = line_prefix.iter().filter(|byte| **byte >= 0xF0);
+        Position::new(
+            position.line,
+            (characters.count() + supplementary.count()) as u32,
+        )
+    };
+
+    for diagnostic in diagnostics {
+        diagnostic.range.start = utf16_position(diagnostic.range.start);
+        diagnostic.range.end = utf16_position(diagnostic.range.end);
+    }
 }
 
 #[cfg(test)]
