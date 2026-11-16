@@ -90,6 +90,7 @@ fn unknown_entity_diagnostic(
 enum Mismatch<'a> {
     RequiredNull,
     OmittedUnsupported,
+    DerivedNotOmitted,
     TypedValueName {
         expected: &'a str,
         found: &'a str,
@@ -154,6 +155,9 @@ impl fmt::Display for Mismatch<'_> {
         match self {
             Mismatch::RequiredNull => write!(f, "attribute is required and does not allow `$`"),
             Mismatch::OmittedUnsupported => write!(f, "`*` is not supported for this attribute"),
+            Mismatch::DerivedNotOmitted => {
+                write!(f, "attribute is derived in this entity and must be `*`")
+            }
             Mismatch::TypedValueName { expected, found } => write!(
                 f,
                 "expected typed value `{}` but found `{}`",
@@ -229,11 +233,11 @@ fn validate_value<'a>(
     attribute: &'a EntityAttributeDoc,
 ) -> Validation<'a> {
     match value {
+        ParameterValue::Omitted { .. } if attribute.allows_omitted => Ok(()),
+        _ if attribute.allows_omitted => Err(Mismatch::DerivedNotOmitted),
         ParameterValue::Null { .. } if !attribute.optional => Err(Mismatch::RequiredNull),
-        ParameterValue::Omitted { .. } if !attribute.allows_omitted => {
-            Err(Mismatch::OmittedUnsupported)
-        }
-        ParameterValue::Null { .. } | ParameterValue::Omitted { .. } => Ok(()),
+        ParameterValue::Omitted { .. } => Err(Mismatch::OmittedUnsupported),
+        ParameterValue::Null { .. } => Ok(()),
         _ => validate_non_null_value(instances, schema, value, &attribute.ty),
     }
 }
@@ -843,6 +847,78 @@ mod tests {
                 "4:10-4:17 Some(Error) None IfcMisc expects 8 attributes but found 2",
                 "5:3-5:11 Some(Error) None Unknown IFC entity `IFCWALLX` in selected schema `IFC4`",
             ]
+        );
+    }
+
+    const SUBCONTEXT_SCHEMA: &str = r#"
+        SCHEMA IFC4;
+          ENTITY IfcDirection;
+          END_ENTITY;
+          ENTITY IfcContext;
+            CoordinateSpaceDimension : IfcDimensionCount;
+            TrueNorth : OPTIONAL IfcDirection;
+            Label : OPTIONAL IfcLabel;
+          END_ENTITY;
+          ENTITY IfcSubContext
+            SUBTYPE OF (IfcContext);
+          DERIVE
+            SELF\IfcContext.CoordinateSpaceDimension : IfcDimensionCount := ?;
+            SELF\IfcContext.TrueNorth : IfcDirection := ?;
+          END_ENTITY;
+          TYPE IfcDimensionCount = INTEGER;
+          END_TYPE;
+          TYPE IfcLabel = STRING;
+          END_TYPE;
+        END_SCHEMA;
+    "#;
+
+    fn subcontext_messages(args: &str) -> Vec<String> {
+        let schema = schema_from(SUBCONTEXT_SCHEMA);
+        let doc = parse_document(&format!("#1=IFCDIRECTION();\n#2=IFCSUBCONTEXT({args});"));
+        let instances = instances(&doc);
+        collect_with_schema_name(&instances, &schema, None)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn derived_attribute_accepts_only_omitted() {
+        assert!(subcontext_messages("*,*,'x'").is_empty());
+    }
+
+    #[test]
+    fn derived_mandatory_attribute_rejects_null_with_derived_message() {
+        assert_eq!(
+            subcontext_messages("$,*,$"),
+            ["CoordinateSpaceDimension: attribute is derived in this entity and must be `*`"]
+        );
+    }
+
+    #[test]
+    fn derived_optional_attribute_rejects_null_with_derived_message() {
+        assert_eq!(
+            subcontext_messages("*,$,$"),
+            ["TrueNorth: attribute is derived in this entity and must be `*`"]
+        );
+    }
+
+    #[test]
+    fn derived_attribute_rejects_a_value() {
+        assert_eq!(
+            subcontext_messages("3,#1,$"),
+            [
+                "CoordinateSpaceDimension: attribute is derived in this entity and must be `*`",
+                "TrueNorth: attribute is derived in this entity and must be `*`",
+            ]
+        );
+    }
+
+    #[test]
+    fn non_derived_attribute_keeps_omitted_rejection() {
+        assert_eq!(
+            subcontext_messages("*,*,*"),
+            ["Label: `*` is not supported for this attribute"]
         );
     }
 }
