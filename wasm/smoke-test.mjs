@@ -1,5 +1,6 @@
 // Smoke test for the wasm package: runs the server in-process over two web streams, opens a
-// sample model with one broken instance and expects a diagnostic for it plus a hover, then checks
+// sample model with one broken instance and expects a diagnostic for it plus a hover, removes it
+// in a burst of edits and expects debounced diagnostics without it, then checks
 // that `serve` resolves on a closed input and rejects when either stream fails.
 // Usage: bun wasm/smoke-test.mjs [pkg-dir]   (the `wasm-pack build --target web` output)
 
@@ -135,6 +136,24 @@ const hover = await request("textDocument/hover", {
   position: { line: brokenLine, character: 9 },
 });
 check(JSON.stringify(hover.result ?? "").includes("IfcWall"), "hover documents IfcWall");
+
+// Two edits in a burst: the second waits for the debounce timer, then removes the broken instance.
+function change(version, range, newText) {
+  send({
+    method: "textDocument/didChange",
+    params: { textDocument: { uri, version }, contentChanges: [{ range, text: newText }] },
+  });
+}
+change(2, { start: { line: brokenLine, character: 8 }, end: { line: brokenLine, character: 8 } }, " ");
+change(3, { start: { line: brokenLine, character: 0 }, end: { line: brokenLine + 1, character: 0 } }, "");
+const debounced = await notification(
+  "textDocument/publishDiagnostics",
+  (params) => params.uri === uri && !params.diagnostics.some((d) => d.range.start.line === brokenLine),
+);
+check(
+  !debounced.diagnostics.some((d) => d.range.start.line === brokenLine),
+  "debounced diagnostics follow the last edit of a burst",
+);
 
 await request("shutdown", null);
 send({ method: "exit" });
