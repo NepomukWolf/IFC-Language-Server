@@ -478,7 +478,7 @@ pub(crate) fn section_end(text: &[u8], p: usize, end: usize, ahead: &mut Lookahe
 
 /// Where the statement at `start` ends, or the start of a comment that opens in it and doesn't
 /// close.
-pub(super) fn frame_end(
+pub(crate) fn frame_end(
     text: &[u8],
     start: usize,
     end: usize,

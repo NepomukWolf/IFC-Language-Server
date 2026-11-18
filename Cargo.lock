@@ -774,6 +774,7 @@ dependencies = [
  "memchr",
  "percent-encoding",
  "rustc-hash",
+ "serde",
  "serde_json",
  "sha2",
  "time",

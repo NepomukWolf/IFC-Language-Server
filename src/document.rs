@@ -4,9 +4,9 @@
 
 mod decode;
 
-#[cfg(test)]
-pub(crate) use decode::DECODED_STATEMENTS;
 pub(crate) use decode::decode_entity_instance_relative;
+#[cfg(test)]
+pub(crate) use decode::{DECODED_STATEMENTS, UTF16_BYTES};
 use decode::{LinePoints, decode_entity_instance, utf16_len};
 
 use rustc_hash::FxHashMap;
@@ -402,6 +402,43 @@ impl Document {
         self.range_for_offsets(start, end)
     }
 
+    /// The ranges of the id tokens at `offsets`. Offsets in ascending order are converted from the
+    /// previous one, so many tokens on one line cost no more than the line's length.
+    pub fn id_ranges_at_offsets(&self, offsets: &[usize]) -> Vec<Range> {
+        let mut cursor: Option<(usize, Position)> = None;
+        let mut position_at = |offset: usize| {
+            let position = match cursor {
+                Some((from, at))
+                    if from <= offset
+                        && self.text.is_char_boundary(offset)
+                        && self
+                            .line_offsets
+                            .get(at.line as usize + 1)
+                            .is_none_or(|&next| offset < next) =>
+                {
+                    let units: u32 = self.text[from..offset]
+                        .chars()
+                        .map(|character| character.len_utf16() as u32)
+                        .sum();
+                    Position::new(at.line, at.character + units)
+                }
+                _ => self.offset_to_position(offset)?,
+            };
+            cursor = Some((offset, position));
+            Some(position)
+        };
+        offsets
+            .iter()
+            .filter_map(|&offset| {
+                let (start, end, _) = self.id_token_at_offset(offset)?;
+                Some(Range {
+                    start: position_at(start)?,
+                    end: position_at(end)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn definition_range(&self, id: u32) -> Option<Range> {
         self.id_range_at_offset(*self.definitions.get(&id)?)
     }
@@ -427,6 +464,28 @@ impl Document {
         self.references
             .get(&id)
             .is_some_and(|offsets| offsets.contains(&start))
+    }
+
+    /// The last `#id=` definition at or before `offset`, as its offset and id. Walks back from
+    /// `offset` and accepts only the `#` tokens the text index records as definitions, so ids in
+    /// strings and comments are passed over; the cost is the distance to that definition.
+    pub fn enclosing_definition(&self, offset: usize) -> Option<(usize, u32)> {
+        let bytes = self.text.as_bytes();
+        let mut end = offset.min(bytes.len().checked_sub(1)?);
+        loop {
+            let start = bytes[..=end].iter().rposition(|&byte| byte == b'#')?;
+            let digits = bytes[start + 1..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let id = self.text[start + 1..start + 1 + digits].parse::<u32>().ok();
+            if let Some(id) = id
+                && self.definitions.get(&id) == Some(&start)
+            {
+                return Some((start, id));
+            }
+            end = start.checked_sub(1)?;
+        }
     }
 
     pub fn entity_name_at_position(&self, position: Position) -> Option<(String, Range)> {
