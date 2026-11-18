@@ -2,6 +2,24 @@ use super::{EntityInstanceInfo, ParameterValue, typed_name_len};
 use crate::step;
 use tower_lsp::lsp_types::{Position, Range};
 
+/// Decodes one statement with positions relative to its start: row 0 columns count from the
+/// statement's first byte, later rows keep absolute columns.
+pub(crate) fn decode_entity_instance_relative(
+    parsed: &step::Document,
+    text: &str,
+    index: usize,
+) -> Option<EntityInstanceInfo> {
+    let start = parsed.statements[index].span.start as usize;
+    let mut points = LinePoints {
+        text: text.as_bytes(),
+        offset: start,
+        row: 0,
+        column: 0,
+    };
+    decode_entity_instance(parsed, text, index, &mut points)
+        .filter(|instance| instance.parameter_list_range.is_some())
+}
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static DECODED_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

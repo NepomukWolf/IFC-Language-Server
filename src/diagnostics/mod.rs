@@ -11,12 +11,15 @@ use crate::schema::SchemaDoc;
 use crate::step;
 
 pub mod datatype;
+pub mod incremental;
 pub mod scheduler;
 pub mod syntax;
 
 #[derive(Debug)]
 pub struct DiagnosticSnapshot {
     statement_index: Option<Arc<step::Document>>,
+    statement_edits: incremental::StatementEdits,
+    validation_cache: Arc<incremental::ValidationCache>,
     text: Arc<String>,
     schema_name: Option<String>,
 }
@@ -25,6 +28,8 @@ impl DiagnosticSnapshot {
     pub fn from_document(document: &Document) -> Self {
         Self {
             statement_index: document.statement_index.clone(),
+            statement_edits: document.statement_edits.clone(),
+            validation_cache: Arc::clone(&document.validation_cache),
             text: Arc::clone(&document.text),
             schema_name: document.schema_name.clone(),
         }
@@ -55,14 +60,16 @@ pub fn collect(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = syntax::collect(snapshot);
     if let (Some(parsed), Some((schema_name, schema))) = (snapshot.statement_index(), schema) {
-        let entity_types = crate::document::entity_type_index(parsed, snapshot.text());
-        diagnostics.extend(datatype::collect_all(
+        let (datatype, mode) = incremental::collect(
             parsed,
             snapshot.text(),
-            &entity_types,
+            &snapshot.statement_edits,
+            &snapshot.validation_cache,
             schema,
-            Some(schema_name),
-        ));
+            schema_name,
+        );
+        tracing::info!(?mode, "datatype diagnostics");
+        diagnostics.extend(datatype);
     }
     diagnostics
 }

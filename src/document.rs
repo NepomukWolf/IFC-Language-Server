@@ -6,6 +6,7 @@ mod decode;
 
 #[cfg(test)]
 pub(crate) use decode::DECODED_STATEMENTS;
+pub(crate) use decode::decode_entity_instance_relative;
 use decode::{LinePoints, decode_entity_instance, utf16_len};
 
 use rustc_hash::FxHashMap;
@@ -13,7 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
-use crate::document_index::{TextIndex, rescan_text, scan_text};
+use crate::diagnostics::incremental::{StatementEdits, ValidationCache};
+use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
 use crate::schema::SchemaDoc;
 use crate::step;
 
@@ -27,6 +29,8 @@ pub struct Document {
     pub text: Arc<String>,
     /// Statement index of this document; parameters are decoded on demand.
     pub statement_index: Option<Arc<step::Document>>,
+    pub statement_edits: StatementEdits,
+    pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: FxHashMap<u32, usize>,
@@ -149,6 +153,8 @@ impl Document {
         Self {
             text: Arc::new(text),
             statement_index: Some(parsed),
+            statement_edits: StatementEdits::fresh(),
+            validation_cache: Arc::default(),
             schema_name,
             line_offsets,
             definitions,
@@ -191,8 +197,10 @@ impl Document {
         self.statement_index = Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
     }
 
+    /// Replaces the whole text, dropping the parse state and the edit log of the old one.
     pub fn replace_text(&mut self, text: String) {
         self.statement_index = None;
+        self.statement_edits = StatementEdits::fresh();
         self.text = Arc::new(text);
     }
 
@@ -234,9 +242,28 @@ impl Document {
             return Err(ApplyChangeError::InvalidRange(range));
         }
 
-        Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
-        self.statement_index = None;
-        self.reload_text_index();
+        let removed = self.text.as_bytes()[start_byte..old_end_byte].to_vec();
+        replace_text(&mut self.text, start_byte..old_end_byte, replacement);
+        if let Some(parsed) = self.statement_index.as_mut() {
+            let outcome = Arc::make_mut(parsed).edit(
+                &removed,
+                self.text.as_bytes(),
+                step::Edit {
+                    start: start_byte,
+                    delete_len: removed.len(),
+                    insert_len: replacement.len(),
+                },
+            );
+            self.statement_edits.record(outcome);
+        } else {
+            self.statement_edits = StatementEdits::fresh();
+        }
+        let edited = self.with_text_index(|index, text| {
+            edit_text_index(index, text, start_byte, &removed, replacement.len())
+        });
+        if !edited {
+            self.reload_text_index();
+        }
         Ok(())
     }
 
@@ -556,6 +583,27 @@ impl Document {
 
         let id = self.text[offset..digit_end].parse().ok()?;
         Some((offset - 1, id))
+    }
+}
+
+/// Spare capacity given to the text when an edit has to reallocate it, so that typing does not
+/// double the allocation of a large document.
+const TEXT_HEADROOM: usize = 64 * 1024;
+
+fn replace_text(text: &mut Arc<String>, range: std::ops::Range<usize>, replacement: &str) {
+    let len = text.len() - range.len() + replacement.len();
+    if Arc::strong_count(text) == 1 {
+        let owned = Arc::make_mut(text);
+        if owned.capacity() < len {
+            owned.reserve_exact(len - owned.len() + TEXT_HEADROOM);
+        }
+        owned.replace_range(range, replacement);
+    } else {
+        let mut edited = String::with_capacity(len + TEXT_HEADROOM);
+        edited.push_str(&text[..range.start]);
+        edited.push_str(replacement);
+        edited.push_str(&text[range.end..]);
+        *text = Arc::new(edited);
     }
 }
 

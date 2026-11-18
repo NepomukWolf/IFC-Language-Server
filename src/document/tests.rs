@@ -68,6 +68,39 @@ fn reference_aggregate_preserves_ranges_and_overflow() {
     );
 }
 
+#[test]
+fn insertions_reserve_bounded_headroom_and_edit_unshared_text_in_place() {
+    let text = format!("DATA;\n{}ENDSEC;\n", "#1=IFCWALL($);\n".repeat(100_000));
+    let mut document = Document::new_unloaded(text.clone());
+    let mut text = text;
+    text.shrink_to_fit();
+    document.text = Arc::new(text);
+    let shared = Arc::clone(&document.text);
+
+    for snapshot in [Some(shared), None] {
+        document
+            .apply_content_changes(&[change(
+                Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
+                "x",
+            )])
+            .unwrap();
+        drop(snapshot);
+        let spare = document.text.capacity() - document.text.len();
+        assert!(spare <= TEXT_HEADROOM, "{spare} bytes spare");
+    }
+
+    let cache_key = Arc::downgrade(&document.text);
+    let data = document.text.as_ptr();
+    document
+        .apply_content_changes(&[change(
+            Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
+            "y",
+        )])
+        .unwrap();
+    assert_eq!(document.text.as_ptr(), data, "the edit copied the text");
+    drop(cache_key);
+}
+
 fn instances(document: &Document) -> EntityInstanceCollection {
     build_entity_instances(document.statement_index.as_deref(), &document.text)
 }
@@ -606,6 +639,29 @@ fn applies_an_edit_on_the_empty_last_line_inside_an_unterminated_comment() {
     assert!(document.definitions.contains_key(&2));
 }
 
+/// Whether `edit_text_index` handled the edit without a full rescan; asserts that its result
+/// equals one when it did.
+fn local_edit_matches_scan(text: &str, start: usize, end: usize, replacement: &str) -> bool {
+    let mut index = scan_text(text);
+    let mut edited = text.to_string();
+    edited.replace_range(start..end, replacement);
+    let local = edit_text_index(
+        &mut index,
+        &edited,
+        start,
+        &text.as_bytes()[start..end],
+        replacement.len(),
+    );
+    if local {
+        assert_eq!(
+            index,
+            scan_text(&edited),
+            "{text:?} {start}..{end} {replacement:?}"
+        );
+    }
+    local
+}
+
 #[test]
 fn edits_match_full_scan_at_token_boundaries() {
     let fixtures = [
@@ -623,6 +679,7 @@ fn edits_match_full_scan_at_token_boundaries() {
     let replacements = [
         "", "x", "9", "_", " ", "\t", "\n", "'", "''", "/*", "*/", "#12=", ";", "😀", "\\X2\\",
     ];
+    let mut fast = 0;
     for text in fixtures {
         let original = Document::new_unloaded(text.to_string());
         let boundaries: Vec<_> = text
@@ -643,6 +700,12 @@ fn edits_match_full_scan_at_token_boundaries() {
                 }
                 for replacement in replacements {
                     let mut document = Document::new_unloaded(text.to_string());
+                    fast += usize::from(local_edit_matches_scan(
+                        &document.text,
+                        start,
+                        end,
+                        replacement,
+                    ));
                     document
                         .apply_content_changes(&[change(Some(range), replacement)])
                         .unwrap();
@@ -651,6 +714,7 @@ fn edits_match_full_scan_at_token_boundaries() {
             }
         }
     }
+    assert!(fast > 100);
 }
 
 #[test]
@@ -660,6 +724,7 @@ fn random_edit_sequences_match_full_scan() {
         "a", "Name", "IFCDOOR", "1", "99", "#2", "#12=", " ", "\t", "\n", "", ";", "'", "''", "/*",
         "*/", "😀", "\\X2\\",
     ];
+    let mut fast = 0;
     for seed in 1..=128u64 {
         let mut state = seed;
         let mut random = |limit: usize| {
@@ -695,6 +760,12 @@ fn random_edit_sequences_match_full_scan() {
                     continue;
                 }
                 let replacement = replacements[random(replacements.len())];
+                fast += usize::from(local_edit_matches_scan(
+                    &document.text,
+                    start,
+                    end,
+                    replacement,
+                ));
                 let event = change(Some(range), replacement);
                 document
                     .apply_content_changes(std::slice::from_ref(&event))
@@ -708,6 +779,7 @@ fn random_edit_sequences_match_full_scan() {
             batched.assert_text_index_matches_scan();
         }
     }
+    assert!(fast > 100);
 }
 
 #[test]

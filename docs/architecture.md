@@ -47,11 +47,11 @@ On open or document change:
 
 1. `Backend` unloads the statement index of other open documents.
 2. On open, the active document stores the full text and builds its statement index with `step::Document::parse`.
-3. On change, the active document applies every LSP content change in order. Each ranged change updates the source text and rescans the lightweight text index so subsequent ranges use the edited text. A full-text change replaces the source text and rescans the index.
-4. The statement index is rebuilt from the resulting text.
-5. `Backend` creates a diagnostic snapshot containing the statement index and a reference-counted source-text revision.
+3. On change, the active document applies every LSP content change in order. A ranged change edits the source text and re-parses only the statements it touches (`step::Document::edit`), falling back to a full parse when the edited region no longer splits into whole statements. A full-text change parses from scratch.
+4. The lightweight text index is edited in place, or rescanned when the edit cannot be applied locally.
+5. `Backend` creates a diagnostic snapshot containing the statement index, the recorded edits and a reference-counted source-text revision.
 6. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
-7. Diagnostics validate every statement and publish results only if the snapshot is still the newest generation for that URI.
+7. Diagnostics revalidate only the statements an edit touched, plus the statements referring to ids whose definition changed, and publish results only if the snapshot is still the newest generation for that URI.
 
 On hover or document-symbol requests:
 
@@ -109,6 +109,8 @@ notifications such as `window/showMessage`.
 pub struct Document {
     pub text: Arc<String>,
     pub statement_index: Option<Arc<step::Document>>,
+    pub statement_edits: StatementEdits,
+    pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
     pub definitions: HashMap<u32, usize>,
@@ -131,6 +133,8 @@ Important fields:
   Maps numeric ids to byte offsets of all local `#123` tokens, including the definition token.
 - `statement_index`
   The statement index: one entry per `#id = NAME(...);` statement with its span, id, entity name and parse errors. Parameters are decoded on demand from the statement text.
+- `statement_edits` and `validation_cache`
+  The statements changed since the last diagnostics run and their cached results, used for incremental revalidation.
 
 `EntityInstanceInfo` is the decoded form of one statement: entity name, parameter values and their
 ranges. Features decode only the statements they need.

@@ -18,6 +18,13 @@ pub struct TextIndex {
     pub string_reaches: Vec<(usize, usize)>,
 }
 
+/// Bounds of a local rescan: how far before an edit it looks for an indexed `#id` to restart
+/// from, how far past it it may run, and how many id tokens it may replace. Past them a full
+/// rescan is cheaper.
+const MAX_ANCHOR_DISTANCE: usize = 64 * 1024;
+const MAX_RESCAN_PAST_EDIT: usize = 1024 * 1024;
+const MAX_REPLACED_TOKENS: usize = 64 * 1024;
+
 pub fn scan_text(text: &str) -> TextIndex {
     rescan_text(text, TextIndex::default())
 }
@@ -127,6 +134,187 @@ fn scan(
         }
     }
     offset
+}
+
+/// Updates `index`, built for the text before an edit, after `removed` at `start` was replaced
+/// by the `inserted_len` bytes of `text` at `start`. Rescans from the last indexed `#id` before
+/// the edit until the first `#id` after it that the old scan also indexed: both scans are outside
+/// strings and comments there, so the rest of the index only shifts. Returns false, leaving
+/// `index` untouched, when the edit reaches into the header, when deciding where a string before
+/// the restart ends read into the edit, or when the rescan would exceed its bounds.
+pub fn edit_text_index(
+    index: &mut TextIndex,
+    text: &str,
+    start: usize,
+    removed: &[u8],
+    inserted_len: usize,
+) -> bool {
+    let bytes = text.as_bytes();
+    let Some(schema_end) = index.schema_end.filter(|&end| end <= start) else {
+        return false;
+    };
+    let floor = schema_end.max(start.saturating_sub(MAX_ANCHOR_DISTANCE));
+    let mut ahead = step::Lookahead::default();
+    let before_edit = &bytes[..start];
+    // Whether a string before an `#id` ends there depends on the `=` after it, so that lookahead
+    // must end before the edit.
+    let indexed = (floor..start).rev().find(|&offset| {
+        bytes[offset] == b'#'
+            && parse_id(bytes, offset).is_some_and(|(id, end)| {
+                step::trivia(before_edit, end, start, &mut ahead) < start
+                    && index
+                        .references
+                        .get(&id)
+                        .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
+            })
+    });
+    // The scan leaves the schema name's string right at `schema_end`.
+    let Some(anchor) =
+        indexed.or((floor == schema_end && schema_end < start).then_some(schema_end))
+    else {
+        return false;
+    };
+    // A `*/` can straddle the edit's start.
+    let strings_before = index
+        .string_reaches
+        .partition_point(|&(quote, _)| quote < anchor);
+    if index.string_reaches[..strings_before]
+        .iter()
+        .any(|&(_, reach)| reach + 1 >= start)
+    {
+        return false;
+    }
+
+    let new_edit_end = start + inserted_len;
+    let delta = inserted_len as isize - removed.len() as isize;
+    let mut new_lines = Vec::new();
+    let mut new_reaches = Vec::new();
+    let mut new_tokens = Vec::new();
+    let mut synced = false;
+    let new_stop = scan(
+        bytes,
+        anchor,
+        new_edit_end + MAX_RESCAN_PAST_EDIT,
+        &mut new_lines,
+        &mut new_reaches,
+        None,
+        |token| {
+            synced = token.offset >= new_edit_end
+                && index.references.get(&token.id).is_some_and(|offsets| {
+                    offsets
+                        .binary_search(&((token.offset as isize - delta) as usize))
+                        .is_ok()
+                });
+            if !synced {
+                new_tokens.push(token);
+            }
+            !synced
+        },
+    );
+    if !synced && new_stop < bytes.len() || new_tokens.len() > MAX_REPLACED_TOKENS {
+        return false;
+    }
+
+    let mut old_window = Vec::with_capacity(new_stop - anchor - inserted_len + removed.len());
+    old_window.extend_from_slice(&bytes[anchor..start]);
+    old_window.extend_from_slice(removed);
+    old_window.extend_from_slice(&bytes[new_edit_end..new_stop]);
+    let old_stop = anchor + old_window.len();
+    let mut old_tokens = Vec::new();
+    for at in memchr::memchr_iter(b'#', &old_window) {
+        let Some((id, _)) = parse_id(&old_window, at) else {
+            continue;
+        };
+        let offset = anchor + at;
+        if index
+            .references
+            .get(&id)
+            .is_some_and(|offsets| offsets.binary_search(&offset).is_ok())
+        {
+            old_tokens.push((id, offset));
+            if old_tokens.len() > MAX_REPLACED_TOKENS {
+                return false;
+            }
+        }
+    }
+    let lines_from = index
+        .line_offsets
+        .partition_point(|&offset| offset <= anchor);
+    let lines_to = index
+        .line_offsets
+        .partition_point(|&offset| offset <= old_stop);
+    let strings_to = index
+        .string_reaches
+        .partition_point(|&(quote, _)| quote < old_stop);
+
+    let mut touched: Vec<u32> = old_tokens
+        .iter()
+        .filter(|&&(id, offset)| index.definitions.get(&id) == Some(&offset))
+        .map(|&(id, _)| id)
+        .collect();
+    let mut old_ids: Vec<u32> = old_tokens.iter().map(|&(id, _)| id).collect();
+    old_ids.sort_unstable();
+    old_ids.dedup();
+    for id in old_ids {
+        let offsets = index
+            .references
+            .get_mut(&id)
+            .expect("an old token is indexed");
+        offsets.retain(|&offset| offset < anchor || offset >= old_stop);
+        if offsets.is_empty() {
+            index.references.remove(&id);
+        }
+    }
+    let shift = |offset: &mut usize| {
+        if *offset >= old_stop {
+            *offset = offset.wrapping_add_signed(delta);
+        }
+    };
+    if delta != 0 {
+        index.line_offsets.iter_mut().for_each(shift);
+        index.definitions.values_mut().for_each(shift);
+        index.references.values_mut().flatten().for_each(shift);
+        for (quote, reach) in &mut index.string_reaches[strings_to..] {
+            shift(quote);
+            shift(reach);
+        }
+    }
+
+    index.line_offsets.splice(lines_from..lines_to, new_lines);
+    index
+        .string_reaches
+        .splice(strings_before..strings_to, new_reaches);
+
+    touched.extend(
+        new_tokens
+            .iter()
+            .filter(|token| token.definition)
+            .map(|token| token.id),
+    );
+    new_tokens.sort_by_key(|token| token.id);
+    for tokens in new_tokens.chunk_by(|a, b| a.id == b.id) {
+        let offsets = index.references.entry(tokens[0].id).or_default();
+        let at = offsets.partition_point(|&offset| offset < tokens[0].offset);
+        offsets.splice(at..at, tokens.iter().map(|token| token.offset));
+    }
+    touched.sort_unstable();
+    touched.dedup();
+    for id in touched {
+        let last = index.references.get(&id).and_then(|offsets| {
+            offsets.iter().rev().copied().find(|&offset| {
+                parse_id(bytes, offset).is_some_and(|(_, end)| is_definition(bytes, end))
+            })
+        });
+        match last {
+            Some(offset) => {
+                index.definitions.insert(id, offset);
+            }
+            None => {
+                index.definitions.remove(&id);
+            }
+        }
+    }
+    true
 }
 
 fn parse_id(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
@@ -324,6 +512,26 @@ mod tests {
     }
 
     #[test]
+    fn edits_that_change_the_rest_of_a_large_file_fall_back_to_a_full_rescan() {
+        let mut text = String::from("FILE_SCHEMA(('IFC4'));\n");
+        for id in 1..=60_000 {
+            text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
+        }
+        let open = text.find("#2=").expect("second statement");
+        let mut with_comment = text.clone();
+        with_comment.insert_str(open, "/*");
+        let mut index = scan_text(&text);
+        assert!(!edit_text_index(&mut index, &with_comment, open, b"", 2));
+        assert!(index == scan_text(&text));
+
+        let quote = text.find("1',").expect("first closing quote") + 1;
+        let mut with_space = text.clone();
+        with_space.insert(quote, ' ');
+        assert!(edit_text_index(&mut index, &with_space, quote, b"", 1));
+        assert!(index == scan_text(&with_space));
+    }
+
+    #[test]
     fn an_unclosed_string_ends_at_the_next_statement() {
         let text = "#1=X('a);\n#2=Y(#1);\n#3=Z('b,\n  #4=W(#2);";
         let at = |needle: &str| text.find(needle).unwrap();
@@ -375,5 +583,99 @@ mod tests {
             FxHashMap::from_iter([(1, 0), (2, text.find("#2=").unwrap())])
         );
         assert!(!index.references.contains_key(&9));
+    }
+
+    #[test]
+    fn deleting_a_closing_quote_rescans_only_its_statement() {
+        let mut text = String::from("FILE_SCHEMA(('IFC4'));\n");
+        for id in 1..=60_000 {
+            text.push_str(&format!("#{id}=IFCLABEL('label {id}',#{});\n", id / 2 + 1));
+        }
+        let quote = text.find("1',").expect("first closing quote") + 1;
+        let mut without_quote = text.clone();
+        without_quote.remove(quote);
+        let mut index = scan_text(&text);
+
+        assert!(edit_text_index(&mut index, &without_quote, quote, b"'", 0));
+        assert!(index == scan_text(&without_quote));
+        assert!(edit_text_index(&mut index, &text, quote, b"", 1));
+        assert!(index == scan_text(&text));
+    }
+
+    /// Applies an edit as the document does, rescanning in full when the local edit declines it.
+    fn edit_matches_scan(text: &str, start: usize, end: usize, replacement: &str) {
+        let mut index = scan_text(text);
+        let mut edited = text.to_string();
+        edited.replace_range(start..end, replacement);
+        let removed = &text.as_bytes()[start..end];
+        if !edit_text_index(&mut index, &edited, start, removed, replacement.len()) {
+            index = rescan_text(&edited, index);
+        }
+        assert_eq!(
+            index,
+            scan_text(&edited),
+            "{text:?} {start}..{end} {replacement:?}"
+        );
+    }
+
+    #[test]
+    fn closing_a_comment_before_an_id_the_old_text_hid_in_it() {
+        let text = "FILE_SCHEMA(('IFC4'));ENDSEC;\n\
+                    #4170=IFCCARTESIANPOFNT'((0.,0.,0.));\n\
+                    /*#4171=IFC'CARTESIANT((0.,0.,0ENDSEC;\n\
+                    #4174=IFCCARTESIANPOFNT'((0.,0.,0.));\n\
+                    /* \u{1D538} \u{1D538} */\n\
+                    #4222=IFCCARTESIANPOFNT'((0.,0.,0.));";
+        let at = text.find("#4174").unwrap();
+        edit_matches_scan(text, at, at, "*/");
+    }
+
+    #[test]
+    fn opening_a_comment_whose_slash_precedes_the_edit() {
+        let text = "FILE_SCHEMA(('IFC4'));\n#1=X(#2/";
+        edit_matches_scan(text, text.len(), text.len(), "*");
+    }
+
+    #[test]
+    fn closing_a_comment_that_a_string_before_the_restart_looked_into() {
+        for (text, appended) in [
+            (
+                "FILE_SCHEMA(('IFC4'));\n#1=X('abc\n#2 /* x' #5=Y(1); \n",
+                "*/=",
+            ),
+            (
+                "FILE_SCHEMA(('IFC4'));\n#1=X('abc\nENDSEC /* x' #5=Y(1); \n",
+                "*/;",
+            ),
+            ("FILE_SCHEMA(('IFC4'));\n#1=X('abc; /* x' #9 */\n#5 ", "="),
+        ] {
+            edit_matches_scan(text, text.len(), text.len(), appended);
+        }
+    }
+
+    #[test]
+    fn random_edits_match_a_full_scan() {
+        const PIECES: [&str; 14] = [
+            "'", ";", "\n", "/*", "*/", "#1=", "#2", "ENDSEC;", "A", "b", " ", "(", ",", "=",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut below = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        fn pieces(below: &mut impl FnMut(usize) -> usize, max: usize) -> String {
+            (0..below(max + 1))
+                .map(|_| PIECES[below(PIECES.len())])
+                .collect()
+        }
+        for _ in 0..50_000 {
+            let text = format!("FILE_SCHEMA(('IFC4'));{}", pieces(&mut below, 24));
+            let start = below(text.len() + 1);
+            let end = start + below(text.len() - start + 1).min(4);
+            let replacement = pieces(&mut below, 3);
+            edit_matches_scan(&text, start, end, &replacement);
+        }
     }
 }
