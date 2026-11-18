@@ -214,6 +214,26 @@ mod tests {
     use super::*;
     use crate::document::Document;
 
+    #[test]
+    fn syntax_diagnostic_columns_are_utf16_code_units() {
+        let doc = parse_document(concat!(
+            "DATA;\n",
+            "#1=IFCWALL('ääää',%);\n",
+            "#2=IFCWALL('😀',%);\n",
+            "#3=IFCWALL('ab',%);\n",
+            "ENDSEC;\n",
+        ));
+        let columns: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| {
+                let Range { start, end } = diagnostic.range;
+                (start.line, start.character, end.line, end.character)
+            })
+            .collect();
+
+        assert_eq!(columns, [(1, 17, 1, 19), (2, 15, 2, 17), (3, 15, 3, 17)]);
+    }
+
     fn parse_document(text: &str) -> Document {
         Document::parse(text.to_string())
     }

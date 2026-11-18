@@ -877,6 +877,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn datatype_diagnostic_columns_are_utf16_code_units() {
+        let diagnostics = rendered_diagnostics(
+            "#1=IFCPROPERTY(IFCLABEL('ääää'),$,IFCLABEL('a'),$);
+#2=IFCPROPERTY(IFCLABEL('😀'),$,IFCLABEL('a'),$);
+#3=IFCPROPERTY(IFCLABEL('ab'),$,IFCLABEL('a'),$);",
+        );
+
+        assert_eq!(
+            diagnostics,
+            [
+                "0:34-0:47 Some(Error) None ListValues: expected list aggregate but found typed value",
+                "1:32-1:45 Some(Error) None ListValues: expected list aggregate but found typed value",
+                "2:32-2:45 Some(Error) None ListValues: expected list aggregate but found typed value",
+            ]
+        );
+    }
+
     fn rendered_diagnostics(text: &str) -> Vec<String> {
         let doc = parse_document(text);
         collect(&doc, &select_schema(), Some("IFC4"))
