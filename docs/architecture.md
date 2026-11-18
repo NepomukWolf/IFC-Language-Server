@@ -305,6 +305,7 @@ src/
   lib.rs
   main.rs
   rt.rs
+  wasm.rs
   backend.rs
   config.rs
   document.rs
@@ -315,6 +316,8 @@ src/
   step.rs
 samples/
   *.ifc
+wasm/
+  smoke-test.mjs
 ```
 
 ## Non-Goals
