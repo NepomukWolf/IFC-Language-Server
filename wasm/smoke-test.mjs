@@ -155,6 +155,48 @@ check(
   "debounced diagnostics follow the last edit of a burst",
 );
 
+const smallUri = "inmemory://model/small.ifc";
+const smallText = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n#1=IFCWALL('g',$,'é😀',$);\n#2=IFCX(#1);\nENDSEC;END-ISO-10303-21;";
+send({
+  method: "textDocument/didOpen",
+  params: { textDocument: { uri: smallUri, languageId: "ifc", version: 1, text: smallText } },
+});
+const counts = await request("ifc/entityCounts", { uri: smallUri });
+check(counts.result?.total === 2 && counts.result.entities[0].entity === "IFCWALL",
+  "entityCounts reports both instances in count/name order");
+const found = await request("ifc/findInstances", { uri: smallUri, query: "é😀", limit: 1 });
+check(found.result?.total === 1 && found.result.instances[0].id === 1,
+  "findInstances matches a decoded Unicode name");
+const prepared = await request("textDocument/prepareCallHierarchy", {
+  textDocument: { uri: smallUri }, position: { line: 1, character: 1 },
+});
+check(prepared.result?.[0]?.data?.id === 1, "call hierarchy prepares an instance");
+const incoming = await request("callHierarchy/incomingCalls", { item: prepared.result[0] });
+check(incoming.result?.length === 1 && incoming.result[0].from.data.id === 2,
+  "call hierarchy finds the referring instance");
+const outgoing = await request("callHierarchy/outgoingCalls", { item: incoming.result[0].from });
+check(outgoing.result?.length === 1 && outgoing.result[0].to.data.id === 1,
+  "call hierarchy resolves the outgoing reference");
+await request("ifc/instances", { uri, limit: 0 });
+const listed = await request("ifc/instances", { uri: smallUri, limit: 1 });
+check(listed.result?.total === 2 && listed.result.instances.length === 1 &&
+  listed.result.instances[0].attributes[2].value.value === "é😀" &&
+  listed.result.instances[0].range.end.character === 29,
+  "instances reloads the statement index and preserves Unicode values and byte ranges");
+send({
+  method: "textDocument/didChange",
+  params: { textDocument: { uri: smallUri, version: 2 }, contentChanges: [{
+    range: { start: { line: 2, character: 9 }, end: { line: 2, character: 10 } }, text: "9",
+  }] },
+});
+const edited = await request("ifc/instances", { uri: smallUri });
+check(edited.result?.instances[1].attributes[0].value.id === 9,
+  "instances reads incremental edits");
+const afterEdit = await request("callHierarchy/incomingCalls", { item: prepared.result[0] });
+check(afterEdit.result?.length === 0, "call hierarchy reads the edited text index");
+const unopened = await request("ifc/instances", { uri: "inmemory://model/unopened.ifc" });
+check(unopened.result === null, "instances returns null for unopened documents");
+
 await request("shutdown", null);
 send({ method: "exit" });
 await writer.close();

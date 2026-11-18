@@ -4,10 +4,10 @@
 
 mod decode;
 
-pub(crate) use decode::decode_entity_instance_relative;
+use decode::utf16_len;
 #[cfg(test)]
 pub(crate) use decode::{DECODED_STATEMENTS, UTF16_BYTES};
-use decode::{LinePoints, decode_entity_instance, utf16_len};
+pub(crate) use decode::{LinePoints, decode_entity_instance, decode_entity_instance_relative};
 
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -464,6 +464,17 @@ impl Document {
         self.references
             .get(&id)
             .is_some_and(|offsets| offsets.contains(&start))
+    }
+
+    /// Definition offsets and their ids, in document order.
+    pub fn definitions_in_order(&self) -> Vec<(usize, u32)> {
+        let mut definitions: Vec<(usize, u32)> = self
+            .definitions
+            .iter()
+            .map(|(&id, &offset)| (offset, id))
+            .collect();
+        definitions.sort_unstable();
+        definitions
     }
 
     /// The last `#id=` definition at or before `offset`, as its offset and id. Walks back from

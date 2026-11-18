@@ -26,7 +26,7 @@ thread_local! {
     pub(crate) static UTF16_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(super) fn decode_entity_instance(
+pub(crate) fn decode_entity_instance(
     parsed: &step::Document,
     text: &str,
     index: usize,
@@ -142,11 +142,11 @@ fn decode_parameter_values(
 
 /// Converts monotonically increasing byte offsets to positions with UTF-16 columns, scanning
 /// only the bytes between consecutive offsets.
-pub(super) struct LinePoints<'a> {
-    pub(super) text: &'a [u8],
-    pub(super) offset: usize,
-    pub(super) row: usize,
-    pub(super) column: usize,
+pub(crate) struct LinePoints<'a> {
+    pub(crate) text: &'a [u8],
+    pub(crate) offset: usize,
+    pub(crate) row: usize,
+    pub(crate) column: usize,
 }
 
 impl LinePoints<'_> {

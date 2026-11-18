@@ -27,6 +27,7 @@ The shipped LSP features are:
 - call hierarchy over instance references
 - range-based semantic tokens
 - schema-aware diagnostics
+- model-query custom requests: `ifc/instances`, `ifc/entityCounts`, `ifc/findInstances`
 
 ## Core Design
 
@@ -265,7 +266,7 @@ client with `window/showDocument` to move the cursor. This depends on the client
 `window.showDocument.support`; clients that do not implement it (e.g. Zed before its
 `window/showDocument` support landed) will show the actions but the jump will not occur.
 
-### Call Hierarchy
+### Call Hierarchy And Model Queries
 
 `src/features/call_hierarchy.rs` exposes local `#id` references as an LSP call hierarchy: incoming
 calls are the instances that reference an instance, outgoing calls the instances it references.
@@ -274,7 +275,10 @@ back from a reference to its `#id=` definition; cost grows with relevant referen
 Incoming calls stop after `MAX_INCOMING_CALLS` (1000) referrers and end with one item that counts the
 references left out, so a shared instance referenced from most of a model stays cheap to expand.
 
-`docs/instance-navigation.md` documents the call hierarchy items' `data`.
+`src/features/instances.rs` (`ifc/instances`) and `src/features/instance_queries.rs`
+(`ifc/entityCounts`, `ifc/findInstances`) are custom requests that `Backend::service()` registers
+for both the native binary and the wasm build. `docs/instance-navigation.md` documents their
+params and result shapes and the call hierarchy items' `data`.
 
 ### Semantic Tokens
 
