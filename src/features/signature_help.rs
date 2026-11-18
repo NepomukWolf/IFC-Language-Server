@@ -1,6 +1,6 @@
 //! Signature-help feature logic.
 //! Finds the current STEP entity argument list with a lightweight text scanner and renders
-//! schema-backed parameter information without requiring tree-sitter AST state.
+//! schema-backed parameter information without the statement index.
 
 use tower_lsp::lsp_types::{
     Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position,
@@ -82,8 +82,6 @@ fn active_parameter_index(parameter_index: usize, entity: &EntityDoc) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use tower_lsp::lsp_types::Position;
 
     use super::*;
@@ -113,12 +111,12 @@ mod tests {
                 attribute("Representation", "IfcProductRepresentation", false, true),
             ],
             url: String::new(),
-            all_supertypes: HashSet::new(),
+            all_supertypes: Default::default(),
         };
         SchemaDocCollection::from_docs([(
             "IFC4".to_string(),
             SchemaDoc {
-                entities: [("IFCWALL".to_string(), entity)].into(),
+                entities: [("IFCWALL".to_string(), entity)].into_iter().collect(),
                 types: Default::default(),
             },
         )])

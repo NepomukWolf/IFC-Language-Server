@@ -174,8 +174,8 @@ mod tests {
 
     fn empty_schema() -> SchemaDoc {
         SchemaDoc {
-            entities: HashMap::new(),
-            types: HashMap::new(),
+            entities: Default::default(),
+            types: Default::default(),
         }
     }
 

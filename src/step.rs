@@ -1,8 +1,9 @@
 mod reader;
 
-use reader::{Lookahead, Reader, SECTION_REOPENED, closed_trivia, frame_end, trivia};
-
-pub mod ast;
+pub(crate) use reader::{
+    Lookahead, MAX_NESTING, NESTING_TOO_DEEP, SECTION_REOPENED, definition, section_end, trivia,
+};
+use reader::{Reader, closed_trivia, frame_end};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Span {

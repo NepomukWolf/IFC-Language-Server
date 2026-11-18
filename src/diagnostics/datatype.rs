@@ -7,33 +7,51 @@ use std::fmt;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterValue};
+use crate::document::{EntityInstanceInfo, EntityTypeIndex, ParameterValue};
 use crate::schema::{
     AggregateKind, AggregateTypeRef, BoundValue, EntityAttributeDoc, EntityDoc, NamedTypeKind,
     PrimitiveType, SchemaDoc, SelectTypeDef, TypeDoc, TypeRef,
 };
 
-pub fn collect_with_schema_name(
-    instances: &EntityInstanceCollection,
+#[tracing::instrument(skip_all)]
+pub fn collect_all(
+    parsed: &crate::step::Document,
+    text: &str,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     schema_name: Option<&str>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for instance in &instances.instances {
-        let Some(entity) = schema.entity(&instance.entity_name) else {
-            diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
-            continue;
-        };
-
-        validate_instance(instances, schema, entity, instance, &mut diagnostics);
-    }
+    crate::document::for_each_entity_instance(parsed, text, |instance| {
+        validate(
+            entity_types,
+            schema,
+            schema_name,
+            &instance,
+            &mut diagnostics,
+        );
+    });
 
     diagnostics
 }
 
+pub(super) fn validate(
+    entity_types: &EntityTypeIndex,
+    schema: &SchemaDoc,
+    schema_name: Option<&str>,
+    instance: &EntityInstanceInfo,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(entity) = schema.entity(&instance.entity_name) {
+        validate_instance(entity_types, schema, entity, instance, diagnostics);
+    } else {
+        diagnostics.push(unknown_entity_diagnostic(instance, schema_name));
+    }
+}
+
 fn validate_instance(
-    instances: &EntityInstanceCollection,
+    entity_types: &EntityTypeIndex,
     schema: &SchemaDoc,
     entity: &EntityDoc,
     instance: &EntityInstanceInfo,
@@ -56,7 +74,7 @@ fn validate_instance(
     }
 
     for (value, attribute) in instance.parameters.iter().zip(&entity.attributes) {
-        if let Err(mismatch) = validate_value(instances, schema, value, attribute) {
+        if let Err(mismatch) = validate_value(entity_types, schema, value, attribute) {
             diagnostics.push(Diagnostic {
                 range: value.range(),
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -86,7 +104,6 @@ fn unknown_entity_diagnostic(
     }
 }
 
-/// Why a value failed validation; rendered only when it becomes a diagnostic.
 enum Mismatch<'a> {
     RequiredNull,
     OmittedUnsupported,
@@ -227,7 +244,7 @@ impl fmt::Display for Mismatch<'_> {
 type Validation<'a> = Result<(), Mismatch<'a>>;
 
 fn validate_value<'a>(
-    instances: &'a EntityInstanceCollection,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     attribute: &'a EntityAttributeDoc,
@@ -238,33 +255,36 @@ fn validate_value<'a>(
         ParameterValue::Null { .. } if !attribute.optional => Err(Mismatch::RequiredNull),
         ParameterValue::Omitted { .. } => Err(Mismatch::OmittedUnsupported),
         ParameterValue::Null { .. } => Ok(()),
-        _ => validate_non_null_value(instances, schema, value, &attribute.ty),
+        _ => validate_non_null_value(entity_types, schema, value, &attribute.ty),
     }
 }
 
 fn validate_non_null_value<'a>(
-    instances: &'a EntityInstanceCollection,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     expected: &'a TypeRef,
 ) -> Validation<'a> {
+    if matches!(value, ParameterValue::Malformed { .. }) {
+        return Ok(());
+    }
     match expected {
         TypeRef::Primitive(primitive) => validate_primitive(value, primitive),
-        TypeRef::Aggregate(aggregate) => validate_aggregate(instances, schema, value, aggregate),
+        TypeRef::Aggregate(aggregate) => validate_aggregate(entity_types, schema, value, aggregate),
         TypeRef::GenericEntity { .. } | TypeRef::Generic { .. } => Ok(()),
         TypeRef::Named(named) => match named.kind {
             NamedTypeKind::Entity => {
-                validate_entity_reference(instances, schema, value, &named.name)
+                validate_entity_reference(entity_types, schema, value, &named.name)
             }
             NamedTypeKind::Type | NamedTypeKind::Unresolved => {
-                validate_named_type(instances, schema, value, &named.name)
+                validate_named_type(entity_types, schema, value, &named.name)
             }
         },
     }
 }
 
 fn validate_named_type<'a>(
-    instances: &'a EntityInstanceCollection,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     type_name: &'a str,
@@ -275,13 +295,13 @@ fn validate_named_type<'a>(
     match type_def {
         TypeDoc::Alias(alias) => {
             let value = unwrap_inline_typed_value(value, type_name)?;
-            validate_non_null_value(instances, schema, value, &alias.target)
+            validate_non_null_value(entity_types, schema, value, &alias.target)
         }
         TypeDoc::Enumeration(enum_def) => {
             let value = unwrap_inline_typed_value(value, type_name)?;
             validate_enum_value(value, &enum_def.items)
         }
-        TypeDoc::Select(select) => validate_select(instances, schema, value, select),
+        TypeDoc::Select(select) => validate_select(entity_types, schema, value, select),
     }
 }
 
@@ -315,7 +335,7 @@ fn unwrap_inline_typed_value<'a>(
 }
 
 fn validate_select<'a>(
-    instances: &'a EntityInstanceCollection,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     select: &'a SelectTypeDef,
@@ -323,7 +343,7 @@ fn validate_select<'a>(
     if select
         .options
         .iter()
-        .any(|option| validate_non_null_value(instances, schema, value, option).is_ok())
+        .any(|option| select_option_accepts(entity_types, schema, value, option))
     {
         Ok(())
     } else {
@@ -331,6 +351,30 @@ fn validate_select<'a>(
             select: &select.name,
         })
     }
+}
+
+/// An inline typed value can only match the defined type it names, so differently named aliases
+/// and enumerations are rejected without validating the payload; nested selects are searched.
+fn select_option_accepts<'a>(
+    entity_types: &'a EntityTypeIndex,
+    schema: &'a SchemaDoc,
+    value: &'a ParameterValue,
+    option: &'a TypeRef,
+) -> bool {
+    if let (ParameterValue::Typed { type_name, .. }, TypeRef::Named(named)) = (value, option)
+        && named.kind != NamedTypeKind::Entity
+        && named.name != *type_name
+    {
+        return match schema.type_decl(&named.name) {
+            Some(TypeDoc::Select(select)) => {
+                validate_select(entity_types, schema, value, select).is_ok()
+            }
+            Some(TypeDoc::Alias(_) | TypeDoc::Enumeration(_)) => false,
+            None => true,
+        };
+    }
+
+    validate_non_null_value(entity_types, schema, value, option).is_ok()
 }
 
 fn validate_enum_value<'a>(value: &'a ParameterValue, items: &'a [String]) -> Validation<'a> {
@@ -352,7 +396,7 @@ fn validate_enum_value<'a>(value: &'a ParameterValue, items: &'a [String]) -> Va
 }
 
 fn validate_aggregate<'a>(
-    instances: &'a EntityInstanceCollection,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     aggregate: &'a AggregateTypeRef,
@@ -384,14 +428,14 @@ fn validate_aggregate<'a>(
     }
 
     for item in items {
-        validate_non_null_value(instances, schema, item, &aggregate.item)?;
+        validate_non_null_value(entity_types, schema, item, &aggregate.item)?;
     }
 
     Ok(())
 }
 
 fn validate_entity_reference<'a>(
-    instances: &'a EntityInstanceCollection,
+    entity_types: &'a EntityTypeIndex,
     schema: &'a SchemaDoc,
     value: &'a ParameterValue,
     expected_entity: &'a str,
@@ -403,17 +447,17 @@ fn validate_entity_reference<'a>(
         });
     };
 
-    let Some(instance) = instances.instance_by_id(*id) else {
+    let Some(entity_name) = entity_types.entity_name_by_id(*id) else {
         return Err(Mismatch::UnresolvedReference { id: *id });
     };
 
-    if schema.is_entity_compatible(&instance.entity_name, expected_entity) {
+    if schema.is_entity_compatible(entity_name, expected_entity) {
         Ok(())
     } else {
         Err(Mismatch::IncompatibleReference {
             expected: expected_entity,
             id: *id,
-            found: &instance.entity_name,
+            found: entity_name,
         })
     }
 }
@@ -446,7 +490,7 @@ fn validate_primitive<'a>(value: &'a ParameterValue, primitive: &PrimitiveType) 
             _ => Err(Mismatch::NotLogical { found }),
         },
         PrimitiveType::Binary { .. } => match value {
-            ParameterValue::String { .. } => Ok(()),
+            ParameterValue::Binary { .. } => Ok(()),
             _ => Err(Mismatch::NotBinary { found }),
         },
     }
@@ -474,24 +518,27 @@ impl AggregateKindDisplay for AggregateKind {
 //*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::{Position, Range};
-    use tree_sitter::Parser;
-
     use super::*;
     use crate::document::Document;
     use crate::schema::{IfcVersion, load_express};
+    use tower_lsp::lsp_types::{Position, Range};
 
     /// Helper function to parse a document and return the result.
     fn parse_document(text: &str) -> Document {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        Document::parse(&mut parser, text.to_string())
+        Document::parse(text.to_string())
     }
 
-    fn instances(document: &Document) -> EntityInstanceCollection {
-        crate::document::build_entity_instances(document.tree.as_ref(), &document.text)
+    fn collect(
+        document: &Document,
+        schema: &SchemaDoc,
+        schema_name: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        let parsed = document
+            .statement_index
+            .as_deref()
+            .expect("document has a statement index");
+        let entity_types = crate::document::entity_type_index(parsed, &document.text);
+        collect_all(parsed, &document.text, &entity_types, schema, schema_name)
     }
 
     /// Helper function to load a schema from a fixture source string.
@@ -524,20 +571,104 @@ mod tests {
     #[test]
     fn datatype_validator_reports_mismatched_attribute_type() {
         let doc = parse_document("#1=IFCWALL(123,.MOVABLE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = collect(&doc, &test_schema(), None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("GlobalId"));
         assert!(diagnostics[0].message.contains("expected string"));
     }
 
+    #[test]
+    fn datatype_validation_recovers_parameters_before_inside_and_after_a_syntax_error() {
+        let doc = parse_document(concat!(
+            "#1=IFCWALL(123,.MOVABLE.);\n",
+            "#2=IFCWALL(456,.MOVABLE.;\n",
+            "#3=IFCWALL(789,.MOVABLE.);\n",
+        ));
+        let diagnostics = collect(&doc, &test_schema(), None);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| d.range.start.line)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.message.contains("expected string"))
+        );
+    }
+
+    #[test]
+    fn datatype_validation_skips_statements_with_an_unclosed_value() {
+        let doc = parse_document(concat!(
+            "#1=IFCWALL(123,'abc);\n",
+            "#2=IFCWALL(456,(1,(2,.MOVABLE.);\n",
+            "#3=IFCWALL(789,.MOVABLE.);\n",
+        ));
+        let diagnostics = collect(&doc, &test_schema(), None);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| d.range.start.line)
+                .collect::<Vec<_>>(),
+            [2],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn datatype_validation_keeps_positions_after_a_malformed_value() {
+        let doc = parse_document("#1=IFCWALL(#,.MOVABLE.);\n#2=IFCWALL(1E,#);\n");
+        let diagnostics = collect(&doc, &test_schema(), None);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn datatype_ranges_count_utf16_units_after_non_ascii_text() {
+        let prefix = "DATA;\n#1=IFCWALL('é😀',";
+        let doc = parse_document(&format!("{prefix}123);\n"));
+        let diagnostics = collect(&doc, &test_schema(), None);
+
+        let line_prefix = &prefix[prefix.find('#').unwrap()..];
+        let start = line_prefix.encode_utf16().count() as u32;
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(1, start), Position::new(1, start + 3))
+        );
+    }
+
+    #[test]
+    fn values_nested_to_the_limit_parse_and_validate_within_a_wasm_sized_stack() {
+        let depth = crate::step::MAX_NESTING - 1;
+        let text = format!(
+            "DATA;\n#1=IFCWALL('g',{}1{});\nENDSEC;\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let doc = parse_document(&text);
+                let snapshot = crate::diagnostics::DiagnosticSnapshot::from_document(&doc);
+                assert_eq!(crate::diagnostics::syntax::collect(&snapshot), []);
+                let instance = doc.entity_instance_by_id(1).expect("instance decodes");
+                assert_eq!(instance.parameters.len(), 2);
+                assert_eq!(collect(&doc, &test_schema(), None).len(), 1);
+            })
+            .expect("thread spawns")
+            .join()
+            .expect("decoding and validation fit the stack");
+    }
+
     /// Test that the datatype validator accepts valid values.
     #[test]
     fn datatype_validator_accepts_valid_values() {
         let doc = parse_document("#1=IFCWALL('gid',.MOVABLE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &test_schema(), None);
+        let diagnostics = collect(&doc, &test_schema(), None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -545,41 +676,7 @@ mod tests {
     /// Test that the datatype validator reports unresolved references.
     #[test]
     fn datatype_validator_reports_unresolved_reference() {
-        let instances = EntityInstanceCollection::new(vec![crate::document::EntityInstanceInfo {
-            id: Some(1),
-            id_range: Some(Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 2),
-            }),
-            entity_name: "IFCWALL".to_string(),
-            entity_name_range: Range {
-                start: Position::new(0, 3),
-                end: Position::new(0, 10),
-            },
-            entity_range: Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 27),
-            },
-            parameter_list_range: Some(Range {
-                start: Position::new(0, 10),
-                end: Position::new(0, 27),
-            }),
-            parameters: vec![
-                ParameterValue::String {
-                    range: Range {
-                        start: Position::new(0, 11),
-                        end: Position::new(0, 16),
-                    },
-                },
-                ParameterValue::Reference {
-                    id: 2,
-                    range: Range {
-                        start: Position::new(0, 17),
-                        end: Position::new(0, 19),
-                    },
-                },
-            ],
-        }]);
+        let doc = parse_document("#1=IFCWALL('gid',#2);");
 
         let schema = schema_from(
             r#"
@@ -595,10 +692,43 @@ mod tests {
             "#,
         );
 
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect(&doc, &schema, None);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("does not resolve"));
+    }
+
+    #[test]
+    fn reference_checks_resolve_the_last_definition_of_each_id() {
+        let schema = schema_from(
+            r#"
+            SCHEMA IFC4;
+              ENTITY IfcTarget; END_ENTITY;
+              ENTITY IfcChild SUBTYPE OF (IfcTarget); END_ENTITY;
+              ENTITY IfcOther; END_ENTITY;
+              ENTITY IfcHolder;
+                A : LIST [1:?] OF IfcTarget;
+                B : LIST [1:?] OF IfcTarget;
+                C : IfcTarget;
+                D : IfcTarget;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        );
+        let text = "#1=IFCHOLDER((#2,#3),(#9),#4,#5);\n#2=IFCCHILD();\n#3=IFCOTHER();\n#4=IFCTARGET();\n#4=IFCOTHER();\n#5=IFCCHILD();";
+        let document = parse_document(text);
+
+        assert_eq!(
+            collect(&document, &schema, None)
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "A: expected reference to `IFCTARGET` but `#3` points to `IFCOTHER`",
+                "B: reference `#9` does not resolve to a local entity",
+                "C: expected reference to `IFCTARGET` but `#4` points to `IFCOTHER`",
+            ]
+        );
     }
 
     /// Test that the datatype validator allows omitted (`*`) values for inherited
@@ -632,8 +762,7 @@ mod tests {
         );
 
         let doc = parse_document("#15=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect(&doc, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -665,8 +794,33 @@ mod tests {
         let doc = parse_document(
             "#1=IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL('Living Room'));\n#2=IFCPROPERTYSINGLEVALUE('Offset',$,IFCLENGTHMEASURE(2.6));",
         );
-        let instances = instances(&doc);
-        let diagnostics = collect_with_schema_name(&instances, &schema, None);
+        let diagnostics = collect(&doc, &schema, None);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn datatype_validator_reads_the_type_name_before_whitespace_and_comments() {
+        let schema = schema_from(
+            r#"
+            SCHEMA IFC4;
+              TYPE IfcLabel = STRING(255);
+              END_TYPE;
+              TYPE IfcValue = SELECT (IfcLabel);
+              END_TYPE;
+              ENTITY IfcProp;
+                NominalValue : IfcValue;
+              END_ENTITY;
+            END_SCHEMA;
+            "#,
+        );
+        let doc = parse_document(concat!(
+            "#1=IFCPROP(IFCLABEL('x'));\n",
+            "#2=IFCPROP(IFCLABEL ('x'));\n",
+            "#3=IFCPROP(IFCLABEL/*c*/('x'));\n",
+            "#4=IFCPROP(IFCLABEL/*(*/('x'));\n",
+        ));
+        let diagnostics = collect(&doc, &schema, None);
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -725,8 +879,7 @@ mod tests {
 
     fn rendered_diagnostics(text: &str) -> Vec<String> {
         let doc = parse_document(text);
-        let instances = instances(&doc);
-        collect_with_schema_name(&instances, &select_schema(), Some("IFC4"))
+        collect(&doc, &select_schema(), Some("IFC4"))
             .iter()
             .map(|diagnostic| {
                 let Range { start, end } = diagnostic.range;
@@ -742,6 +895,38 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn binary_and_string_literals_have_distinct_datatypes() {
+        let schemas = crate::schema::SchemaDocCollection::new();
+        let schema = schemas.get("IFC4").expect("IFC4 is bundled");
+        let doc = parse_document("#1=IFCPROPERTYSINGLEVALUE('p',$,IFCLABEL(\"0F\"),$);");
+        let diagnostics = collect(&doc, schema, Some("IFC4"));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "NominalValue: value does not match any option of `IfcValue`"
+        );
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 32), Position::new(0, 46))
+        );
+        let schema = schema_from(
+            "SCHEMA IFC4; ENTITY IfcLiteral; Text : STRING; Bits : BINARY; END_ENTITY; END_SCHEMA;",
+        );
+        let valid = parse_document("#1=IFCLITERAL('text',\"0F\");");
+        assert_eq!(collect(&valid, &schema, Some("IFC4")), []);
+        let invalid = parse_document("#1=IFCLITERAL(\"0F\",'text');");
+        let diagnostics = collect(&invalid, &schema, Some("IFC4"));
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "Text: expected string but found binary",
+                "Bits: expected binary literal but found string",
+            ]
+        );
     }
 
     /// Test that select values matching an option, directly or through nested selects, pass.
@@ -843,6 +1028,7 @@ mod tests {
                 "3:11-3:12 Some(Error) None Count: attribute is required and does not allow `$`",
                 "3:13-3:14 Some(Error) None Ratio: `*` is not supported for this attribute",
                 "3:15-3:32 Some(Error) None Name: typed value `IFCLABEL` should contain exactly one argument",
+                "3:37-3:40 Some(Error) None Data: expected binary literal but found string",
                 "3:71-3:73 Some(Error) None Pair: expected at least 1 items but found 0",
                 "4:10-4:17 Some(Error) None IfcMisc expects 8 attributes but found 2",
                 "5:3-5:11 Some(Error) None Unknown IFC entity `IFCWALLX` in selected schema `IFC4`",
@@ -875,8 +1061,7 @@ mod tests {
     fn subcontext_messages(args: &str) -> Vec<String> {
         let schema = schema_from(SUBCONTEXT_SCHEMA);
         let doc = parse_document(&format!("#1=IFCDIRECTION();\n#2=IFCSUBCONTEXT({args});"));
-        let instances = instances(&doc);
-        collect_with_schema_name(&instances, &schema, None)
+        collect(&doc, &schema, None)
             .into_iter()
             .map(|d| d.message)
             .collect()

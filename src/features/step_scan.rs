@@ -1,6 +1,6 @@
 //! Shared lightweight STEP entity-instance argument scanner.
 //! Given a known `#id=` definition offset, this walks the positional argument list without a
-//! full tree-sitter parse. Shared by inlay hints and related-entity navigation, which both only
+//! full parse. Shared by inlay hints and related-entity navigation, which both only
 //! need argument boundaries, enclosing entity names, and referenced ids within a bounded region.
 
 #[derive(Debug, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub(crate) struct EntityArgumentContext {
     pub(crate) value_start: usize,
 }
 
-/// Locates the positional argument containing `cursor_offset` without requiring an AST.
+/// Locates the positional argument containing `cursor_offset` without the statement index.
 pub(crate) fn entity_argument_context(
     text: &str,
     cursor_offset: usize,

@@ -1,94 +1,247 @@
 //! Syntax diagnostics for IFC STEP documents.
-//! This module walks the tree-sitter parse tree and reports invalid or missing syntax nodes.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::diagnostics::DiagnosticSnapshot;
+use crate::step;
 
+#[tracing::instrument(skip_all)]
 pub fn collect(snapshot: &DiagnosticSnapshot) -> Vec<Diagnostic> {
-    let Some(tree) = &snapshot.tree else {
-        return Vec::new();
-    };
-
-    let mut diagnostics = Vec::new();
-    let mut cursor = tree.root_node().walk();
-    collect_error_nodes(&mut cursor, &mut diagnostics);
-    diagnostics
-}
-
-fn collect_error_nodes(
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    loop {
-        let node = cursor.node();
-
-        if let Some(diagnostic) = syntax_diagnostic_for_node(&node) {
-            diagnostics.push(diagnostic);
-        }
-
-        // An ERROR node's range covers everything nested in it, including the leaf ERROR
-        // that tree-sitter creates for a token the lexer cannot recognize. `has_error` is also
-        // true on every ancestor of a MISSING node.
-        if !node.is_error() && node.has_error() && cursor.goto_first_child() {
-            collect_error_nodes(cursor, diagnostics);
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn syntax_diagnostic_for_node(node: &tree_sitter::Node<'_>) -> Option<Diagnostic> {
-    let message = if node.is_error() {
-        Some("Invalid IFC STEP syntax".to_string())
-    } else if node.is_missing() {
-        Some(missing_node_message(node))
-    } else {
-        None
-    }?;
-
-    Some(Diagnostic {
-        range: node_range(node),
-        severity: Some(DiagnosticSeverity::ERROR),
-        message,
-        ..Default::default()
+    snapshot.statement_index().map_or_else(Vec::new, |parsed| {
+        parse_error_diagnostics(parsed, snapshot.text())
     })
 }
 
-fn missing_node_message(node: &tree_sitter::Node<'_>) -> String {
-    match node.kind() {
-        ";" => "Missing `;`".to_string(),
-        kind => format!("Missing `{kind}`"),
-    }
+#[derive(Clone, Copy)]
+enum Problem {
+    Invalid,
+    Missing(char),
+    TooDeep,
+    TooLarge,
+    UnclosedString,
+    UnclosedComment,
+    MissingSectionEnd,
 }
 
-fn node_range(node: &tree_sitter::Node<'_>) -> Range {
-    let start = node.start_position();
-    let end = node.end_position();
+#[derive(Clone, Copy)]
+struct Located {
+    problem: Problem,
+    start: usize,
+    end: usize,
+}
 
-    Range {
-        start: Position::new(start.row as u32, start.column as u32),
-        end: Position::new(end.row as u32, end.column as u32),
+fn parse_error_diagnostics(parsed: &step::Document, text: &str) -> Vec<Diagnostic> {
+    let mut last_statement_quote: Option<(usize, Option<Located>)> = None;
+    let mut located: Vec<Located> = parsed
+        .errors
+        .iter()
+        .map(|error| {
+            let mut start = error.span.start as usize;
+            let mut end = error.span.end as usize;
+            let statement_index = parsed
+                .statements
+                .partition_point(|statement| statement.span.start as usize <= start);
+            let statement = statement_index.checked_sub(1).and_then(|index| {
+                let statement = parsed.statements[index];
+                (start < statement.span.end as usize).then_some(statement)
+            });
+            if let Some(statement) = statement {
+                let unclosed = match last_statement_quote {
+                    Some((index, unclosed)) if index == statement_index => unclosed,
+                    _ => {
+                        let unclosed = unclosed_quote(text.as_bytes(), statement.span.range())
+                            .map(|offset| unclosed(text, offset, Problem::UnclosedString));
+                        last_statement_quote = Some((statement_index, unclosed));
+                        unclosed
+                    }
+                };
+                if let Some(located) = unclosed {
+                    return located;
+                }
+            }
+            if error.message == "unclosed string" {
+                return unclosed(text, start, Problem::UnclosedString);
+            }
+            if error.message == "unclosed comment" {
+                return unclosed(text, start, Problem::UnclosedComment);
+            }
+            let missing = match error.message {
+                "expected ;" => Some(';'),
+                "expected )" => Some(')'),
+                _ => None,
+            };
+            if let Some(token) = missing
+                && start == end
+            {
+                return Located {
+                    problem: Problem::Missing(token),
+                    start,
+                    end,
+                };
+            }
+            if error.message == step::SECTION_REOPENED {
+                return Located {
+                    problem: Problem::MissingSectionEnd,
+                    start,
+                    end,
+                };
+            }
+            if error.message == step::DOCUMENT_TOO_LARGE {
+                return Located {
+                    problem: Problem::TooLarge,
+                    start,
+                    end,
+                };
+            }
+            if error.message == step::NESTING_TOO_DEEP {
+                return Located {
+                    problem: Problem::TooDeep,
+                    start,
+                    end,
+                };
+            }
+            if let Some(statement) = statement
+                && error.message != "unexpected value"
+            {
+                end = (statement.span.end as usize).saturating_sub(1);
+            }
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            Located {
+                problem: Problem::Invalid,
+                start,
+                end,
+            }
+        })
+        .collect();
+    if parsed.unclosed_section {
+        let at = text
+            .trim_end_matches(|c: char| c.is_ascii_whitespace())
+            .len();
+        located.push(Located {
+            problem: Problem::MissingSectionEnd,
+            start: at,
+            end: at,
+        });
+    }
+
+    let offsets: Vec<usize> = located
+        .iter()
+        .flat_map(|located| [located.start, located.end])
+        .collect();
+    let mut order: Vec<usize> = (0..offsets.len()).collect();
+    order.sort_unstable_by_key(|&slot| offsets[slot]);
+    let mut positions = vec![Position::default(); offsets.len()];
+    let ascending = crate::document::positions_of(text, order.iter().map(|&slot| offsets[slot]));
+    for (&slot, position) in order.iter().zip(ascending) {
+        positions[slot] = position;
+    }
+
+    let mut diagnostics: Vec<Diagnostic> = located
+        .iter()
+        .zip(positions.as_chunks::<2>().0)
+        .map(|(located, &[start, end])| Diagnostic {
+            range: Range::new(start, end),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: match located.problem {
+                Problem::Invalid => "Invalid IFC STEP syntax".to_string(),
+                Problem::Missing(token) => format!("Missing `{token}`"),
+                Problem::TooDeep => format!(
+                    "Values nested more than {} levels deep are not supported",
+                    step::MAX_NESTING
+                ),
+                Problem::TooLarge => step::DOCUMENT_TOO_LARGE.to_string(),
+                Problem::UnclosedString => "Unclosed string; expected `'`".to_string(),
+                Problem::UnclosedComment => "Unclosed comment; expected `*/`".to_string(),
+                Problem::MissingSectionEnd => "Missing `ENDSEC;`".to_string(),
+            },
+            ..Default::default()
+        })
+        .collect();
+    diagnostics.sort_by(|a, b| {
+        (a.range.start, a.range.end, &a.message).cmp(&(b.range.start, b.range.end, &b.message))
+    });
+    diagnostics.dedup();
+    diagnostics
+}
+
+/// The opening quote of the unbalanced string outside comments.
+fn unclosed_quote(text: &[u8], span: std::ops::Range<usize>) -> Option<usize> {
+    let mut offset = span.start;
+    let mut opening = None;
+    let mut quoted = false;
+    while offset < span.end {
+        if text[offset] == b'\'' {
+            if !quoted {
+                opening = Some(offset);
+            }
+            quoted = !quoted;
+            offset += 1;
+        } else if !quoted && text[offset..span.end].starts_with(b"/*") {
+            offset = memchr::memmem::find(&text[offset + 2..span.end], b"*/")
+                .map_or(span.end, |end| offset + end + 4);
+        } else {
+            offset += 1;
+        }
+    }
+    quoted.then_some(opening).flatten()
+}
+
+/// From the opening delimiter at `offset` to the end of its line, before any `\r`.
+fn unclosed(text: &str, offset: usize, problem: Problem) -> Located {
+    let line_end = memchr::memchr(b'\n', &text.as_bytes()[offset..])
+        .map_or(text.len(), |newline| offset + newline);
+    let line_end = if text[..line_end].ends_with('\r') {
+        line_end - 1
+    } else {
+        line_end
+    };
+    Located {
+        problem,
+        start: offset,
+        end: line_end,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use tower_lsp::lsp_types::Position;
-    use tree_sitter::Parser;
 
     use super::*;
     use crate::document::Document;
 
     fn parse_document(text: &str) -> Document {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        Document::parse(&mut parser, text.to_string())
+        Document::parse(text.to_string())
+    }
+
+    #[test]
+    fn diagnostics_at_one_position_keep_their_order_after_a_local_reparse() {
+        let text = "#1321=IFCMATERIALLAYER(#1319=IFCAXIS2PLACEMENT3D('Concrete Masonry,10303-21;\nFILE_DESCRIPTION ((''), '2;\u{a0}1');\n";
+        let mut edited = parse_document(text);
+        edited
+            .apply_content_changes(&[tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 23), Position::new(0, 23))),
+                range_length: None,
+                text: "#".to_string(),
+            }])
+            .expect("change should apply");
+
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&edited));
+        let fresh = collect(&DiagnosticSnapshot::from_document(&parse_document(
+            &edited.text,
+        )));
+
+        assert_eq!(diagnostics, fresh);
+        assert!(
+            diagnostics
+                .windows(2)
+                .any(|pair| pair[0].range.start == pair[1].range.start),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
@@ -98,6 +251,69 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].range.start, Position::new(2, 0));
         assert_eq!(diagnostics[0].range.end, Position::new(2, 5));
+    }
+
+    #[test]
+    fn locating_errors_grows_linearly_with_their_number() {
+        let growth = crate::test_support::growth_on_sixteenfold(
+            2_500,
+            |lines| {
+                let text: String = (1..=lines).map(|id| format!("#{id}=IFCFOO((;\n")).collect();
+                let parsed = step::Document::parse(text.as_bytes(), false);
+                assert_eq!(parsed.errors.len(), 2 * lines);
+                (parsed, text)
+            },
+            |(parsed, text)| {
+                assert!(!parse_error_diagnostics(parsed, text).is_empty());
+            },
+        );
+        assert!(
+            growth < 4.0,
+            "16x the errors in one input took {growth:.1}x as long as in 16 inputs"
+        );
+    }
+
+    #[test]
+    fn errors_within_one_statement_grow_linearly_with_their_number() {
+        let growth = crate::test_support::growth_on_sixteenfold(
+            2_000,
+            |values| {
+                let text = format!(
+                    "DATA;\n#1=IFCFOO({});\nENDSEC;\n",
+                    vec!["@x"; values].join(",")
+                );
+                let parsed = step::Document::parse(text.as_bytes(), false);
+                assert_eq!(parsed.errors.len(), values);
+                (parsed, text)
+            },
+            |(parsed, text)| {
+                assert!(!parse_error_diagnostics(parsed, text).is_empty());
+            },
+        );
+        assert!(
+            growth < 4.0,
+            "16x the errors in one input took {growth:.1}x as long as in 16 inputs"
+        );
+    }
+
+    #[test]
+    fn oversized_documents_report_the_limit_instead_of_invalid_syntax() {
+        let mut document = Document::new_unloaded(String::new());
+        std::sync::Arc::make_mut(document.statement_index.as_mut().unwrap())
+            .errors
+            .push(step::ParseError {
+                span: step::Span::default(),
+                message: step::DOCUMENT_TOO_LARGE,
+            });
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&document)),
+            [Diagnostic {
+                range: Range::default(),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Documents of 4294967295 bytes or more are not supported".to_string(),
+                ..Default::default()
+            }]
+        );
     }
 
     #[test]
@@ -114,6 +330,72 @@ mod tests {
     }
 
     #[test]
+    fn invalid_coordinate_number_preserves_diagnostic_range() {
+        let doc = parse_document("DATA;\n#1=IFCCARTESIANPOINT((1.0,2x,3.0));\nENDSEC;\n");
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&doc)),
+            vec![Diagnostic {
+                range: Range::new(Position::new(1, 27), Position::new(1, 28)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Invalid IFC STEP syntax".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_data_section_opened_inside_the_header_misses_the_header_end() {
+        let doc = parse_document(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nDATA;\n#1=IFCCARTESIANPOINT((0.,0.,0.));\nENDSEC;\nEND-ISO-10303-21;\n",
+        );
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&doc)),
+            vec![Diagnostic {
+                range: Range::new(Position::new(5, 0), Position::new(5, 4)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Missing `ENDSEC;`".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn skipping_an_invalid_value_steps_over_a_comment_with_delimiters() {
+        let doc = parse_document("DATA;\n#1=IFCCARTESIANPOINT((1.0,2x /* ; ) */,3.0));\nENDSEC;\n");
+        assert_eq!(
+            collect(&DiagnosticSnapshot::from_document(&doc)),
+            vec![Diagnostic {
+                range: Range::new(Position::new(1, 27), Position::new(1, 28)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Invalid IFC STEP syntax".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_values_nested_beyond_the_limit_as_unsupported() {
+        let depth = step::MAX_NESTING;
+        let text = format!(
+            "DATA;\n#1=IFCWALL({}1{});\nENDSEC;\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&parse_document(&text)));
+
+        let start = "#1=IFCWALL(".len() as u32 + depth as u32 - 1;
+        assert_eq!(
+            diagnostics,
+            vec![Diagnostic {
+                range: Range::new(Position::new(1, start), Position::new(1, start + 1)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Values nested more than 256 levels deep are not supported".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
     fn reports_missing_step_semicolon() {
         let doc = parse_document("#1=IFCWALL('gid')\n#2=IFCWALL('next');");
         let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));
@@ -125,6 +407,242 @@ mod tests {
 
         assert_eq!(diagnostic.range.start, Position::new(0, 17));
         assert_eq!(diagnostic.range.end, Position::new(0, 17));
+    }
+
+    #[test]
+    fn reports_a_stray_closing_parenthesis_instead_of_a_missing_semicolon() {
+        let doc = parse_document("DATA;\n#1=IFCX((1)));\n#2=IFCX(2);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(1, 12), Position::new(1, 13)),
+                "Invalid IFC STEP syntax".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_one_unclosed_string_diagnostic_at_its_opening_quote() {
+        let doc = parse_document("#1=IFCWALL('Anna's wall');\n#2=IFCWALL('next');\n");
+        let diagnostics = collect(&DiagnosticSnapshot::from_document(&doc));
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 23), Position::new(0, 26))
+        );
+        assert_eq!(diagnostics[0].message, "Unclosed string; expected `'`");
+    }
+
+    #[test]
+    fn reports_the_unclosed_string_after_valid_strings_and_comments() {
+        for prefix in ["'gid',$,", "'it''s',/* 'ignored' */$,"] {
+            let text = format!("#1=IFCWALL({prefix}'broken);\n");
+            let diagnostics = collect(&DiagnosticSnapshot::from_document(&parse_document(&text)));
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].message, "Unclosed string; expected `'`");
+            assert_eq!(
+                diagnostics[0].range,
+                Range::new(
+                    Position::new(0, (11 + prefix.len()) as u32),
+                    Position::new(0, (text.len() - 1) as u32),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_string_range_counts_utf16_units_and_stops_before_crlf() {
+        let doc = parse_document("#1=X('y😀z,$);\r\n#2=IFCWALL('next');\r\n");
+        let ranges: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            ranges,
+            [(
+                Range::new(Position::new(0, 5), Position::new(0, 14)),
+                "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_an_unclosed_comment_from_its_opening_to_the_end_of_its_line() {
+        let doc =
+            parse_document("DATA;\n#1=IFCWALL($);\n/* never closed\r\n#2=IFCWALL(#3);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(2, 0), Position::new(2, 15)),
+                "Unclosed comment; expected `*/`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_endsec_after_the_last_token() {
+        for (text, line, character) in [
+            ("DATA;\n#1=IFCWALL($);\n\n", 1, 14),
+            ("HEADER;\nFILE_SCHEMA(('IFC4'));\r\n", 1, 22),
+            ("DATA;\n#1=IFCWALL($);\n/* end */ \n", 2, 9),
+        ] {
+            let at = Position::new(line, character);
+            assert_eq!(
+                collect(&DiagnosticSnapshot::from_document(&parse_document(text))),
+                [Diagnostic {
+                    range: Range::new(at, at),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: "Missing `ENDSEC;`".to_string(),
+                    ..Default::default()
+                }],
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_string_before_endsec_leaves_the_section_closed() {
+        let doc = parse_document("DATA;\n#1=IFCWALL('a);\nENDSEC;\nEND-ISO-10303-21;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+
+        assert_eq!(diagnostics, ["Unclosed string; expected `'`"]);
+    }
+
+    #[test]
+    fn accepts_a_byte_order_mark_and_counts_it_in_first_line_positions() {
+        let doc = parse_document("\u{FEFF}#1=IFCWALL('a);\n#2=IFCWALL($);\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(0, 12), Position::new(0, 16)),
+                "Unclosed string; expected `'`".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_a_stray_token_right_after_a_statement() {
+        let doc = parse_document("DATA;\n#1=IFCWALL($);q\r\n#2=IFCWALL($);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(1, 14), Position::new(1, 15)),
+                "Invalid IFC STEP syntax".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_statement_rejected_as_a_whole_is_reported_from_where_it_went_wrong() {
+        let doc =
+            parse_document("DATA;\n#4=IFCAXIS2PLACEMENT3DX#8,$,$);\n#8=IFCWALL($);\nENDSEC;\n");
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [(
+                Range::new(Position::new(1, 23), Position::new(1, 30)),
+                "Invalid IFC STEP syntax".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_two_unclosed_strings_and_unrelated_errors() {
+        let doc = parse_document(concat!(
+            "DATA;\n",
+            "#1=X('a);\n",
+            "#2=X(1);\n",
+            "#3=X('b);\n",
+            "#4=X(1);\n",
+            "#5=X(2)\n",
+            "#6=X(3);\n",
+            "ENDSEC;\n",
+        ));
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range.start, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [
+                (
+                    Position::new(1, 5),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (
+                    Position::new(3, 5),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (Position::new(5, 7), "Missing `;`".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_errors_read_out_of_phase_until_the_next_unclosed_string() {
+        let text = (1..=30)
+            .map(|id| match id {
+                10 | 20 => format!("#{id}=X('a);\n"),
+                25 => format!("#{id}=X(1)\n"),
+                _ => format!("#{id}=X('v',(1.,2.),.T.,'w',#3);\n"),
+            })
+            .collect::<String>();
+        let doc = parse_document(&format!("DATA;\n{text}ENDSEC;\n"));
+        let diagnostics: Vec<_> = collect(&DiagnosticSnapshot::from_document(&doc))
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range.start, diagnostic.message))
+            .collect();
+
+        assert_eq!(
+            diagnostics,
+            [
+                (
+                    Position::new(10, 6),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (
+                    Position::new(20, 6),
+                    "Unclosed string; expected `'`".to_string()
+                ),
+                (Position::new(25, 8), "Missing `;`".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_a_balanced_multiline_string_alone() {
+        let doc = parse_document("#1=IFCWALL('line\ncontinued');\n");
+        assert!(collect(&DiagnosticSnapshot::from_document(&doc)).is_empty());
     }
 
     #[test]

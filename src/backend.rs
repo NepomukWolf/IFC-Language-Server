@@ -1,12 +1,12 @@
 //! LSP backend and document store.
-//! This is the `tower-lsp` entry point: it owns the open-document map, the shared tree-sitter
+//! This is the `tower-lsp` entry point: it owns the open-document map, the shared document state
 //! parser, and the in-memory schema docs used by hover and datatype diagnostics.
 //! Request handlers stay thin here and delegate document-specific work to the feature modules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
@@ -15,7 +15,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
 use crate::diagnostics::DiagnosticSnapshot;
 use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
-use crate::document::{DEFAULT_AST_FILE_SIZE_LIMIT_BYTES, Document};
+use crate::document::{Document, EntityInstanceCache};
 use crate::features::{
     completions, definition, document_highlight, document_symbols, hover, inlay_hints, references,
     related_entities, scaffold_completions, semantic_tokens, signature_help,
@@ -29,7 +29,6 @@ struct ConfigState {
     forced_schema_name: Option<String>,
     additional_schema_paths: HashMap<String, std::path::PathBuf>,
     pending_init_config: Option<ServerConfig>,
-    ast_file_size_limit_bytes: usize,
     semantic_tokens_enabled: bool,
     completion_snippet_support: bool,
     completion_documentation_resolve_support: bool,
@@ -41,7 +40,6 @@ impl Default for ConfigState {
             forced_schema_name: None,
             additional_schema_paths: HashMap::new(),
             pending_init_config: None,
-            ast_file_size_limit_bytes: DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
             semantic_tokens_enabled: true,
             completion_snippet_support: false,
             completion_documentation_resolve_support: false,
@@ -54,9 +52,9 @@ pub struct Backend {
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     schema_docs: Arc<RwLock<SchemaDocCollection>>,
     config: Arc<RwLock<ConfigState>>,
-    ast_skip_warning_shown: Arc<RwLock<HashSet<Url>>>,
     unknown_schema_warned: Arc<RwLock<HashMap<Url, Option<String>>>>,
     diagnostic_scheduler: DiagnosticScheduler,
+    instance_cache: Arc<EntityInstanceCache>,
 }
 
 impl Backend {
@@ -67,39 +65,10 @@ impl Backend {
             documents: Arc::new(RwLock::new(HashMap::new())),
             schema_docs: Arc::new(RwLock::new(SchemaDocCollection::new())),
             config: Arc::new(RwLock::new(ConfigState::default())),
-            ast_skip_warning_shown: Arc::new(RwLock::new(HashSet::new())),
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
+            instance_cache: Arc::new(EntityInstanceCache::default()),
         }
-    }
-
-    async fn ast_file_size_limit_bytes(&self) -> usize {
-        self.config.read().await.ast_file_size_limit_bytes
-    }
-
-    #[instrument(skip(self), fields(uri = %uri, text_len, limit_bytes))]
-    async fn check_ast_support(&self, uri: &Url, text_len: usize, limit_bytes: usize) -> bool {
-        let mut shown = self.ast_skip_warning_shown.write().await;
-        if text_len <= limit_bytes {
-            shown.remove(uri);
-            return false;
-        }
-
-        if shown.insert(uri.clone()) {
-            self.client
-                .show_message(
-                    MessageType::WARNING,
-                    format!(
-                        "This IFC file is larger than the AST parsing limit ({} MB).\nNavigation and basic hover remain available, but schema diagnostics and derived-value hover are disabled.",
-                        limit_bytes / 1024 / 1024
-                    ),
-                )
-                .await;
-            warn!("skipping AST parse because document exceeds configured size limit");
-            return true;
-        }
-
-        false
     }
 
     #[instrument(skip(self), fields(uri = %uri, schema_name = schema_name.unwrap_or("<none>")))]
@@ -170,34 +139,23 @@ impl Backend {
         }
     }
 
-    #[instrument(skip(self, text), fields(uri = %uri, text_len = text.len()))]
-    async fn load_text_as_active_document(&self, uri: &Url, text: String) -> DiagnosticSnapshot {
-        let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
-        if self
-            .check_ast_support(uri, text.len(), ast_file_size_limit_bytes)
-            .await
-        {
-            crate::rt::yield_now().await;
-        }
-
-        let mut documents = self.documents.write().await;
+    #[instrument(skip(self, documents, text), fields(uri = %uri, text_len = text.len()))]
+    async fn load_text_as_active_document(
+        &self,
+        mut documents: RwLockWriteGuard<'_, HashMap<Url, Document>>,
+        uri: &Url,
+        text: String,
+    ) -> DiagnosticSnapshot {
         unload_other_documents(&mut documents, uri);
 
         let document = documents
             .entry(uri.clone())
             .or_insert_with(|| Document::new_unloaded(String::new()));
-        document.unload_parse_state();
-        document.text = Arc::new(text);
-
-        {
-            let mut parser = new_parser();
-            document.reload_parse_state(&mut parser, ast_file_size_limit_bytes);
-        }
+        document.replace_text(text);
+        document.reload_parse_state();
 
         info!(
             schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
-            has_ast = document.has_ast(),
-            ast_skipped = document.ast_skipped,
             definition_count = document.definitions.len(),
             reference_id_count = document.references.len(),
             "reloaded active document"
@@ -209,39 +167,30 @@ impl Backend {
         snapshot
     }
 
-    #[instrument(skip(self, changes), fields(uri = %uri, change_count = changes.len()))]
+    #[instrument(skip(self, documents, changes), fields(uri = %uri, change_count = changes.len()))]
     async fn apply_changes_to_active_document(
         &self,
+        mut documents: RwLockWriteGuard<'_, HashMap<Url, Document>>,
         uri: &Url,
         changes: Vec<TextDocumentContentChangeEvent>,
     ) -> Option<DiagnosticSnapshot> {
-        let ast_file_size_limit_bytes = self.ast_file_size_limit_bytes().await;
-        let mut documents = self.documents.write().await;
         unload_other_documents(&mut documents, uri);
 
         let document = documents.get_mut(uri)?;
-        let mut parser = new_parser();
-        if let Err(error) =
-            document.apply_content_changes(&mut parser, &changes, ast_file_size_limit_bytes)
-        {
+        if let Err(error) = document.apply_content_changes(&changes) {
             warn!(?error, "received invalid incremental document change");
         }
 
         info!(
             text_len = document.text.len(),
             schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
-            has_ast = document.has_ast(),
-            ast_skipped = document.ast_skipped,
             definition_count = document.definitions.len(),
             reference_id_count = document.references.len(),
             "updated active document"
         );
-        let text_len = document.text.len();
         let snapshot = DiagnosticSnapshot::from_document(document);
         drop(documents);
 
-        self.check_ast_support(uri, text_len, ast_file_size_limit_bytes)
-            .await;
         self.check_schema_support(uri, snapshot.schema_name()).await;
         Some(snapshot)
     }
@@ -259,18 +208,13 @@ impl Backend {
         unload_other_documents(documents, uri);
 
         {
-            let mut parser = new_parser();
-            documents
-                .get_mut(uri)?
-                .reload_parse_state(&mut parser, self.ast_file_size_limit_bytes().await);
+            documents.get_mut(uri)?.reload_parse_state();
         }
 
         let snapshot = {
             let document = documents.get(uri)?;
             info!(
                 schema_name = document.schema_name.as_deref().unwrap_or("<none>"),
-                has_ast = document.has_ast(),
-                ast_skipped = document.ast_skipped,
                 definition_count = document.definitions.len(),
                 reference_id_count = document.references.len(),
                 "reloaded document parse state on demand"
@@ -406,7 +350,7 @@ impl Backend {
         }
     }
 
-    #[instrument(skip(self, config), fields(ast_file_size_limit_bytes = config.ast_file_size_limit_bytes))]
+    #[instrument(skip(self, config))]
     async fn apply_config(&self, config: ServerConfig) {
         let mut schema_docs = self.schema_docs.read().await.sharing_official();
         let mut next_state = {
@@ -479,34 +423,24 @@ fn config_state_with_client_capabilities(
         forced_schema_name: None,
         additional_schema_paths: HashMap::new(),
         pending_init_config: None,
-        ast_file_size_limit_bytes: config.ast_file_size_limit_bytes,
         semantic_tokens_enabled: config.semantic_tokens_enabled,
         ..current_state.clone()
     }
 }
 
-/// Drops AST-backed parse state from every open document except `active_uri`.
-/// The backend keeps tree-sitter state for at most one document at a time. Unloaded trees are
-/// freed on a blocking thread instead of inside the handler that switched documents.
+/// Drops the statement index of every open document except `active_uri`.
+/// Large decoded tapes are freed on a blocking thread instead of inside the handler that switched documents.
 fn unload_other_documents(documents: &mut HashMap<Url, Document>, active_uri: &Url) {
-    let mut unloaded_trees = Vec::new();
+    let mut unloaded_documents = Vec::new();
     for (document_uri, document) in documents.iter_mut() {
         if document_uri != active_uri {
-            unloaded_trees.extend(document.tree.take());
+            unloaded_documents.extend(document.statement_index.take());
             document.unload_parse_state();
         }
     }
-    if !unloaded_trees.is_empty() {
-        crate::document::drop_on_blocking_thread(unloaded_trees);
+    if !unloaded_documents.is_empty() {
+        crate::document::drop_on_blocking_thread(unloaded_documents);
     }
-}
-
-fn new_parser() -> tree_sitter::Parser {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_ifc::LANGUAGE.into())
-        .expect("Error loading IFC parser");
-    parser
 }
 
 fn completion_snippet_support(params: &InitializeParams) -> bool {
@@ -638,8 +572,11 @@ impl LanguageServer for Backend {
 
         info!(text_len = text.len(), "document opened");
 
+        let documents = self.documents.write().await;
         let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
-        let snapshot = self.load_text_as_active_document(&uri, text).await;
+        let snapshot = self
+            .load_text_as_active_document(documents, &uri, text)
+            .await;
         self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
     }
 
@@ -649,8 +586,15 @@ impl LanguageServer for Backend {
         let changes = params.content_changes;
         if !changes.is_empty() {
             debug!(change_count = changes.len(), "document changed");
+            // tower-lsp polls handlers in arrival order, so queueing for the document lock before
+            // any other await makes every later request read the changed text.
+            let documents = self.documents.write().await;
+            self.instance_cache.clear();
             let diagnostic_ticket = self.diagnostic_scheduler.begin(uri.clone()).await;
-            if let Some(snapshot) = self.apply_changes_to_active_document(&uri, changes).await {
+            if let Some(snapshot) = self
+                .apply_changes_to_active_document(documents, &uri, changes)
+                .await
+            {
                 self.schedule_diagnostics(diagnostic_ticket, snapshot).await;
             } else {
                 warn!("received document change for an unopened document");
@@ -663,10 +607,12 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
 
         let mut documents = self.documents.write().await;
-        documents.remove(&uri);
+        let closed = documents.remove(&uri);
         drop(documents);
+        if let Some(closed) = closed {
+            self.instance_cache.forget(&closed.text);
+        }
 
-        self.ast_skip_warning_shown.write().await.remove(&uri);
         self.unknown_schema_warned.write().await.remove(&uri);
         self.diagnostic_scheduler.invalidate(&uri).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
@@ -817,13 +763,6 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        if let Some(node) = document.node_at_position(position) {
-            debug!(
-                node_kind = node.kind(),
-                node_text = node.utf8_text(document.text.as_bytes()).unwrap_or("?"),
-                "resolved syntax node at hover position"
-            );
-        }
         let schema_docs = self.schema_docs.read().await;
 
         let result = hover::hover(
@@ -891,8 +830,7 @@ impl LanguageServer for Backend {
                 .map(crate::schema::normalize_name)
         });
         let text = Arc::clone(&document.text);
-        let tree = document.tree.clone();
-        let ast_skipped = document.ast_skipped;
+        let parsed = document.statement_index.clone();
         drop(documents);
 
         let schema = if let Some(schema_name) = schema_name.as_deref() {
@@ -900,19 +838,12 @@ impl LanguageServer for Backend {
         } else {
             None
         };
-        let Ok(permit) = self
-            .diagnostic_scheduler
-            .semantic_work()
-            .acquire_owned()
-            .await
-        else {
-            warn!("semantic work limiter closed");
-            return Ok(None);
-        };
+        let instance_cache = Arc::clone(&self.instance_cache);
         let result = crate::rt::spawn_blocking(move || {
-            let _permit = permit;
-            let instances = crate::document::build_entity_instances(tree.as_ref(), &text);
-            document_symbols::document_symbols(&text, &instances, ast_skipped, schema.as_deref())
+            let instances = instance_cache.get_or_build_with(schema.as_ref(), &text, || {
+                document_symbols::outline_instances(parsed.as_deref(), &text, schema.as_deref())
+            });
+            document_symbols::document_symbols(&text, &instances, schema.as_deref())
         })
         .await
         .unwrap_or_else(|error| {
@@ -1206,8 +1137,8 @@ mod tests {
         *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
             "IFC4".to_string(),
             SchemaDoc {
-                entities: HashMap::new(),
-                types: HashMap::new(),
+                entities: Default::default(),
+                types: Default::default(),
             },
         )]);
 
@@ -1236,8 +1167,8 @@ mod tests {
         *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
             normalize_name("Forced"),
             SchemaDoc {
-                entities: HashMap::new(),
-                types: HashMap::new(),
+                entities: Default::default(),
+                types: Default::default(),
             },
         )]);
         backend.config.write().await.forced_schema_name = Some(normalize_name("Forced"));
@@ -1251,8 +1182,8 @@ mod tests {
 
     fn empty_schema() -> SchemaDoc {
         SchemaDoc {
-            entities: HashMap::new(),
-            types: HashMap::new(),
+            entities: Default::default(),
+            types: Default::default(),
         }
     }
 
@@ -1325,13 +1256,11 @@ mod tests {
                 std::path::PathBuf::from("/stale"),
             )]),
             pending_init_config: Some(ServerConfig::default()),
-            ast_file_size_limit_bytes: 1,
             semantic_tokens_enabled: false,
             completion_snippet_support: true,
             completion_documentation_resolve_support: true,
         };
         let new_config = ServerConfig {
-            ast_file_size_limit_bytes: 999,
             semantic_tokens_enabled: true,
             ..ServerConfig::default()
         };
@@ -1341,7 +1270,6 @@ mod tests {
         assert_eq!(next_state.forced_schema_name, None);
         assert!(next_state.additional_schema_paths.is_empty());
         assert!(next_state.pending_init_config.is_none());
-        assert_eq!(next_state.ast_file_size_limit_bytes, 999);
         assert!(next_state.semantic_tokens_enabled);
         assert!(next_state.completion_snippet_support);
         assert!(next_state.completion_documentation_resolve_support);
@@ -1380,8 +1308,8 @@ mod tests {
         *backend.schema_docs.write().await = SchemaDocCollection::from_docs([(
             normalize_name("IFC4"),
             SchemaDoc {
-                entities: HashMap::new(),
-                types: HashMap::new(),
+                entities: Default::default(),
+                types: Default::default(),
             },
         )]);
         let large = Url::parse("file:///tmp/large.ifc").unwrap();
@@ -1411,6 +1339,172 @@ mod tests {
         assert!(backend.documents.read().await[&large].is_parse_state_loaded());
         assert_eq!(scheduler.current_generation(&large).await, large_generation);
         assert_eq!(scheduler.current_generation(&other).await, other_generation);
+    }
+
+    async fn outline(backend: &Backend, uri: &Url) -> Option<DocumentSymbolResponse> {
+        backend
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("document symbols succeed")
+    }
+
+    fn outline_of_fresh_parse(text: &str) -> Option<DocumentSymbolResponse> {
+        let document = Document::parse(text.to_string());
+        let instances = document_symbols::outline_instances(
+            document.statement_index.as_deref(),
+            &document.text,
+            None,
+        );
+        document_symbols::document_symbols(&document.text, &instances, None)
+    }
+
+    #[tokio::test]
+    async fn outline_after_an_edit_reflects_the_edited_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/outline.ifc").unwrap();
+        let before = "DATA;\n#1=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n#2=IFCSITE('g',$,'S',$,$,$,$,$,$);\n#10=IFCRELAGGREGATES('g',$,$,$,#1,(#2));\nENDSEC;\n";
+        let after = before.replace("IFCSITE", "IFCBUILDING");
+        open_document(backend, &uri, before).await;
+
+        let first = outline(backend, &uri).await;
+        let repeated = outline(backend, &uri).await;
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(2, 3), Position::new(2, 10))),
+                    range_length: None,
+                    text: "IFCBUILDING".to_string(),
+                }],
+            })
+            .await;
+        let edited = outline(backend, &uri).await;
+
+        assert_eq!(backend.documents.read().await[&uri].text.as_str(), after);
+        assert_eq!(first, outline_of_fresh_parse(before));
+        assert_eq!(repeated, first);
+        assert_eq!(edited, outline_of_fresh_parse(&after));
+        assert_ne!(edited, first);
+    }
+
+    #[tokio::test]
+    async fn a_change_waiting_on_open_keeps_the_edited_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/open-order.ifc").unwrap();
+        let busy = backend.diagnostic_scheduler.hold().await;
+        let open = open_document(backend, &uri, "#1=IFCWALL($);\n");
+        let change = backend.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 3), Position::new(0, 10))),
+                range_length: None,
+                text: "IFCDOOR".to_string(),
+            }],
+        });
+        futures::pin_mut!(open, change);
+        assert!(futures::poll!(&mut open).is_pending());
+        assert!(futures::poll!(&mut change).is_pending());
+        drop(busy);
+        futures::join!(open, change);
+
+        let documents = backend.documents.read().await;
+        assert_eq!(documents[&uri].text.as_str(), "#1=IFCDOOR($);\n");
+        assert!(documents[&uri].statement_index.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_request_sent_after_a_change_reads_the_changed_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/order.ifc").unwrap();
+        open_document(
+            backend,
+            &uri,
+            "DATA;\n#1=IFCWALL($);\n#2=IFCDOOR(#1);\nENDSEC;\n",
+        )
+        .await;
+        let busy = backend.diagnostic_scheduler.hold().await;
+        let change = backend.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 0), Position::new(1, 0))),
+                range_length: None,
+                text: "#3=IFCSLAB($);\n".to_string(),
+            }],
+        });
+        let hover = backend.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(3, 12),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+        futures::pin_mut!(change, hover);
+
+        assert!(futures::poll!(&mut change).is_pending());
+        let early = futures::poll!(&mut hover);
+        drop(busy);
+        change.await;
+        let hover = match early {
+            std::task::Poll::Ready(hover) => hover,
+            std::task::Poll::Pending => hover.await,
+        };
+
+        let Some(Hover {
+            contents: HoverContents::Markup(markup),
+            ..
+        }) = hover.unwrap()
+        else {
+            panic!("hover on `#1` in the changed text");
+        };
+        assert!(markup.value.contains("#1=IFCWALL($);"), "{}", markup.value);
+    }
+
+    #[tokio::test]
+    async fn reopening_a_document_with_fewer_statements_diagnoses_the_new_text() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/reopened.ifc").unwrap();
+        let header = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n";
+        let before = format!(
+            "{header}#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCCARTESIANPOINT((1.,0.));\n#3=IFCCARTESIANPOINT('x');\nENDSEC;\n"
+        );
+        let after = format!("{header}#1=IFCCARTESIANPOINT('y');\nENDSEC;\n");
+        let (name, schema) = backend
+            .resolve_schema(Some("IFC4"))
+            .await
+            .expect("IFC4 is bundled");
+        let diagnose = |snapshot: &DiagnosticSnapshot| {
+            crate::diagnostics::collect(snapshot, Some((&name, &schema)))
+        };
+
+        let opened = backend
+            .load_text_as_active_document(backend.documents.write().await, &uri, before)
+            .await;
+        assert_ne!(diagnose(&opened), []);
+        let reopened = backend
+            .load_text_as_active_document(backend.documents.write().await, &uri, after.clone())
+            .await;
+
+        assert_eq!(
+            diagnose(&reopened),
+            diagnose(&DiagnosticSnapshot::from_document(&Document::parse(after)))
+        );
     }
 
     #[test]
