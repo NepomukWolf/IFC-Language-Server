@@ -1,9 +1,11 @@
 mod reader;
+pub mod string_literal;
 
 pub(crate) use reader::{
-    Lookahead, MAX_NESTING, NESTING_TOO_DEEP, SECTION_REOPENED, definition, section_end, trivia,
+    Lookahead, MAX_NESTING, NESTING_TOO_DEEP, SECTION_REOPENED, definition, frame_end, section_end,
+    trivia,
 };
-use reader::{Reader, closed_trivia, frame_end};
+use reader::{Reader, closed_trivia};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Span {

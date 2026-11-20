@@ -23,6 +23,7 @@ pub(crate) fn decode_entity_instance_relative(
 #[cfg(test)]
 thread_local! {
     pub(crate) static DECODED_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static UTF16_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn decode_entity_instance(
@@ -165,6 +166,8 @@ impl LinePoints<'_> {
 
 /// UTF-16 code units in UTF-8 `bytes`: one per leading byte, two for a four-byte sequence.
 pub(crate) fn utf16_len(bytes: &[u8]) -> usize {
+    #[cfg(test)]
+    UTF16_BYTES.with(|count| count.set(count.get() + bytes.len()));
     bytes
         .iter()
         .map(|&byte| usize::from(byte & 0xC0 != 0x80) + usize::from(byte >= 0xF0))

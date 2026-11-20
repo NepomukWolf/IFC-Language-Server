@@ -71,6 +71,22 @@ Resolution should be scoped to the entity under the cursor so cost does not grow
 The jump is delivered through `workspace/executeCommand` and `window/showDocument`; clients that do
 not support `window/showDocument` will show the actions without the jump taking effect.
 
+### Call Hierarchy
+
+The language server should expose references between entity instances through the LSP call
+hierarchy (`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`,
+`callHierarchy/outgoingCalls`), for the instance at the cursor position:
+
+- incoming calls: the instances that reference the instance
+- outgoing calls: the instances the instance references
+- relationship instances are ordinary intermediate nodes, so a wall leads to its
+  `IfcRelContainedInSpatialStructure` and on to the storey
+- items name the referring attributes and are labelled with `Name`, or else `GlobalId`, when the
+  schema places them
+
+Incoming calls should list at most 1000 instances, followed by one item that counts the references
+left out. For the current scope, this should be limited to a single document.
+
 ### Find References
 
 The language server should implement find references functionality for IFC symbols.

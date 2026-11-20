@@ -208,6 +208,21 @@ fn parse_builds_text_index_and_statement_index() {
 }
 
 #[test]
+fn enclosing_definition_skips_ids_that_are_not_definitions() {
+    let text = "DATA;\n#1=IFCWALL('#7=',$);\n#12=IFCX(#1,'#1=');\nENDSEC;";
+    let document = Document::new_unloaded(text.to_string());
+    let offset = |needle: &str| text.find(needle).expect("needle should exist");
+
+    let first = Some((offset("#1="), 1));
+    let second = Some((offset("#12="), 12));
+    assert_eq!(document.enclosing_definition(offset("$);")), first);
+    assert_eq!(document.enclosing_definition(offset("'#1=')")), second);
+    assert_eq!(document.enclosing_definition(offset("12=")), second);
+    assert_eq!(document.enclosing_definition(offset("ENDSEC")), second);
+    assert_eq!(document.enclosing_definition(offset("DATA")), None);
+}
+
+#[test]
 fn parse_detects_schema_name_from_text_index() {
     let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4X3_LOCAL_TEST'));ENDSEC;DATA;#1=IFCWALL($);ENDSEC;END-ISO-10303-21;";
     let document = parse_document(text);
