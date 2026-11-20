@@ -42,3 +42,33 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+  wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Lint
+        run: cargo clippy --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: Build wasm package
+        run: wasm-pack build --profile wasm-release --target web --no-pack -- --locked
+
+      - name: Smoke test wasm package
+        run: bun wasm/smoke-test.mjs pkg

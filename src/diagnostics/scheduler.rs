@@ -3,7 +3,10 @@
 //! each URI so rapid edits do not create an unbounded task or memory backlog.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 
 use tokio::sync::{Mutex, Notify};
 use tower_lsp::Client;
@@ -17,6 +20,7 @@ use crate::schema::SchemaDoc;
 pub struct DiagnosticScheduler {
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 pub struct DiagnosticTicket {
@@ -29,9 +33,24 @@ impl DiagnosticScheduler {
         let state = Arc::new(Mutex::new(SchedulerState::default()));
         let notify = Arc::new(Notify::new());
 
-        crate::rt::spawn(run_worker(client, Arc::clone(&state), Arc::clone(&notify)));
+        let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
+        let worker = run_worker(client, Arc::clone(&state), Arc::clone(&notify));
+        crate::rt::spawn(async move {
+            let mut worker = pin!(worker);
+            poll_fn(|cx| {
+                if Pin::new(&mut stopped).poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                worker.as_mut().poll(cx)
+            })
+            .await;
+        });
 
-        Self { state, notify }
+        Self {
+            state,
+            notify,
+            _shutdown: shutdown,
+        }
     }
 
     #[instrument(skip(self), fields(uri = %uri))]
@@ -298,6 +317,40 @@ mod tests {
         state.schedule(ticket, snapshot(), None)
     }
 
+    #[tokio::test]
+    async fn dropping_service_releases_its_diagnostics_worker() {
+        struct TestServer(DiagnosticScheduler);
+        #[tower_lsp::async_trait]
+        impl tower_lsp::LanguageServer for TestServer {
+            async fn initialize(
+                &self,
+                _: tower_lsp::lsp_types::InitializeParams,
+            ) -> tower_lsp::jsonrpc::Result<tower_lsp::lsp_types::InitializeResult> {
+                Ok(Default::default())
+            }
+            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+        for start_worker in [false, true] {
+            let (service, _socket) =
+                tower_lsp::LspService::new(|client| TestServer(DiagnosticScheduler::new(client)));
+            let state = Arc::downgrade(&service.inner().0.state);
+            if start_worker {
+                tokio::task::yield_now().await;
+            }
+            assert!(state.upgrade().is_some());
+            drop(service);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while state.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("diagnostics worker must exit when its service drops");
+        }
+    }
+
     #[test]
     fn replaces_pending_job_for_same_uri() {
         let mut state = SchedulerState::default();
@@ -482,6 +535,7 @@ mod tests {
             let scheduler = DiagnosticScheduler {
                 state: Arc::new(Mutex::new(SchedulerState::default())),
                 notify: Arc::new(Notify::new()),
+                _shutdown: tokio::sync::oneshot::channel().0,
             };
             let uri = uri("model");
             let text = Arc::new("#1=IFCWALL($);".to_string());

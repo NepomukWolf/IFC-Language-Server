@@ -75,6 +75,17 @@ Build a release binary with:
 cargo build --release
 ```
 
+### WebAssembly
+
+The server also builds for `wasm32-unknown-unknown`, to run in a browser. Releases include it as `ifc-language-server-<version>-wasm32.tar.gz`. To build it yourself you need [`wasm-pack`](https://github.com/drager/wasm-pack):
+
+```bash
+rustup target add wasm32-unknown-unknown
+wasm-pack build --profile wasm-release --target web --no-pack
+```
+
+The package exports `serve(input, output)`: a `ReadableStream` and a `WritableStream` of `Uint8Array` chunks carrying LSP messages framed as on stdio. Its promise resolves when `input` closes and rejects with the stream's error if either stream fails. Run it in a Web Worker; options pointing at local `.exp` files don't apply. [`wasm/smoke-test.mjs`](./wasm/smoke-test.mjs) is a complete client.
+
 ### Configuration
 
 The server accepts configuration through LSP `initializationOptions`.

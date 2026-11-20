@@ -607,10 +607,13 @@ fn replace_text(text: &mut Arc<String>, range: std::ops::Range<usize>, replaceme
     }
 }
 
-/// Freeing the tree of a large document takes hundreds of milliseconds, so values that may own the
-/// last reference to one are dropped on a blocking thread instead of inside an async handler.
+// Large cached collections can take hundreds of milliseconds to free; browsers have no blocking
+// thread pool, so they must release them inline.
 pub fn drop_on_blocking_thread<T: Send + 'static>(value: T) {
+    #[cfg(not(target_arch = "wasm32"))]
     tokio::task::spawn_blocking(move || drop(value));
+    #[cfg(target_arch = "wasm32")]
+    drop(value);
 }
 
 pub(crate) fn is_identifier_part(byte: u8) -> bool {

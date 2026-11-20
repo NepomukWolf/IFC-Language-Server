@@ -8,21 +8,17 @@ version = "0.6.0"
 edition = "2024"
 build = "build.rs"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 espr = "0.4.0"
 memchr = "2"
 percent-encoding = "2"
 rustc-hash = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
-tower-lsp = "0.20"
-tokio = {
-    version = "1",
-    default-features = false,
-    features = ["io-util", "macros", "rt", "sync", "time"],
-}
 time = "0.3"
 tracing = { version = "0.1.44", features = ["attributes"] }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["js", "v4"] }
 
 [dev-dependencies]
@@ -34,4 +30,25 @@ sha2 = "0.11"
 ureq = "3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tower-lsp = "0.20"
 tokio = { version = "1", default-features = false, features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+tower-lsp = { version = "0.20", default-features = false, features = ["runtime-agnostic"] }
+time = { version = "0.3", features = ["wasm-bindgen"] }
+# The browser build installs no tracing subscriber, so its events are compiled out.
+tracing = { version = "0.1.44", features = ["max_level_off"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-streams = "0.4"
+futures = "0.3"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["ReadableStream", "WritableStream"] }
+console_error_panic_hook = "0.1"
+
+[profile.wasm-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
