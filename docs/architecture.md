@@ -283,7 +283,8 @@ The lexer in `src/features/semantic_tokens/lexer.rs` scans borrowed document tex
 absolute byte ranges for STEP keywords, entity/type identifiers, instance ids, strings, numbers,
 enumerations, operators, and block comments.
 
-Semantic tokens do not use the statement index or schema docs.
+Semantic tokens do not use the statement index or schema docs. The server advertises them only when
+`initializationOptions.semanticTokensEnabled` is `true`; they are off by default.
 
 ### Diagnostics
 

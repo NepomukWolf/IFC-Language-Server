@@ -7,21 +7,13 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::LSPAny;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ServerConfig {
     pub overwrite_exp_schema_with_local: Option<PathBuf>,
     pub add_local_schema_to_selection: Vec<PathBuf>,
+    /// Off by default: the tokens mark only lexical categories, which supported editors already
+    /// colour with their own grammars.
     pub semantic_tokens_enabled: bool,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            overwrite_exp_schema_with_local: None,
-            add_local_schema_to_selection: Vec::new(),
-            semantic_tokens_enabled: true,
-        }
-    }
 }
 
 pub fn parse_server_config(value: &LSPAny) -> ServerConfig {
@@ -42,7 +34,7 @@ pub fn parse_server_config(value: &LSPAny) -> ServerConfig {
         semantic_tokens_enabled: object
             .get("semanticTokensEnabled")
             .and_then(|value| value.as_bool())
-            .unwrap_or(true),
+            .unwrap_or(false),
     }
 }
 
@@ -91,20 +83,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn semantic_tokens_default_to_enabled() {
+    fn semantic_tokens_default_to_disabled() {
         let value = "{}".parse::<LSPAny>().unwrap();
 
         let config = parse_server_config(&value);
 
-        assert!(config.semantic_tokens_enabled);
+        assert!(!config.semantic_tokens_enabled);
+        assert!(!ServerConfig::default().semantic_tokens_enabled);
     }
 
     #[test]
     fn parses_semantic_tokens_enabled_flag() {
-        let value = r#"{"semanticTokensEnabled":false}"#.parse::<LSPAny>().unwrap();
+        let value = r#"{"semanticTokensEnabled":true}"#.parse::<LSPAny>().unwrap();
 
         let config = parse_server_config(&value);
 
-        assert!(!config.semantic_tokens_enabled);
+        assert!(config.semantic_tokens_enabled);
     }
 }
