@@ -33,17 +33,29 @@ pub(crate) struct EntityArgumentContext {
     pub(crate) value_start: usize,
 }
 
-/// Locates the positional argument containing `cursor_offset` without the statement index.
+/// Locates the positional argument containing `cursor_offset`. With `parsed`, the statement scan
+/// starts at the last indexed statement at or before the cursor rather than at the start of `text`.
 pub(crate) fn entity_argument_context(
     text: &str,
+    parsed: Option<&crate::step::Document>,
     cursor_offset: usize,
 ) -> Option<EntityArgumentContext> {
     if cursor_offset > text.len() || !text.is_char_boundary(cursor_offset) {
         return None;
     }
 
+    // Statements start outside strings and comments, so a scan from one sees the same terminators
+    // as a scan from the start of the text.
+    let scan_from = parsed
+        .and_then(|parsed| {
+            let after = parsed
+                .statements
+                .partition_point(|statement| statement.span.start as usize <= cursor_offset);
+            Some(parsed.statements.get(after.checked_sub(1)?)?.span.start as usize)
+        })
+        .unwrap_or(0);
     let bytes = text.as_bytes();
-    let mut offset = statement_start_before_cursor(text, cursor_offset);
+    let mut offset = statement_start_before_cursor(text, scan_from, cursor_offset);
     offset = skip_trivia(bytes, offset, bytes.len());
     let (_, next) = scan_instance_id(bytes, offset, bytes.len())?;
     offset = skip_trivia(bytes, next, bytes.len());
@@ -107,10 +119,10 @@ pub(crate) fn entity_argument_context(
     })
 }
 
-fn statement_start_before_cursor(text: &str, cursor_offset: usize) -> usize {
+fn statement_start_before_cursor(text: &str, from: usize, cursor_offset: usize) -> usize {
     let bytes = text.as_bytes();
-    let mut offset = 0;
-    let mut statement_start = 0;
+    let mut offset = from;
+    let mut statement_start = from;
 
     while offset < cursor_offset {
         match bytes[offset] {
@@ -183,25 +195,6 @@ pub(crate) fn scan_instance(
         },
         end,
     ))
-}
-
-/// Reads only the entity name, as written, at a known `#id=` definition offset.
-pub(crate) fn scan_definition_entity_name(
-    text: &str,
-    start: usize,
-    scan_end: usize,
-) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let (_, mut offset) = scan_instance_id(bytes, start, scan_end)?;
-    offset = skip_trivia(bytes, offset, scan_end);
-    if bytes.get(offset) != Some(&b'=') {
-        return None;
-    }
-
-    offset = skip_trivia(bytes, offset + 1, scan_end);
-    let entity_start = offset;
-    offset = scan_identifier(bytes, offset, scan_end)?;
-    text.get(entity_start..offset)
 }
 
 /// Collects every local instance id (`#N`) referenced within `[start, end)`, skipping strings
@@ -420,28 +413,39 @@ mod tests {
     }
 
     #[test]
-    fn scans_only_definition_entity_name() {
-        let text = "#12 = IfcWall(";
-
-        assert_eq!(
-            scan_definition_entity_name(text, 0, text.len()),
-            Some("IfcWall")
-        );
-    }
-
-    #[test]
     fn argument_context_rejects_statement_without_leading_hash() {
         let text = "12=IFCWALL(";
-        assert!(entity_argument_context(text, text.len()).is_none());
+        assert!(entity_argument_context(text, None, text.len()).is_none());
     }
 
     #[test]
     fn argument_context_skips_leading_comments() {
         let text = "#1=IFCWALL($, /* explanation */ .SO";
-        let context = entity_argument_context(text, text.len()).expect("expected argument context");
+        let context =
+            entity_argument_context(text, None, text.len()).expect("expected argument context");
 
         assert_eq!(context.active_parameter, 1);
         assert_eq!(&text[context.value_start..], " .SO");
+    }
+
+    #[test]
+    fn argument_context_from_indexed_statements_matches_scan_from_start() {
+        let text = "ISO-10303-21;\nHEADER;FILE_SCHEMA(('IFC4'));ENDSEC;\nDATA;\n\
+            #1=IFCWALL('a;b', /* #9=X(; */ #2, $);\n\
+            #2 = IFCSLAB('#3=IFCBEAM(', (#1, #4));junk #4=IFCBEAM('it''s;', .T.);\n\
+            #5=IFCROOF($, 'multi\nline; #6=IFCX(', (#1,\n#2));\n\
+            #7=IFCROOF('#1;#2', $, (#5, #4));\n\
+            #1=IFCWALL(#4, /* open; comment";
+        let parsed = crate::step::Document::parse(text.as_bytes(), false);
+        assert!(parsed.statements.len() >= 4);
+
+        for cursor in 0..=text.len() {
+            assert_eq!(
+                entity_argument_context(text, Some(&parsed), cursor),
+                entity_argument_context(text, None, cursor),
+                "cursor {cursor}"
+            );
+        }
     }
 
     #[test]
