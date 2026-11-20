@@ -86,6 +86,23 @@ wasm-pack build --profile wasm-release --target web --no-pack
 
 The package exports `serve(input, output)`: a `ReadableStream` and a `WritableStream` of `Uint8Array` chunks carrying LSP messages framed as on stdio. Its promise resolves when `input` closes and rejects with the stream's error if either stream fails. Run it in a Web Worker; options pointing at local `.exp` files don't apply. [`wasm/smoke-test.mjs`](./wasm/smoke-test.mjs) is a complete client.
 
+### Benchmarks
+
+```bash
+cargo bench                                            # measure the current branch
+git switch dev && cargo bench -- --save-baseline dev   # save a baseline
+git switch my-branch && cargo bench -- --baseline dev  # compare against it
+```
+
+The benches use the larger files in `samples/` and a generated property-heavy model (18 MB; `IFC_BENCH_SYNTHETIC_MB` sets another size). Set `IFC_BENCH_MODEL` to one or more paths (separated like `PATH`) to benchmark other models instead.
+
+Peak heap usage while opening and editing a model:
+
+```bash
+cargo run --release --example peak_memory                       # the generated model
+cargo run --release --example peak_memory -- path/to/model.ifc
+```
+
 ### Configuration
 
 The server accepts configuration through LSP `initializationOptions`.

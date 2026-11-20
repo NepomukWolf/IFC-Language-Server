@@ -10,6 +10,7 @@ build = "build.rs"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+bench = false
 
 [dependencies]
 espr = "0.4.0"
@@ -22,9 +23,19 @@ tracing = { version = "0.1.44", features = ["attributes"] }
 uuid = { version = "1", features = ["js", "v4"] }
 
 [dev-dependencies]
+criterion = "0.8"
 futures = "0.3"
 tokio = { version = "1", features = ["test-util"] }
 tower = "0.4"
+
+[[bin]]
+name = "ifc-language-server"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "lsp"
+harness = false
 
 [build-dependencies]
 sha2 = "0.11"
