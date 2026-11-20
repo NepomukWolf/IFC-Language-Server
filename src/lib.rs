@@ -9,6 +9,8 @@ mod document_index;
 mod features;
 mod rt;
 mod schema;
-mod step;
+pub mod step;
+#[cfg(test)]
+mod test_support;
 
 pub use backend::Backend;
