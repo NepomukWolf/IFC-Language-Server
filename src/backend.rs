@@ -935,7 +935,12 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let result = references::find_references(&uri, document, position);
+        let result = references::find_references(
+            &uri,
+            document,
+            position,
+            params.context.include_declaration,
+        );
         drop(documents);
         debug!(
             result_count = result.as_ref().map_or(0, Vec::len),

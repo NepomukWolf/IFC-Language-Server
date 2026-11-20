@@ -91,6 +91,8 @@ left out. For the current scope, this should be limited to a single document.
 
 The language server should implement find references functionality for IFC symbols.
 
+The instance's definition should be included only when the client asks for it with `includeDeclaration`.
+
 For the current scope, this should be limited to a single document. Cross-file indexing is not required.
 
 ### Document Highlight
