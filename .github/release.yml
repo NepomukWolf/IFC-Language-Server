@@ -1,0 +1,31 @@
+# Sections of the release notes GitHub generates from merged pull requests. A pull request goes into
+# the first section whose labels it has. CHANGELOG.md holds the curated, user-facing summary.
+changelog:
+  exclude:
+    labels:
+      - dependencies
+      - github_actions
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking
+    - title: New features
+      labels:
+        - enhancement
+    - title: Fixes
+      labels:
+        - bug
+    - title: Performance
+      labels:
+        - optimization
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Internal
+      labels:
+        - refactor
+        - tests
+        - ci
+    - title: Other changes
+      labels:
+        - "*"

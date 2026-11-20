@@ -71,6 +71,13 @@ Prefer the simplest implementation that matches the documented current scope in 
 - Do not silently broaden the project into diagnostics, workspace indexing, or additional LSP features.
 - If a design can be simpler, prefer the simpler version.
 
+## Changelog
+
+- A change users or editor integrations notice adds a line under `## [Unreleased]` in `CHANGELOG.md`, with its pull request number. Breaking changes, removed settings and changed behavior belong there especially.
+- Internal changes (refactors, tests, CI, benches, dependency bumps) need no entry.
+- Label each pull request so the generated release notes sort it: `breaking`, `enhancement`, `bug`, `optimization`, `documentation`, or `refactor`/`tests`/`ci` for internal work. Sections are configured in `.github/release.yml`.
+- At release time, rename `## [Unreleased]` to the version and date, add a new empty `## [Unreleased]`, and update the compare links at the end of the file.
+
 ## Verification Gate
 
 The following commands must pass for a change to be verified:

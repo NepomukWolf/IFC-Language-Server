@@ -159,6 +159,8 @@ jobs:
             exit 1
           fi
 
+          # The generated list of pull requests follows this note.
           gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
             --title "${GITHUB_REF_NAME}" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for the user-facing changes in this release." \
             --generate-notes
