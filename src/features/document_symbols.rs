@@ -6,6 +6,10 @@ use crate::document::{EntityInstanceCollection, EntityInstanceInfo, ParameterVal
 use crate::schema::SchemaDoc;
 use tower_lsp::lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind};
 
+/// The outline nests no deeper than this many levels, because clients and the JSON serialiser
+/// recurse over it.
+const MAX_OUTLINE_DEPTH: usize = 256;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
     Project,
@@ -106,6 +110,7 @@ pub fn document_symbols(
         }
     }
     let mut parent = HashMap::new();
+    let mut trees = TreeRoots::new(instances.instances.len());
     for child in 0..instances.instances.len() {
         let Some(class) = classes.get(child).copied().flatten() else {
             continue;
@@ -117,8 +122,9 @@ pub fn document_symbols(
         let options = candidates.entry(child).or_default();
         options.sort_by_key(|edge| (priority(class, edge.kind), edge.order, edge.parent));
         for edge in options.iter() {
-            if !would_cycle(child, edge.parent, &parent) {
+            if trees.root(edge.parent) != child {
                 parent.insert(child, edge.parent);
+                trees.attach(child, edge.parent);
                 break;
             }
         }
@@ -140,45 +146,41 @@ pub fn document_symbols(
         })
         .collect();
     roots.sort_unstable();
-    let mut emitted = HashSet::new();
-    let mut symbols = Vec::new();
-    for root in roots {
-        symbols.push(render_real(
-            root,
-            instances,
-            schema,
-            &lines,
-            &classes,
-            &children,
-            &mut emitted,
-        ));
-    }
+    let mut outline = OutlineBuilder {
+        instances,
+        classes: &classes,
+        children: &children,
+        nodes: Vec::new(),
+        unexpanded: Vec::new(),
+    };
+    let mut top: Vec<usize> = roots
+        .into_iter()
+        .map(|root| outline.add_instance(root))
+        .collect();
 
     let mut uncontained: Vec<usize> = relevant
         .iter()
         .copied()
-        .filter(|index| {
-            classes[*index] == Some(Class::Product)
-                && !emitted.contains(index)
-                && !parent.contains_key(index)
-        })
+        .filter(|index| classes[*index] == Some(Class::Product) && !parent.contains_key(index))
         .collect();
     uncontained.sort_unstable();
     if !uncontained.is_empty() {
-        let grouped = render_product_groups(
-            &uncontained,
-            ProductRenderMode::GroupMultiOnly,
-            instances,
-            schema,
-            &lines,
-            &classes,
-            &children,
-            &mut emitted,
-        );
-        if !grouped.is_empty() {
-            symbols.push(bucket_symbol("Uncontained products", grouped));
-        }
+        let bucket = outline.add(OutlineLabel::Bucket("Uncontained products".to_string()));
+        outline.nodes[bucket].children =
+            outline.add_product_groups(&uncontained, ProductRenderMode::GroupMultiOnly);
+        top.push(bucket);
     }
+    outline.expand();
+    let symbols = outline_symbols(&outline.nodes, &top, |label, children| match label {
+        OutlineLabel::Instance(index) => instance_symbol(
+            &lines,
+            schema,
+            &instances.instances[*index],
+            classes[*index],
+            children,
+        ),
+        OutlineLabel::Bucket(name) => bucket_symbol(name, children),
+    });
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
@@ -357,58 +359,188 @@ fn priority(class: Class, kind: EdgeKind) -> u8 {
         },
     }
 }
-fn would_cycle(child: usize, mut candidate: usize, parent: &HashMap<usize, usize>) -> bool {
-    loop {
-        if candidate == child {
-            return true;
+/// Union-find over the chosen parent links: each set is one outline tree, and `root` holds that
+/// tree's root at the set's representative.
+struct TreeRoots {
+    set: Vec<usize>,
+    size: Vec<usize>,
+    root: Vec<usize>,
+}
+
+impl TreeRoots {
+    fn new(len: usize) -> Self {
+        Self {
+            set: (0..len).collect(),
+            size: vec![1; len],
+            root: (0..len).collect(),
         }
-        let Some(next) = parent.get(&candidate) else {
-            return false;
+    }
+
+    fn representative(&mut self, mut index: usize) -> usize {
+        while self.set[index] != index {
+            self.set[index] = self.set[self.set[index]];
+            index = self.set[index];
+        }
+        index
+    }
+
+    fn root(&mut self, index: usize) -> usize {
+        let representative = self.representative(index);
+        self.root[representative]
+    }
+
+    /// `child` must be the root of its tree.
+    fn attach(&mut self, child: usize, parent: usize) {
+        let child_set = self.representative(child);
+        let parent_set = self.representative(parent);
+        let root = self.root[parent_set];
+        let (small, large) = if self.size[child_set] < self.size[parent_set] {
+            (child_set, parent_set)
+        } else {
+            (parent_set, child_set)
         };
-        candidate = *next;
+        self.set[small] = large;
+        self.size[large] += self.size[small];
+        self.root[large] = root;
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_real(
-    index: usize,
-    instances: &EntityInstanceCollection,
-    schema: Option<&SchemaDoc>,
-    lines: &[&str],
-    classes: &[Option<Class>],
-    children: &HashMap<usize, Vec<usize>>,
-    emitted: &mut HashSet<usize>,
-) -> DocumentSymbol {
-    emitted.insert(index);
-    let item = &instances.instances[index];
-    let all_children = children.get(&index).cloned().unwrap_or_default();
-    let mut nested = Vec::new();
-    for child in all_children
-        .iter()
-        .copied()
-        .filter(|child| matches!(classes[*child], Some(Class::Project | Class::Spatial)))
-    {
-        if !emitted.contains(&child) {
-            nested.push(render_real(
-                child, instances, schema, lines, classes, children, emitted,
-            ));
+enum OutlineLabel {
+    Instance(usize),
+    Bucket(String),
+}
+
+struct OutlineNode {
+    label: OutlineLabel,
+    children: Vec<usize>,
+}
+
+struct OutlineBuilder<'a> {
+    instances: &'a EntityInstanceCollection,
+    classes: &'a [Option<Class>],
+    children: &'a HashMap<usize, Vec<usize>>,
+    nodes: Vec<OutlineNode>,
+    unexpanded: Vec<(usize, usize)>,
+}
+
+impl OutlineBuilder<'_> {
+    fn add(&mut self, label: OutlineLabel) -> usize {
+        self.nodes.push(OutlineNode {
+            label,
+            children: Vec::new(),
+        });
+        self.nodes.len() - 1
+    }
+
+    fn add_instance(&mut self, index: usize) -> usize {
+        let node = self.add(OutlineLabel::Instance(index));
+        self.unexpanded.push((node, index));
+        node
+    }
+
+    fn expand(&mut self) {
+        let classes = self.classes;
+        while let Some((node, index)) = self.unexpanded.pop() {
+            let all_children = self.children.get(&index).map_or(&[][..], Vec::as_slice);
+            let mut nested: Vec<usize> = all_children
+                .iter()
+                .copied()
+                .filter(|child| matches!(classes[*child], Some(Class::Project | Class::Spatial)))
+                .map(|child| self.add_instance(child))
+                .collect();
+            let products: Vec<usize> = all_children
+                .iter()
+                .copied()
+                .filter(|child| classes[*child] == Some(Class::Product))
+                .collect();
+            nested.extend(self.add_product_groups(&products, product_render_mode(classes[index])));
+            self.nodes[node].children = nested;
         }
     }
-    let products: Vec<usize> = all_children
-        .into_iter()
-        .filter(|child| classes[*child] == Some(Class::Product))
-        .collect();
-    nested.extend(render_product_groups(
-        &products,
-        product_render_mode(classes[index]),
-        instances,
-        schema,
-        lines,
-        classes,
-        children,
-        emitted,
-    ));
-    instance_symbol(lines, schema, item, classes[index], nested)
+
+    fn add_product_groups(&mut self, indices: &[usize], mode: ProductRenderMode) -> Vec<usize> {
+        if matches!(mode, ProductRenderMode::Direct) {
+            return indices
+                .iter()
+                .map(|&index| self.add_instance(index))
+                .collect();
+        }
+        let instances = self.instances;
+        let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for &index in indices {
+            groups
+                .entry(&instances.instances[index].entity_name)
+                .or_default()
+                .push(index);
+        }
+        let mut result = Vec::new();
+        for (entity, group) in groups {
+            if let [index] = group[..] {
+                result.push(self.add_instance(index));
+            } else {
+                let bucket = self.add(OutlineLabel::Bucket(format!("{entity} ({})", group.len())));
+                self.nodes[bucket].children = group
+                    .into_iter()
+                    .map(|index| self.add_instance(index))
+                    .collect();
+                result.push(bucket);
+            }
+        }
+        result
+    }
+}
+
+/// Symbols at `MAX_OUTLINE_DEPTH` have no children: when a node one level above it has deeper
+/// descendants, all its descendant instances become its direct children in document order.
+fn outline_symbols(
+    nodes: &[OutlineNode],
+    top: &[usize],
+    symbol: impl Fn(&OutlineLabel, Vec<DocumentSymbol>) -> DocumentSymbol,
+) -> Vec<DocumentSymbol> {
+    let mut visit = Vec::new();
+    let mut stack: Vec<(usize, usize)> = top.iter().map(|&node| (node, 1)).collect();
+    while let Some((node, level)) = stack.pop() {
+        visit.push((node, level));
+        if level + 1 < MAX_OUTLINE_DEPTH {
+            stack.extend(nodes[node].children.iter().map(|&child| (child, level + 1)));
+        }
+    }
+    let mut built: Vec<Option<DocumentSymbol>> = (0..nodes.len()).map(|_| None).collect();
+    for &(node, level) in visit.iter().rev() {
+        let children = &nodes[node].children;
+        let symbols = if level + 1 < MAX_OUTLINE_DEPTH {
+            children
+                .iter()
+                .map(|&child| built[child].take().expect("children are built first"))
+                .collect()
+        } else if children
+            .iter()
+            .all(|&child| nodes[child].children.is_empty())
+        {
+            children
+                .iter()
+                .map(|&child| symbol(&nodes[child].label, Vec::new()))
+                .collect()
+        } else {
+            let mut descendants = Vec::new();
+            let mut pending = children.clone();
+            while let Some(descendant) = pending.pop() {
+                if let OutlineLabel::Instance(index) = nodes[descendant].label {
+                    descendants.push((index, descendant));
+                }
+                pending.extend(&nodes[descendant].children);
+            }
+            descendants.sort_unstable();
+            descendants
+                .into_iter()
+                .map(|(_, descendant)| symbol(&nodes[descendant].label, Vec::new()))
+                .collect()
+        };
+        built[node] = Some(symbol(&nodes[node].label, symbols));
+    }
+    top.iter()
+        .map(|&node| built[node].take().expect("top-level nodes are built"))
+        .collect()
 }
 
 fn product_render_mode(parent_class: Option<Class>) -> ProductRenderMode {
@@ -416,56 +548,6 @@ fn product_render_mode(parent_class: Option<Class>) -> ProductRenderMode {
         Some(Class::Product) => ProductRenderMode::Direct,
         _ => ProductRenderMode::GroupMultiOnly,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_product_groups(
-    indices: &[usize],
-    mode: ProductRenderMode,
-    instances: &EntityInstanceCollection,
-    schema: Option<&SchemaDoc>,
-    lines: &[&str],
-    classes: &[Option<Class>],
-    children: &HashMap<usize, Vec<usize>>,
-    emitted: &mut HashSet<usize>,
-) -> Vec<DocumentSymbol> {
-    if matches!(mode, ProductRenderMode::Direct) {
-        let mut result = Vec::new();
-        for &index in indices {
-            if !emitted.contains(&index) {
-                result.push(render_real(
-                    index, instances, schema, lines, classes, children, emitted,
-                ));
-            }
-        }
-        return result;
-    }
-
-    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for &index in indices {
-        if !emitted.contains(&index) {
-            groups
-                .entry(&instances.instances[index].entity_name)
-                .or_default()
-                .push(index);
-        }
-    }
-    let mut result = Vec::new();
-    for (entity, group) in groups {
-        let total = group.len();
-        let mut items = Vec::new();
-        for index in group {
-            items.push(render_real(
-                index, instances, schema, lines, classes, children, emitted,
-            ));
-        }
-        if items.len() == 1 {
-            result.extend(items);
-        } else if !items.is_empty() {
-            result.push(bucket_symbol(&format!("{entity} ({total})"), items));
-        }
-    }
-    result
 }
 
 fn instance_symbol(
