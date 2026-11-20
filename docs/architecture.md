@@ -49,8 +49,8 @@ On open or document change:
 2. On open, the active document stores the full text and builds its statement index with `step::Document::parse`.
 3. On change, the active document applies every LSP content change in order. A ranged change edits the source text and re-parses only the statements it touches (`step::Document::edit`), falling back to a full parse when the edited region no longer splits into whole statements. A full-text change parses from scratch.
 4. The lightweight text index is edited in place, or rescanned when the edit cannot be applied locally.
-5. `Backend` creates a diagnostic snapshot containing the statement index, the recorded edits and a reference-counted source-text revision.
-6. The snapshot is submitted to a bounded background scheduler and the notification handler returns.
+5. On open, `Backend` creates a diagnostic snapshot containing the statement index, the recorded edits and a reference-counted source-text revision. On change, it spawns diagnostic preparation through `src/rt.rs`: an isolated edit runs immediately; an edit less than 100 ms after the previous edit waits 100 ms. Parsing and text indexing remain eager in the notification handler.
+6. Diagnostic preparation checks its generation before acquiring the document lock and again under the lock, dropping superseded runs before taking a snapshot. A current run reloads the statement index if needed and submits its snapshot to the bounded background scheduler.
 7. Diagnostics revalidate only the statements an edit touched, plus the statements referring to ids whose definition changed, and publish results only if the snapshot is still the newest generation for that URI.
 
 On hover or document-symbol requests:
@@ -58,7 +58,7 @@ On hover or document-symbol requests:
 1. `Backend::ensure_document_loaded` rebuilds the statement index of the requested document if it was unloaded.
 2. Reloading one document unloads the statement index of the other open documents.
 3. Hover decodes only the statements it reads. Document symbols decode relationships and outline-classified entities in bounded blocking work.
-4. If request-time reloading produced a diagnostic snapshot, it is submitted to the same background scheduler after the feature result is computed, unless the document's current diagnostics generation was already scheduled with the same text and schema.
+4. If request-time reloading produced a diagnostic snapshot, it is submitted to the same background scheduler after the feature result is computed, unless its source-text revision differs from the open document or the document's current diagnostics generation was already scheduled with the same text and schema. The document read lock covers the revision check and scheduling so an intervening edit cannot be superseded by an older snapshot.
 
 Definition, references, document-highlight, signature-help, and semantic-token range requests read
 the stored document text and text index only. These requests do not reload the statement index or

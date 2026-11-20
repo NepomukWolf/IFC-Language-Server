@@ -27,6 +27,7 @@ pub enum ApplyChangeError {
 #[derive(Debug)]
 pub struct Document {
     pub text: Arc<String>,
+    pub last_change: Option<crate::rt::Instant>,
     /// Statement index of this document; parameters are decoded on demand.
     pub statement_index: Option<Arc<step::Document>>,
     pub statement_edits: StatementEdits,
@@ -152,6 +153,7 @@ impl Document {
         let parsed = Arc::new(step::Document::parse(text.as_bytes(), false));
         Self {
             text: Arc::new(text),
+            last_change: None,
             statement_index: Some(parsed),
             statement_edits: StatementEdits::fresh(),
             validation_cache: Arc::default(),

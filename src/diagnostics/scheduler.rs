@@ -17,10 +17,12 @@ use crate::diagnostics::{self, DiagnosticSnapshot};
 use crate::document::drop_on_blocking_thread;
 use crate::schema::SchemaDoc;
 
+#[derive(Clone)]
 pub struct DiagnosticScheduler {
     state: Arc<Mutex<SchedulerState>>,
     notify: Arc<Notify>,
-    _shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Stops the worker once the last clone of the scheduler is dropped.
+    _shutdown: Arc<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub struct DiagnosticTicket {
@@ -49,7 +51,7 @@ impl DiagnosticScheduler {
         Self {
             state,
             notify,
-            _shutdown: shutdown,
+            _shutdown: Arc::new(shutdown),
         }
     }
 
@@ -58,6 +60,13 @@ impl DiagnosticScheduler {
         let generation = self.state.lock().await.begin(uri.clone());
         debug!(generation, "started document diagnostics generation");
         DiagnosticTicket { uri, generation }
+    }
+
+    pub async fn is_current(&self, ticket: &DiagnosticTicket) -> bool {
+        self.state
+            .lock()
+            .await
+            .is_current(&ticket.uri, ticket.generation)
     }
 
     #[instrument(skip(self, ticket, snapshot, schema), fields(uri = %ticket.uri, generation = ticket.generation))]
@@ -275,14 +284,22 @@ async fn run_worker(client: Client, state: Arc<Mutex<SchedulerState>>, notify: A
             }
         };
 
-        let state = state.lock().await;
-        if !state.is_current(&uri, generation) {
-            debug!(uri = %uri, generation, "discarding stale diagnostics result");
-            continue;
-        }
-
-        debug!(uri = %uri, generation, diagnostic_count = diagnostics.len(), "publishing background diagnostics");
-        client.publish_diagnostics(uri, diagnostics, None).await;
+        let mut publication =
+            std::pin::pin!(client.publish_diagnostics(uri.clone(), diagnostics, None));
+        let mut lock = std::pin::pin!(state.lock());
+        // Serialize each channel poll with generation changes, but release the lock on backpressure.
+        std::future::poll_fn(|cx| {
+            let guard = std::task::ready!(lock.as_mut().poll(cx));
+            if !guard.is_current(&uri, generation) {
+                debug!(uri = %uri, generation, "discarding stale diagnostics result");
+                return std::task::Poll::Ready(());
+            }
+            let result = publication.as_mut().poll(cx);
+            drop(guard);
+            lock.set(state.lock());
+            result
+        })
+        .await;
     }
 }
 
@@ -535,7 +552,7 @@ mod tests {
             let scheduler = DiagnosticScheduler {
                 state: Arc::new(Mutex::new(SchedulerState::default())),
                 notify: Arc::new(Notify::new()),
-                _shutdown: tokio::sync::oneshot::channel().0,
+                _shutdown: Arc::new(tokio::sync::oneshot::channel().0),
             };
             let uri = uri("model");
             let text = Arc::new("#1=IFCWALL($);".to_string());
