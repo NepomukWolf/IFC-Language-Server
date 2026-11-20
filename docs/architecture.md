@@ -271,6 +271,8 @@ client with `window/showDocument` to move the cursor. This depends on the client
 calls are the instances that reference an instance, outgoing calls the instances it references.
 Referrers are found through `Document::references` and `Document::enclosing_definition`, which walks
 back from a reference to its `#id=` definition; cost grows with relevant reference locations and scanned statement lengths.
+Incoming calls stop after `MAX_INCOMING_CALLS` (1000) referrers and end with one item that counts the
+references left out, so a shared instance referenced from most of a model stays cheap to expand.
 
 `docs/instance-navigation.md` documents the call hierarchy items' `data`.
 

@@ -978,6 +978,9 @@ impl LanguageServer for Backend {
         &self,
         params: CallHierarchyIncomingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        if call_hierarchy::is_more_item(&params.item) {
+            return Ok(Some(Vec::new()));
+        }
         let id = call_hierarchy_item_id(&params.item)?;
         let uri = params.item.uri;
 
@@ -1006,6 +1009,9 @@ impl LanguageServer for Backend {
         &self,
         params: CallHierarchyOutgoingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        if call_hierarchy::is_more_item(&params.item) {
+            return Ok(Some(Vec::new()));
+        }
         let id = call_hierarchy_item_id(&params.item)?;
         let uri = params.item.uri;
 
@@ -1275,6 +1281,53 @@ mod tests {
             false,
             Some("broken")
         ));
+    }
+
+    #[tokio::test]
+    async fn expanding_the_item_for_left_out_incoming_calls_lists_nothing() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/more.ifc").unwrap();
+        let mut text = String::from("DATA;\n#1=IFCWALL($);\n");
+        for id in 2..call_hierarchy::MAX_INCOMING_CALLS + 3 {
+            text.push_str(&format!("#{id}=IFCX(#1);\n"));
+        }
+        text.push_str("ENDSEC;\n");
+        open_document(backend, &uri, &text).await;
+
+        let item = backend
+            .prepare_call_hierarchy(CallHierarchyPrepareParams {
+                text_document_position_params: TextDocumentPositionParams::new(
+                    TextDocumentIdentifier::new(uri.clone()),
+                    Position::new(1, 1),
+                ),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("an item for #1")
+            .remove(0);
+        let incoming = |item: CallHierarchyItem| {
+            backend.incoming_calls(CallHierarchyIncomingCallsParams {
+                item,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+        };
+        let calls = incoming(item).await.unwrap().unwrap();
+        let more = calls.last().unwrap().from.clone();
+        assert!(call_hierarchy::is_more_item(&more));
+
+        assert_eq!(incoming(more.clone()).await.unwrap(), Some(Vec::new()));
+        let outgoing = backend
+            .outgoing_calls(CallHierarchyOutgoingCallsParams {
+                item: more,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outgoing, Some(Vec::new()));
     }
 
     #[tokio::test]

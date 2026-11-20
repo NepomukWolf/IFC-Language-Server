@@ -21,7 +21,8 @@ The examples use this IFC4 document, opened as `file:///small.ifc`:
   the one whose text, from `#id` through its `;`, holds the position. It returns nothing outside
   every instance and for ids without a definition.
 - **incoming calls** are the instances that reference the item, in document order. `fromRanges`
-  are the `#id` tokens inside each referrer.
+  are the `#id` tokens inside each referrer. At most 1000 instances are listed; past that, one
+  last item stands for the references left out (see below).
 - **outgoing calls** are the instances the item references, in the order of their first
   reference. `fromRanges` are the `#id` tokens inside the item. References to undefined ids are
   left out.
@@ -51,6 +52,18 @@ the item:
 `attributes` names the arguments of the referring instance that hold the call's references: on an
 incoming call's `from` item, the arguments of `from`; on an outgoing call's `to` item, the
 arguments of the item whose outgoing calls were requested.
+
+When an instance has more than 1000 referrers, its incoming calls end with one more call whose
+`from` item stands for the references left out. LSP call hierarchy has no paging, and a shared
+instance such as an `IfcOwnerHistory` can have hundreds of thousands of referrers. That item has
+`name` `… <count> more references not shown`, `kind` `Null` (21), `selectionRange` the first
+reference left out, `range` the instance holding it, empty `fromRanges`, and this `data`:
+
+```text
+{ more: number }           // the number of references left out
+```
+
+Expanding it returns no calls in either direction.
 
 Example: incoming calls of `#2`.
 

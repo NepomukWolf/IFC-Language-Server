@@ -32,6 +32,17 @@ pub struct ReferringAttribute {
     pub name: Option<String>,
 }
 
+/// Referrers `incoming_calls` lists before it stops; one more item stands for the rest. LSP call
+/// hierarchy has no paging, and a shared instance such as an `IfcOwnerHistory` can have hundreds of
+/// thousands of referrers.
+pub const MAX_INCOMING_CALLS: usize = 1000;
+
+/// The `data` of the item that stands for the references `incoming_calls` left out.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct MoreData {
+    more: usize,
+}
+
 /// The instance at `position`: on a `#id` token the instance that id names, elsewhere the instance
 /// whose text holds `position`. None when there is no such instance or it has no definition.
 pub fn prepare(
@@ -50,7 +61,8 @@ pub fn prepare(
     Some(vec![item])
 }
 
-/// The instances that reference `id`, in document order.
+/// The instances that reference `id`, in document order. Past `MAX_INCOMING_CALLS` referrers, one
+/// last call stands for the references left out.
 pub fn incoming_calls(
     document: &Document,
     uri: &Url,
@@ -62,9 +74,11 @@ pub fn incoming_calls(
     // Reference offsets are sorted, so the references one instance holds are adjacent; those inside
     // the current referrer's statement need no lookup.
     let text = document.text.as_str();
+    let references = document.references.get(&id).map_or(&[][..], Vec::as_slice);
     let mut referrers: Vec<(usize, u32, Vec<usize>)> = Vec::new();
     let mut referrer_end = 0;
-    for &offset in document.references.get(&id).into_iter().flatten() {
+    let mut left_out: &[usize] = &[];
+    for (index, &offset) in references.iter().enumerate() {
         if Some(offset) == target_definition {
             continue;
         }
@@ -73,6 +87,10 @@ pub fn incoming_calls(
         {
             offsets.push(offset);
             continue;
+        }
+        if referrers.len() == MAX_INCOMING_CALLS {
+            left_out = &references[index..];
+            break;
         }
         let Some((start, referrer)) = document.enclosing_definition(offset) else {
             continue;
@@ -85,7 +103,7 @@ pub fn incoming_calls(
     }
 
     let mut items = ItemBuilder::new(document, uri, schema);
-    referrers
+    let mut calls: Vec<_> = referrers
         .into_iter()
         .filter_map(|(start, referrer, offsets)| {
             let (instance, _) = scan_document_instance(document, start)?;
@@ -95,7 +113,52 @@ pub fn incoming_calls(
                 from_ranges: document.id_ranges_at_offsets(&offsets),
             })
         })
-        .collect()
+        .collect();
+    if let Some(&first) = left_out.first() {
+        let count = left_out
+            .iter()
+            .filter(|&&offset| Some(offset) != target_definition)
+            .count();
+        calls.extend(more_call(document, uri, first, count));
+    }
+    calls
+}
+
+/// The call standing for `count` references left out of incoming calls, placed on the first of
+/// them so that opening it shows where the list would go on.
+fn more_call(
+    document: &Document,
+    uri: &Url,
+    first: usize,
+    count: usize,
+) -> Option<CallHierarchyIncomingCall> {
+    let selection_range = document.id_ranges_at_offsets(&[first]).pop()?;
+    let range = document
+        .enclosing_definition(first)
+        .and_then(|(start, _)| {
+            let (_, arguments_end) = scan_document_instance(document, start)?;
+            let end = statement_end(document.text.as_bytes(), arguments_end);
+            document.range_for_offsets(start, end)
+        })
+        .unwrap_or(selection_range);
+    Some(CallHierarchyIncomingCall {
+        from: CallHierarchyItem {
+            name: format!("… {count} more references not shown"),
+            kind: SymbolKind::NULL,
+            tags: None,
+            detail: Some(format!(
+                "incoming calls are limited to {MAX_INCOMING_CALLS} instances"
+            )),
+            uri: uri.clone(),
+            range,
+            selection_range,
+            data: Some(
+                serde_json::to_value(MoreData { more: count })
+                    .expect("item data serializes to JSON"),
+            ),
+        },
+        from_ranges: Vec::new(),
+    })
 }
 
 /// The instances `id` references, in the order of their first reference. References to ids
@@ -145,6 +208,13 @@ pub fn outgoing_calls(
 pub fn item_id(item: &CallHierarchyItem) -> Option<u32> {
     let data = serde_json::from_value::<ItemData>(item.data.clone()?).ok()?;
     Some(data.id)
+}
+
+/// Whether `item` stands for references left out of incoming calls; it has no calls of its own.
+pub fn is_more_item(item: &CallHierarchyItem) -> bool {
+    item.data
+        .clone()
+        .is_some_and(|data| serde_json::from_value::<MoreData>(data).is_ok())
 }
 
 /// The id of the instance whose text, from `#id` through its closing `;`, holds `offset`. The
@@ -606,6 +676,90 @@ mod tests {
                 json!("RelatingStructure")
             ]
         );
+    }
+
+    /// `#1` referenced once by each of `referrers` instances `#2`, `#3`, … on lines of their own.
+    fn referenced_by(referrers: usize) -> Document {
+        let mut text = String::from("DATA;\n#1=IFCWALL($);\n");
+        for id in 2..referrers + 2 {
+            text.push_str(&format!("#{id}=IFCX(#1);\n"));
+        }
+        text.push_str("ENDSEC;\n");
+        Document::new_unloaded(text)
+    }
+
+    #[test]
+    fn incoming_calls_stop_at_the_limit_and_count_the_rest() {
+        let document = referenced_by(MAX_INCOMING_CALLS + 5);
+
+        let calls = incoming_calls(&document, &uri(), None, 1);
+
+        assert_eq!(calls.len(), MAX_INCOMING_CALLS + 1);
+        let listed: Vec<_> = calls[..MAX_INCOMING_CALLS]
+            .iter()
+            .map(|call| item_id(&call.from).unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            (2..MAX_INCOMING_CALLS as u32 + 2).collect::<Vec<_>>()
+        );
+        assert!(
+            !calls[..MAX_INCOMING_CALLS]
+                .iter()
+                .any(|call| is_more_item(&call.from))
+        );
+
+        let more = &calls[MAX_INCOMING_CALLS];
+        assert_eq!(more.from.name, "… 5 more references not shown");
+        assert_eq!(more.from.kind, SymbolKind::NULL);
+        assert_eq!(data(&more.from), json!({ "more": 5 }));
+        assert!(more.from_ranges.is_empty());
+        assert!(is_more_item(&more.from));
+        assert_eq!(item_id(&more.from), None);
+        // On the first reference left out: `#1` inside `#1002=IFCX(#1);`.
+        let line = MAX_INCOMING_CALLS as u32 + 2;
+        let statement = format!("#{line}=IFCX(#1);");
+        let column = statement.find("(#1").unwrap() as u32 + 1;
+        assert_eq!(
+            more.from.selection_range,
+            Range::new(Position::new(line, column), Position::new(line, column + 2))
+        );
+        assert_eq!(
+            more.from.range,
+            Range::new(
+                Position::new(line, 0),
+                Position::new(line, statement.len() as u32)
+            )
+        );
+    }
+
+    #[test]
+    fn incoming_calls_up_to_the_limit_are_complete() {
+        let calls = incoming_calls(&referenced_by(MAX_INCOMING_CALLS), &uri(), None, 1);
+
+        assert_eq!(calls.len(), MAX_INCOMING_CALLS);
+        assert!(!calls.iter().any(|call| is_more_item(&call.from)));
+    }
+
+    #[test]
+    fn the_limit_counts_instances_not_references() {
+        // The last listed referrer holds two references; only the next instance is left out.
+        let mut text = String::from("DATA;\n#1=IFCWALL($);\n");
+        for id in 2..MAX_INCOMING_CALLS + 1 {
+            text.push_str(&format!("#{id}=IFCX(#1);\n"));
+        }
+        let last = MAX_INCOMING_CALLS + 1;
+        text.push_str(&format!(
+            "#{last}=IFCX(#1,#1);\n#{}=IFCX(#1);\nENDSEC;\n",
+            last + 1
+        ));
+        let document = Document::new_unloaded(text);
+
+        let calls = incoming_calls(&document, &uri(), None, 1);
+
+        assert_eq!(calls.len(), MAX_INCOMING_CALLS + 1);
+        assert_eq!(calls[MAX_INCOMING_CALLS - 1].from_ranges.len(), 2);
+        assert_eq!(data(&calls[MAX_INCOMING_CALLS].from), json!({ "more": 1 }));
     }
 
     #[test]
