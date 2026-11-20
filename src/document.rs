@@ -1,16 +1,23 @@
 //! Parsed in-memory representation of one IFC document.
-//! This module owns the source text, cheap text indexes for navigation, and optional tree-sitter
-//! state for schema-aware diagnostics and derived-value hover.
+//! This module owns the source text, cheap text indexes for navigation, and the STEP statement index.
+#![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
+mod decode;
+
+#[cfg(test)]
+pub(crate) use decode::DECODED_STATEMENTS;
+pub(crate) use decode::decode_entity_instance_relative;
+use decode::{LinePoints, decode_entity_instance, utf16_len};
+
+use rustc_hash::FxHashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-use tree_sitter::{InputEdit, Node, Parser, Point, Tree, TreeCursor};
 
-use crate::document_index::{TextIndex, index_neutral_edit, scan_text};
-
-pub const DEFAULT_AST_FILE_SIZE_LIMIT_BYTES: usize = 70 * 1024 * 1024;
+use crate::diagnostics::incremental::{StatementEdits, ValidationCache};
+use crate::document_index::{TextIndex, edit_text_index, rescan_text, scan_text};
+use crate::schema::SchemaDoc;
+use crate::step;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyChangeError {
@@ -20,19 +27,27 @@ pub enum ApplyChangeError {
 #[derive(Debug)]
 pub struct Document {
     pub text: Arc<String>,
-    pub tree: Option<Tree>,
-    pub ast_skipped: bool,
+    /// Statement index of this document; parameters are decoded on demand.
+    pub statement_index: Option<Arc<step::Document>>,
+    pub statement_edits: StatementEdits,
+    pub validation_cache: Arc<ValidationCache>,
     pub schema_name: Option<String>,
     pub line_offsets: Vec<usize>,
-    pub definitions: HashMap<u32, usize>,
-    pub references: HashMap<u32, Vec<usize>>,
+    pub definitions: FxHashMap<u32, usize>,
+    pub references: FxHashMap<u32, Vec<usize>>,
     schema_end: Option<usize>,
+    string_reaches: Vec<(usize, usize)>,
 }
 
 #[derive(Debug)]
 pub struct EntityInstanceCollection {
     pub instances: Vec<EntityInstanceInfo>,
-    instance_indexes_by_id: HashMap<u32, usize>,
+}
+
+#[derive(Debug)]
+pub struct EntityTypeIndex<'a> {
+    statement_index: &'a step::Document,
+    text: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +74,9 @@ pub enum ParameterValue {
     String {
         range: Range,
     },
+    Binary {
+        range: Range,
+    },
     Number {
         text: String,
         range: Range,
@@ -81,6 +99,9 @@ pub enum ParameterValue {
     Unknown {
         range: Range,
     },
+    Malformed {
+        range: Range,
+    },
 }
 
 impl ParameterValue {
@@ -89,12 +110,14 @@ impl ParameterValue {
             ParameterValue::Reference { range, .. }
             | ParameterValue::Enumeration { range, .. }
             | ParameterValue::String { range }
+            | ParameterValue::Binary { range }
             | ParameterValue::Number { range, .. }
             | ParameterValue::Null { range }
             | ParameterValue::Omitted { range }
             | ParameterValue::List { range, .. }
             | ParameterValue::Typed { range, .. }
-            | ParameterValue::Unknown { range } => *range,
+            | ParameterValue::Unknown { range }
+            | ParameterValue::Malformed { range } => *range,
         }
     }
 
@@ -103,12 +126,14 @@ impl ParameterValue {
             ParameterValue::Reference { .. } => "reference",
             ParameterValue::Enumeration { .. } => "enumeration",
             ParameterValue::String { .. } => "string",
+            ParameterValue::Binary { .. } => "binary",
             ParameterValue::Number { .. } => "number",
             ParameterValue::Null { .. } => "null",
             ParameterValue::Omitted { .. } => "omitted value",
             ParameterValue::List { .. } => "aggregate",
             ParameterValue::Typed { .. } => "typed value",
             ParameterValue::Unknown { .. } => "unknown value",
+            ParameterValue::Malformed { .. } => "malformed value",
         }
     }
 }
@@ -121,85 +146,84 @@ impl Document {
             references,
             schema_name,
             schema_end,
+            string_reaches,
         } = scan_text(&text);
 
+        let parsed = Arc::new(step::Document::parse(text.as_bytes(), false));
         Self {
             text: Arc::new(text),
-            tree: None,
-            ast_skipped: false,
+            statement_index: Some(parsed),
+            statement_edits: StatementEdits::fresh(),
+            validation_cache: Arc::default(),
             schema_name,
             line_offsets,
             definitions,
             references,
             schema_end,
+            string_reaches,
         }
     }
 
     pub fn reload_text_index(&mut self) {
-        let TextIndex {
-            line_offsets,
-            definitions,
-            references,
-            schema_name,
-            schema_end,
-        } = scan_text(&self.text);
+        self.with_text_index(|index, text| *index = rescan_text(text, std::mem::take(index)));
+    }
 
-        self.line_offsets = line_offsets;
-        self.definitions = definitions;
-        self.references = references;
-        self.schema_name = schema_name;
-        self.schema_end = schema_end;
+    fn with_text_index<R>(&mut self, update: impl FnOnce(&mut TextIndex, &str) -> R) -> R {
+        let mut index = TextIndex {
+            line_offsets: std::mem::take(&mut self.line_offsets),
+            definitions: std::mem::take(&mut self.definitions),
+            references: std::mem::take(&mut self.references),
+            schema_name: self.schema_name.take(),
+            schema_end: self.schema_end.take(),
+            string_reaches: std::mem::take(&mut self.string_reaches),
+        };
+        let result = update(&mut index, &self.text);
+        self.line_offsets = index.line_offsets;
+        self.definitions = index.definitions;
+        self.references = index.references;
+        self.schema_name = index.schema_name;
+        self.schema_end = index.schema_end;
+        self.string_reaches = index.string_reaches;
+        result
     }
 
     pub fn unload_parse_state(&mut self) {
-        self.tree = None;
-        self.ast_skipped = false;
+        self.statement_index = None;
     }
 
-    pub fn reload_parse_state(&mut self, parser: &mut Parser, ast_file_size_limit_bytes: usize) {
+    pub fn reload_parse_state(&mut self) {
         self.reload_text_index();
         self.unload_parse_state();
+        self.statement_index = Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
+    }
 
-        self.parse_current_text(parser, None, ast_file_size_limit_bytes);
+    /// Replaces the whole text, dropping the parse state and the edit log of the old one.
+    pub fn replace_text(&mut self, text: String) {
+        self.statement_index = None;
+        self.statement_edits = StatementEdits::fresh();
+        self.text = Arc::new(text);
     }
 
     pub fn apply_content_changes(
         &mut self,
-        parser: &mut Parser,
         changes: &[TextDocumentContentChangeEvent],
-        ast_file_size_limit_bytes: usize,
     ) -> Result<(), ApplyChangeError> {
-        let mut index_valid = true;
-        for (index, change) in changes.iter().enumerate() {
+        for change in changes {
             if let Some(range) = change.range {
-                match self.apply_ranged_change(range, &change.text, index_valid) {
-                    Ok(kept_index) => index_valid = kept_index,
-                    Err(error) => {
-                        self.reload_text_index();
-                        let old_tree = self.tree.take();
-                        self.parse_current_text(
-                            parser,
-                            old_tree.as_ref(),
-                            ast_file_size_limit_bytes,
-                        );
-                        return Err(error);
-                    }
+                if let Err(error) = self.apply_ranged_change(range, &change.text) {
+                    self.reload_parse_state();
+                    return Err(error);
                 }
             } else {
-                self.text = Arc::new(change.text.clone());
-                self.tree = None;
-                index_valid = false;
-            }
-            if !index_valid && index + 1 < changes.len() {
-                self.reload_line_offsets();
+                self.replace_text(change.text.clone());
+                self.reload_text_index();
             }
         }
 
-        if !index_valid {
-            self.reload_text_index();
+        if self.statement_index.is_none() {
+            self.statement_index =
+                Some(Arc::new(step::Document::parse(self.text.as_bytes(), false)));
         }
-        let old_tree = self.tree.take();
-        self.parse_current_text(parser, old_tree.as_ref(), ast_file_size_limit_bytes);
         Ok(())
     }
 
@@ -207,8 +231,7 @@ impl Document {
         &mut self,
         range: Range,
         replacement: &str,
-        index_valid: bool,
-    ) -> Result<bool, ApplyChangeError> {
+    ) -> Result<(), ApplyChangeError> {
         let start_byte = self
             .position_to_offset(range.start)
             .ok_or(ApplyChangeError::InvalidRange(range))?;
@@ -219,144 +242,94 @@ impl Document {
             return Err(ApplyChangeError::InvalidRange(range));
         }
 
-        let keep_index =
-            index_valid && self.can_keep_text_index(range, start_byte, old_end_byte, replacement);
-        let start_position = self
-            .point_at_offset(range.start.line as usize, start_byte)
-            .ok_or(ApplyChangeError::InvalidRange(range))?;
-        let old_end_position = self
-            .point_at_offset(range.end.line as usize, old_end_byte)
-            .ok_or(ApplyChangeError::InvalidRange(range))?;
-        let new_end_position = point_after_text(start_position, replacement);
-        let edit = InputEdit {
-            start_byte,
-            old_end_byte,
-            new_end_byte: start_byte + replacement.len(),
-            start_position,
-            old_end_position,
-            new_end_position,
-        };
-
-        if let Some(tree) = self.tree.as_mut() {
-            tree.edit(&edit);
+        let removed = self.text.as_bytes()[start_byte..old_end_byte].to_vec();
+        replace_text(&mut self.text, start_byte..old_end_byte, replacement);
+        if let Some(parsed) = self.statement_index.as_mut() {
+            let outcome = Arc::make_mut(parsed).edit(
+                &removed,
+                self.text.as_bytes(),
+                step::Edit {
+                    start: start_byte,
+                    delete_len: removed.len(),
+                    insert_len: replacement.len(),
+                },
+            );
+            self.statement_edits.record(outcome);
+        } else {
+            self.statement_edits = StatementEdits::fresh();
         }
-        Arc::make_mut(&mut self.text).replace_range(start_byte..old_end_byte, replacement);
-        if keep_index {
-            let delta = replacement.len() as isize - (old_end_byte - start_byte) as isize;
-            if delta != 0 {
-                for offset in self
-                    .line_offsets
-                    .iter_mut()
-                    .chain(self.definitions.values_mut())
-                    .chain(self.references.values_mut().flatten())
-                {
-                    if *offset >= old_end_byte {
-                        *offset = offset.checked_add_signed(delta).expect("offset shift fits");
-                    }
-                }
-            }
+        let edited = self.with_text_index(|index, text| {
+            edit_text_index(index, text, start_byte, &removed, replacement.len())
+        });
+        if !edited {
+            self.reload_text_index();
         }
-        Ok(keep_index)
-    }
-
-    fn reload_line_offsets(&mut self) {
-        self.line_offsets.clear();
-        self.line_offsets.push(0);
-        self.line_offsets.extend(
-            self.text
-                .bytes()
-                .enumerate()
-                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
-        );
-    }
-
-    fn can_keep_text_index(
-        &self,
-        range: Range,
-        start: usize,
-        end: usize,
-        replacement: &str,
-    ) -> bool {
-        if range.start.line != range.end.line || self.schema_end.is_none_or(|offset| start < offset)
-        {
-            return false;
-        }
-        let line_start = self.line_offsets[range.start.line as usize];
-        let line = &self.text[line_start..];
-        let prefix = line.len() - line.trim_start_matches([' ', '\t']).len();
-        let anchor = line_start + prefix;
-        let Some(digits) = self.text[anchor..].strip_prefix('#') else {
-            return false;
-        };
-        let length = digits.bytes().take_while(u8::is_ascii_digit).count();
-        let Ok(id) = digits[..length].parse::<u32>() else {
-            return false;
-        };
-        // A matching indexed definition certifies the scanner's lexical state at this byte.
-        self.definitions.get(&id) == Some(&anchor)
-            && index_neutral_edit(&self.text, anchor, start, end, replacement)
-    }
-
-    fn point_at_offset(&self, line: usize, offset: usize) -> Option<Point> {
-        let line_start = *self.line_offsets.get(line)?;
-        Some(Point {
-            row: line,
-            column: offset.checked_sub(line_start)?,
-        })
-    }
-
-    fn parse_current_text(
-        &mut self,
-        parser: &mut Parser,
-        old_tree: Option<&Tree>,
-        ast_file_size_limit_bytes: usize,
-    ) {
-        self.ast_skipped = false;
-        if self.text.len() > ast_file_size_limit_bytes {
-            self.ast_skipped = true;
-            return;
-        }
-
-        self.tree = parser.parse(self.text.as_bytes(), old_tree);
+        Ok(())
     }
 
     #[cfg(test)]
-    pub fn parse(parser: &mut Parser, text: String) -> Self {
+    pub(crate) fn assert_text_index_matches_scan(&self) {
+        let index = TextIndex {
+            line_offsets: self.line_offsets.clone(),
+            definitions: self.definitions.clone(),
+            references: self.references.clone(),
+            schema_name: self.schema_name.clone(),
+            schema_end: self.schema_end,
+            string_reaches: self.string_reaches.clone(),
+        };
+        assert!(
+            index == scan_text(&self.text),
+            "text index differs from a fresh scan"
+        );
+    }
+
+    #[cfg(test)]
+    pub fn parse(text: String) -> Self {
         let mut document = Self::new_unloaded(text);
-        document.reload_parse_state(parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
+        document.reload_parse_state();
         document
     }
 
     pub fn is_parse_state_loaded(&self) -> bool {
-        self.tree.is_some() || self.ast_skipped
-    }
-
-    pub fn has_ast(&self) -> bool {
-        self.tree.is_some()
-    }
-
-    pub fn node_at_position(&self, position: Position) -> Option<Node<'_>> {
-        let tree = self.tree.as_ref()?;
-        let offset = self.position_to_offset(position)?;
-        let line_start = *self.line_offsets.get(position.line as usize)?;
-        let point = Point {
-            row: position.line as usize,
-            column: offset.checked_sub(line_start)?,
-        };
-
-        tree.root_node().descendant_for_point_range(point, point)
+        self.statement_index.is_some()
     }
 
     pub fn entity_instance_by_id(&self, id: u32) -> Option<EntityInstanceInfo> {
         let definition_offset = *self.definitions.get(&id)?;
-        let tree = self.tree.as_ref()?;
-        let mut node = tree
-            .root_node()
-            .descendant_for_byte_range(definition_offset, definition_offset)?;
-        while node.kind() != "entity_instance" {
-            node = node.parent()?;
-        }
-        parse_entity_instance(node, &self.text)
+        let parsed = self.statement_index.as_deref()?;
+        let index = parsed
+            .statements
+            .partition_point(|statement| (statement.span.start as usize) < definition_offset);
+        (parsed.statements.get(index)?.span.start as usize == definition_offset).then_some(())?;
+        self.decode_statement(parsed, index)
+    }
+
+    /// The statement whose span contains `offset`, decoded.
+    pub fn entity_instance_at_offset(&self, offset: usize) -> Option<EntityInstanceInfo> {
+        let parsed = self.statement_index.as_deref()?;
+        let index = parsed
+            .statements
+            .partition_point(|statement| statement.span.start as usize <= offset)
+            .checked_sub(1)?;
+        (offset < parsed.statements[index].span.end as usize).then_some(())?;
+        self.decode_statement(parsed, index)
+    }
+
+    fn decode_statement(
+        &self,
+        parsed: &step::Document,
+        index: usize,
+    ) -> Option<EntityInstanceInfo> {
+        let start = parsed.statements[index].span.start as usize;
+        let row = self.line_offsets.partition_point(|&line| line <= start) - 1;
+        let mut points = LinePoints {
+            text: self.text.as_bytes(),
+            offset: self.line_offsets[row],
+            row,
+            column: 0,
+        };
+        decode_entity_instance(parsed, &self.text, index, &mut points)
+            .filter(|instance| instance.parameter_list_range.is_some())
     }
 
     pub fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -410,13 +383,9 @@ impl Document {
             Err(next_line) => next_line.checked_sub(1)?,
         };
         let line_start = self.line_offsets[line_index];
-        let line_text = self.text.get(line_start..offset)?;
-        let character = line_text
-            .chars()
-            .map(|character| character.len_utf16() as u32)
-            .sum();
+        let character = utf16_len(&self.text.as_bytes()[line_start..offset]);
 
-        Some(Position::new(line_index as u32, character))
+        Some(Position::new(line_index as u32, character as u32))
     }
 
     pub fn range_for_offsets(&self, start: usize, end: usize) -> Option<Range> {
@@ -437,18 +406,25 @@ impl Document {
 
     pub fn id_token_at_position(&self, position: Position) -> Option<(u32, usize)> {
         let offset = self.position_to_offset(position)?;
-        if let Some((start, _, id)) = self.id_token_at_offset(offset)
-            && self
-                .references
-                .get(&id)
-                .is_some_and(|offsets| offsets.contains(&start))
-        {
-            return Some((id, start));
-        }
+        let (start, _, id) = self.id_token_at_offset(offset)?;
+        self.occurs(id, start).then_some((id, start))
+    }
 
+    /// The instance under the cursor: an id token, or the entity name of a definition.
+    pub fn instance_id_at_position(&self, position: Position) -> Option<u32> {
+        if let Some((id, _)) = self.id_token_at_position(position) {
+            return Some(id);
+        }
+        let offset = self.position_to_offset(position)?;
         let (identifier_start, _) = self.identifier_at_offset(offset)?;
         let (start, id) = self.definition_id_before_entity_name(identifier_start)?;
-        Some((id, start))
+        self.occurs(id, start).then_some(id)
+    }
+
+    fn occurs(&self, id: u32, start: usize) -> bool {
+        self.references
+            .get(&id)
+            .is_some_and(|offsets| offsets.contains(&start))
     }
 
     pub fn entity_name_at_position(&self, position: Position) -> Option<(String, Range)> {
@@ -579,9 +555,8 @@ impl Document {
             .is_some()
     }
 
-    /// If `identifier_start` begins the entity name of a `#id=NAME` definition (e.g. the
-    /// `IFCSLABTYPE` in `#266=IFCSLABTYPE(...)`), returns the offset of the `#` and the id, so
-    /// that a click on the entity name resolves to the same instance as a click on its id.
+    /// Offset of the `#` and the id of the `#id=NAME` definition whose entity name begins at
+    /// `identifier_start`.
     fn definition_id_before_entity_name(&self, identifier_start: usize) -> Option<(usize, u32)> {
         let bytes = self.text.as_bytes();
         let mut offset = identifier_start;
@@ -611,6 +586,27 @@ impl Document {
     }
 }
 
+/// Spare capacity given to the text when an edit has to reallocate it, so that typing does not
+/// double the allocation of a large document.
+const TEXT_HEADROOM: usize = 64 * 1024;
+
+fn replace_text(text: &mut Arc<String>, range: std::ops::Range<usize>, replacement: &str) {
+    let len = text.len() - range.len() + replacement.len();
+    if Arc::strong_count(text) == 1 {
+        let owned = Arc::make_mut(text);
+        if owned.capacity() < len {
+            owned.reserve_exact(len - owned.len() + TEXT_HEADROOM);
+        }
+        owned.replace_range(range, replacement);
+    } else {
+        let mut edited = String::with_capacity(len + TEXT_HEADROOM);
+        edited.push_str(&text[..range.start]);
+        edited.push_str(replacement);
+        edited.push_str(&text[range.end..]);
+        *text = Arc::new(edited);
+    }
+}
+
 /// Freeing the tree of a large document takes hundreds of milliseconds, so values that may own the
 /// last reference to one are dropped on a blocking thread instead of inside an async handler.
 pub fn drop_on_blocking_thread<T: Send + 'static>(value: T) {
@@ -621,754 +617,176 @@ pub(crate) fn is_identifier_part(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-pub fn build_entity_instances(tree: Option<&Tree>, text: &str) -> EntityInstanceCollection {
-    let mut instances = Vec::new();
-
-    if let Some(tree) = tree {
-        let mut cursor = tree.root_node().walk();
-        traverse(&mut cursor, text, &mut instances);
-    }
-
-    EntityInstanceCollection::new(instances)
+pub(crate) fn typed_name_len(source: &str) -> usize {
+    source
+        .bytes()
+        .position(|byte| !is_identifier_part(byte))
+        .unwrap_or(source.len())
 }
 
-impl EntityInstanceCollection {
-    pub fn new(instances: Vec<EntityInstanceInfo>) -> Self {
-        let instance_indexes_by_id = instances
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instance)| instance.id.map(|id| (id, index)))
-            .collect();
-        Self {
-            instances,
-            instance_indexes_by_id,
-        }
-    }
-
-    pub fn instance_by_id(&self, id: u32) -> Option<&EntityInstanceInfo> {
-        self.instance_indexes_by_id
-            .get(&id)
-            .and_then(|index| self.instances.get(*index))
+pub fn entity_type_index<'a>(parsed: &'a step::Document, text: &'a str) -> EntityTypeIndex<'a> {
+    EntityTypeIndex {
+        statement_index: parsed,
+        text,
     }
 }
 
-fn traverse(cursor: &mut TreeCursor, text: &str, instances: &mut Vec<EntityInstanceInfo>) {
-    loop {
-        let node = cursor.node();
-
-        let is_entity_instance = node.kind() == "entity_instance";
-        if is_entity_instance && let Some(instance) = parse_entity_instance(node, text) {
-            instances.push(instance);
-        }
-
-        // The grammar never nests entity instances, so only error recovery can put one inside another.
-        if (!is_entity_instance || node.has_error()) && cursor.goto_first_child() {
-            traverse(cursor, text, instances);
-            cursor.goto_parent();
-        }
-
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn parse_entity_instance(node: Node<'_>, text: &str) -> Option<EntityInstanceInfo> {
-    let mut child_cursor = node.walk();
-    let mut id = None;
-    let mut id_range = None;
-    let mut entity_name = None;
-    let mut entity_name_range = None;
-    let mut parameter_list_range = None;
-    let mut parameters = Vec::new();
-
-    for child in node.children(&mut child_cursor) {
-        match child.kind() {
-            "instance_id" => {
-                let id_text = child.utf8_text(text.as_bytes()).ok()?;
-                id = id_text.trim_start_matches('#').parse::<u32>().ok();
-                id_range = Some(node_range(&child));
+/// Decodes each well-formed statement, in document order, one at a time.
+pub(crate) fn for_each_entity_instance(
+    parsed: &step::Document,
+    text: &str,
+    mut visit: impl FnMut(EntityInstanceInfo),
+) {
+    for_each_entity_instance_named(
+        parsed,
+        text,
+        |_| true,
+        |instance| {
+            if instance.parameter_list_range.is_some() {
+                visit(instance);
             }
-            "entity_name" => {
-                let name = child.utf8_text(text.as_bytes()).ok()?;
-                entity_name = Some(name.to_ascii_uppercase());
-                entity_name_range = Some(node_range(&child));
-            }
-            "parameter_list" => {
-                parameter_list_range = Some(node_range(&child));
-                parameters = parse_parameter_list(child, text);
-            }
-            _ => {}
-        }
-    }
-
-    Some(EntityInstanceInfo {
-        id,
-        id_range,
-        entity_name: entity_name?,
-        entity_name_range: entity_name_range?,
-        entity_range: node_range(&node),
-        parameter_list_range,
-        parameters,
-    })
+        },
+    );
 }
 
-fn parse_parameter_list(node: Node<'_>, text: &str) -> Vec<ParameterValue> {
-    let mut cursor = node.walk();
-    let Some(sequence) = node
-        .children(&mut cursor)
-        .find(|child| child.kind() == "parameter_sequence")
-    else {
-        return Vec::new();
+/// Like `for_each_entity_instance`, but decodes only instances whose uppercase entity name
+/// `keep` accepts, and also visits statements whose parameters could not be read, with no
+/// parameters and no `parameter_list_range`.
+pub(crate) fn for_each_entity_instance_named(
+    parsed: &step::Document,
+    text: &str,
+    mut keep: impl FnMut(&str) -> bool,
+    mut visit: impl FnMut(EntityInstanceInfo),
+) {
+    let mut points = LinePoints {
+        text: text.as_bytes(),
+        offset: 0,
+        row: 0,
+        column: 0,
     };
+    let mut name = String::new();
+    for index in 0..parsed.statements.len() {
+        let indexed_name = parsed.statements[index].name;
+        if indexed_name.end != 0 {
+            name.clear();
+            name.push_str(&text[indexed_name.range()]);
+            name.make_ascii_uppercase();
+            if !keep(&name) {
+                continue;
+            }
+        }
+        if let Some(instance) = decode_entity_instance(parsed, text, index, &mut points)
+            && keep(&instance.entity_name)
+        {
+            visit(instance);
+        }
+    }
+}
 
-    let mut seq_cursor = sequence.walk();
-    sequence
-        .children(&mut seq_cursor)
-        .filter(|child| child.kind() == "parameter")
-        .map(|parameter| parse_parameter(parameter, text))
+/// Positions of `offsets`, which must be ascending.
+pub(crate) fn positions_of(text: &str, offsets: impl IntoIterator<Item = usize>) -> Vec<Position> {
+    let mut points = LinePoints {
+        text: text.as_bytes(),
+        offset: 0,
+        row: 0,
+        column: 0,
+    };
+    offsets
+        .into_iter()
+        .map(|offset| points.position(offset))
         .collect()
 }
 
-fn parse_parameter(node: Node<'_>, text: &str) -> ParameterValue {
-    let mut cursor = node.walk();
-    let Some(value_node) = node.children(&mut cursor).find(|child| child.is_named()) else {
-        return ParameterValue::Unknown {
-            range: node_range(&node),
-        };
-    };
-
-    parse_parameter_value(value_node, text)
+impl EntityTypeIndex<'_> {
+    pub fn entity_name_by_id(&self, id: u32) -> Option<&str> {
+        let parsed = self.statement_index;
+        let name = parsed.statements[parsed.find(id)?].name;
+        (name.end != 0).then(|| &self.text[name.range()])
+    }
 }
 
-fn parse_parameter_value(node: Node<'_>, text: &str) -> ParameterValue {
-    match node.kind() {
-        "reference" => {
-            let range = node_range(&node);
-            let id = node
-                .utf8_text(text.as_bytes())
-                .ok()
-                .and_then(|value| value.trim_start_matches('#').parse::<u32>().ok());
-            match id {
-                Some(id) => ParameterValue::Reference { id, range },
-                None => ParameterValue::Unknown { range },
+/// The weak text and schema keys prevent address reuse without retaining an obsolete document.
+#[derive(Default)]
+pub struct EntityInstanceCache {
+    entry: Mutex<Option<CachedEntityInstances>>,
+    build: Mutex<()>,
+}
+
+struct CachedEntityInstances {
+    text: Weak<String>,
+    schema: Option<Weak<SchemaDoc>>,
+    instances: Arc<OnceLock<Arc<EntityInstanceCollection>>>,
+}
+
+impl EntityInstanceCache {
+    pub fn get_or_build_with(
+        &self,
+        schema: Option<&Arc<SchemaDoc>>,
+        text: &Arc<String>,
+        build: impl FnOnce() -> EntityInstanceCollection,
+    ) -> Arc<EntityInstanceCollection> {
+        let slot = self.slot(schema, text);
+        Arc::clone(slot.get_or_init(|| {
+            let _permit = self
+                .build
+                .lock()
+                .expect("entity instance build lock should not be poisoned");
+            Arc::new(build())
+        }))
+    }
+
+    pub fn clear(&self) {
+        if let Some(cached) = self.lock().take() {
+            drop_on_blocking_thread(cached.instances);
+        }
+    }
+
+    /// Drops the cached instances if they were built from `text`.
+    pub fn forget(&self, text: &Arc<String>) {
+        let mut entry = self.lock();
+        if entry
+            .as_ref()
+            .is_some_and(|cached| std::ptr::eq(cached.text.as_ptr(), Arc::as_ptr(text)))
+            && let Some(cached) = entry.take()
+        {
+            drop(entry);
+            drop_on_blocking_thread(cached.instances);
+        }
+    }
+
+    fn slot(
+        &self,
+        schema: Option<&Arc<SchemaDoc>>,
+        text: &Arc<String>,
+    ) -> Arc<OnceLock<Arc<EntityInstanceCollection>>> {
+        let mut entry = self.lock();
+        if let Some(cached) = entry.as_ref()
+            && std::ptr::eq(cached.text.as_ptr(), Arc::as_ptr(text))
+            && match (&cached.schema, schema) {
+                (None, None) => true,
+                (Some(cached), Some(schema)) => std::ptr::eq(cached.as_ptr(), Arc::as_ptr(schema)),
+                _ => false,
             }
+        {
+            return Arc::clone(&cached.instances);
         }
-        "enumeration" => {
-            let range = node_range(&node);
-            let value = node
-                .utf8_text(text.as_bytes())
-                .ok()
-                .map(|value| value.trim_matches('.').to_ascii_uppercase())
-                .unwrap_or_default();
-            ParameterValue::Enumeration { value, range }
-        }
-        "string" => ParameterValue::String {
-            range: node_range(&node),
-        },
-        "number" => ParameterValue::Number {
-            text: node
-                .utf8_text(text.as_bytes())
-                .unwrap_or_default()
-                .to_string(),
-            range: node_range(&node),
-        },
-        "null_value" => ParameterValue::Null {
-            range: node_range(&node),
-        },
-        "omitted_value" => ParameterValue::Omitted {
-            range: node_range(&node),
-        },
-        "list" => {
-            let range = node_range(&node);
-            let mut cursor = node.walk();
-            let items = node
-                .children(&mut cursor)
-                .find(|child| child.kind() == "parameter_sequence")
-                .map(|sequence| {
-                    let mut seq_cursor = sequence.walk();
-                    sequence
-                        .children(&mut seq_cursor)
-                        .filter(|child| child.kind() == "parameter")
-                        .map(|parameter| parse_parameter(parameter, text))
-                        .collect()
-                })
-                .unwrap_or_default();
-            ParameterValue::List { items, range }
-        }
-        "typed_parameter" => {
-            let range = node_range(&node);
-            let mut cursor = node.walk();
-            let mut type_name = None;
-            let mut inner = Vec::new();
+        let slot = Arc::new(OnceLock::new());
+        let previous = entry.replace(CachedEntityInstances {
+            text: Arc::downgrade(text),
+            schema: schema.map(Arc::downgrade),
+            instances: Arc::clone(&slot),
+        });
+        drop(entry);
+        drop(previous);
+        slot
+    }
 
-            for child in node.children(&mut cursor) {
-                match child.kind() {
-                    "entity_name" => {
-                        type_name = child
-                            .utf8_text(text.as_bytes())
-                            .ok()
-                            .map(|name| name.to_ascii_uppercase());
-                    }
-                    "parameter_list" => inner = parse_parameter_list(child, text),
-                    _ => {}
-                }
-            }
-
-            ParameterValue::Typed {
-                type_name: type_name.unwrap_or_default(),
-                inner,
-                range,
-            }
-        }
-        _ => ParameterValue::Unknown {
-            range: node_range(&node),
-        },
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CachedEntityInstances>> {
+        self.entry
+            .lock()
+            .expect("entity instance cache lock should not be poisoned")
     }
 }
 
-fn node_range(node: &Node<'_>) -> Range {
-    let start = node.start_position();
-    let end = node.end_position();
-
-    Range {
-        start: Position::new(start.row as u32, start.column as u32),
-        end: Position::new(end.row as u32, end.column as u32),
-    }
-}
-
-fn point_after_text(start: Point, text: &str) -> Point {
-    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
-    if newline_count == 0 {
-        return Point {
-            row: start.row,
-            column: start.column + text.len(),
-        };
-    }
-
-    Point {
-        row: start.row + newline_count,
-        column: text
-            .as_bytes()
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(text.len(), |offset| text.len() - offset - 1),
-    }
-}
-
-//*----- TESTS BEGIN HERE -----*
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
-        TextDocumentContentChangeEvent {
-            range,
-            range_length: None,
-            text: text.to_string(),
-        }
-    }
-
-    fn parse_document(text: &str) -> Document {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-
-        Document::parse(&mut parser, text.to_string())
-    }
-
-    fn instances(document: &Document) -> EntityInstanceCollection {
-        build_entity_instances(document.tree.as_ref(), &document.text)
-    }
-
-    fn position_at(text: &str, needle: &str) -> Position {
-        let offset = text.find(needle).expect("needle should exist");
-        let document = Document::new_unloaded(text.to_string());
-        document
-            .offset_to_position(offset)
-            .expect("needle offset should convert to a position")
-    }
-
-    #[test]
-    fn parse_builds_text_index_and_ast_state() {
-        let text = "#1=IFCWALL($);";
-        let document = parse_document(text);
-
-        assert_eq!(document.text.as_str(), text);
-        assert!(document.tree.is_some());
-        assert_eq!(document.schema_name, None);
-        assert_eq!(document.definitions.get(&1), Some(&0));
-        assert_eq!(document.references.get(&1), Some(&vec![0]));
-    }
-
-    #[test]
-    fn parse_detects_schema_name_from_text_index() {
-        let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4X3_LOCAL_TEST'));ENDSEC;DATA;#1=IFCWALL($);ENDSEC;END-ISO-10303-21;";
-        let document = parse_document(text);
-
-        assert_eq!(document.schema_name.as_deref(), Some("IFC4X3_LOCAL_TEST"));
-    }
-
-    #[test]
-    fn node_at_position_finds_entity_name() {
-        let text = "#1=IFCWALL($);";
-        let document = parse_document(text);
-
-        let node = document
-            .node_at_position(position_at(text, "IFCWALL"))
-            .expect("entity_name node should exist");
-
-        assert_eq!(node.kind(), "entity_name");
-        assert_eq!(
-            node.utf8_text(document.text.as_bytes()).ok(),
-            Some("IFCWALL")
-        );
-    }
-
-    #[test]
-    fn id_token_at_position_resolves_clicks_on_the_definition_entity_name() {
-        let text = "#1=IFCWALL($);#2=IFCSLAB(#1);";
-        let document = parse_document(text);
-        let offset = |needle: &str| text.find(needle).expect("needle should exist");
-
-        assert_eq!(
-            document.id_token_at_position(position_at(text, "IFCWALL")),
-            Some((1, offset("#1=")))
-        );
-        assert_eq!(
-            document.id_token_at_position(position_at(text, "IFCSLAB")),
-            Some((2, offset("#2=")))
-        );
-    }
-
-    #[test]
-    fn node_at_position_finds_reference() {
-        let text = "#1=IFCWALL(#2);";
-        let document = parse_document(text);
-
-        let node = document
-            .node_at_position(position_at(text, "#2"))
-            .expect("reference node should exist");
-
-        assert_eq!(node.kind(), "reference");
-        assert_eq!(node.utf8_text(document.text.as_bytes()).ok(), Some("#2"));
-    }
-
-    #[test]
-    fn text_index_records_definition_and_reference_occurrences() {
-        let text = "#1=IFCWALL(#2);\n#2=IFCDOOR(#1);";
-        let document = parse_document(text);
-
-        assert_eq!(document.definitions.get(&1), Some(&0));
-        assert_eq!(document.definitions.get(&2), Some(&16));
-        assert_eq!(document.references.get(&1), Some(&vec![0, 27]));
-        assert_eq!(document.references.get(&2), Some(&vec![11, 16]));
-    }
-
-    #[test]
-    fn position_conversion_uses_utf16_columns() {
-        let document = Document::new_unloaded("a😀b\n#1=IFCWALL($);".to_string());
-
-        assert_eq!(document.position_to_offset(Position::new(0, 3)), Some(5));
-        assert_eq!(document.offset_to_position(5), Some(Position::new(0, 3)));
-        assert_eq!(document.position_to_offset(Position::new(1, 0)), Some(7));
-    }
-
-    #[test]
-    fn instance_by_id_returns_matching_instance() {
-        let text = "#1=IFCWALL($);\n#2=IFCDOOR($);";
-        let document = parse_document(text);
-
-        let instance = document
-            .entity_instance_by_id(2)
-            .expect("instance should exist");
-
-        assert_eq!(instance.entity_name, "IFCDOOR");
-    }
-
-    #[test]
-    fn unload_parse_state_preserves_text_index_and_clears_ast_state() {
-        let text = "#1=IFCWALL(#2);";
-        let mut document = parse_document(text);
-
-        document.unload_parse_state();
-
-        assert_eq!(document.text.as_str(), text);
-        assert!(!document.is_parse_state_loaded());
-        assert_eq!(document.schema_name, None);
-        assert_eq!(document.definitions.get(&1), Some(&0));
-        assert_eq!(document.references.get(&2), Some(&vec![11]));
-    }
-
-    #[test]
-    fn reload_parse_state_rebuilds_derived_state_from_existing_text() {
-        let text = "#1=IFCWALL(#2);\n#2=IFCDOOR($);";
-        let mut document = parse_document(text);
-        document.unload_parse_state();
-
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        document.reload_parse_state(&mut parser, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES);
-
-        assert_eq!(document.text.as_str(), text);
-        assert!(document.is_parse_state_loaded());
-        assert!(document.definitions.contains_key(&1));
-        assert!(document.definitions.contains_key(&2));
-        assert_eq!(document.references[&2], vec![11, 16]);
-        assert_eq!(
-            document
-                .entity_instance_by_id(2)
-                .expect("instance should be indexed")
-                .entity_name,
-            "IFCDOOR"
-        );
-    }
-
-    #[test]
-    fn incremental_changes_are_applied_sequentially() {
-        let mut document = parse_document("#1=IFCWALL($);");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        let changes = [
-            change(
-                Some(Range::new(Position::new(0, 6), Position::new(0, 10))),
-                "SLAB",
-            ),
-            change(
-                Some(Range::new(Position::new(0, 11), Position::new(0, 11))),
-                "#2,",
-            ),
-        ];
-
-        document
-            .apply_content_changes(&mut parser, &changes, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES)
-            .expect("changes should be valid");
-
-        assert_eq!(document.text.as_str(), "#1=IFCSLAB(#2,$);");
-        assert_eq!(document.references.get(&2), Some(&vec![11]));
-        assert_eq!(instances(&document).instances[0].entity_name, "IFCSLAB");
-        assert!(document.has_ast());
-    }
-
-    #[test]
-    fn incremental_change_ranges_use_utf16_columns() {
-        let mut document = parse_document("#1=IFCWALL('😀');");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        let changes = [change(
-            Some(Range::new(Position::new(0, 12), Position::new(0, 14))),
-            "door",
-        )];
-
-        document
-            .apply_content_changes(&mut parser, &changes, DEFAULT_AST_FILE_SIZE_LIMIT_BYTES)
-            .expect("change should be valid");
-
-        assert_eq!(document.text.as_str(), "#1=IFCWALL('door');");
-        assert!(document.has_ast());
-    }
-
-    #[test]
-    fn full_text_change_falls_back_to_full_parse() {
-        let mut document = parse_document("#1=IFCWALL($);");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-
-        document
-            .apply_content_changes(
-                &mut parser,
-                &[change(None, "#2=IFCDOOR($);")],
-                DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-            )
-            .expect("change should be valid");
-
-        assert_eq!(document.text.as_str(), "#2=IFCDOOR($);");
-        assert!(document.definitions.contains_key(&2));
-        assert_eq!(instances(&document).instances[0].entity_name, "IFCDOOR");
-    }
-
-    #[test]
-    fn incremental_change_respects_ast_size_limit_transitions() {
-        let mut document = parse_document("#1=IFCWALL($);");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-
-        document
-            .apply_content_changes(&mut parser, &[change(None, "large")], 4)
-            .expect("change should be valid");
-        assert!(document.ast_skipped);
-        assert!(!document.has_ast());
-
-        document
-            .apply_content_changes(&mut parser, &[change(None, "#1=IFCWALL($);")], 1024)
-            .expect("change should be valid");
-        assert!(!document.ast_skipped);
-        assert!(document.has_ast());
-    }
-
-    #[test]
-    fn clamped_position_to_offset_clamps_past_line_and_document_end() {
-        let document = parse_document("ab😀\ncd\n");
-
-        assert_eq!(
-            document.clamped_position_to_offset(Position::new(0, 1)),
-            Some(1)
-        );
-        assert_eq!(
-            document.clamped_position_to_offset(Position::new(0, 99)),
-            Some(6)
-        );
-        assert_eq!(
-            document.clamped_position_to_offset(Position::new(1, 99)),
-            Some(9)
-        );
-        assert_eq!(
-            document.clamped_position_to_offset(Position::new(99, 0)),
-            Some(document.text.len())
-        );
-        assert_eq!(document.position_to_offset(Position::new(0, 99)), None);
-    }
-
-    #[test]
-    fn invalid_incremental_range_keeps_derived_state_consistent() {
-        let mut document = parse_document("#1=IFCWALL($);");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_ifc::LANGUAGE.into())
-            .expect("Error loading IFC parser");
-        let invalid_range = Range::new(Position::new(2, 0), Position::new(2, 1));
-
-        let result = document.apply_content_changes(
-            &mut parser,
-            &[change(Some(invalid_range), "x")],
-            DEFAULT_AST_FILE_SIZE_LIMIT_BYTES,
-        );
-
-        assert_eq!(result, Err(ApplyChangeError::InvalidRange(invalid_range)));
-        assert_eq!(document.text.as_str(), "#1=IFCWALL($);");
-        assert!(document.definitions.contains_key(&1));
-        assert_eq!(instances(&document).instances[0].entity_name, "IFCWALL");
-        assert!(document.has_ast());
-    }
-
-    fn assert_fresh_index(document: &Document) {
-        let fresh = scan_text(&document.text);
-        assert_eq!(
-            document.line_offsets, fresh.line_offsets,
-            "{}",
-            document.text
-        );
-        assert_eq!(document.definitions, fresh.definitions, "{}", document.text);
-        assert_eq!(document.references, fresh.references, "{}", document.text);
-        assert_eq!(document.schema_name, fresh.schema_name, "{}", document.text);
-        assert_eq!(document.schema_end, fresh.schema_end, "{}", document.text);
-    }
-
-    #[test]
-    fn index_neutral_edits_match_full_scan_at_token_boundaries() {
-        let fixtures = [
-            "FILE_SCHEMA(('IFC4'));\r\n#1 = IFCWALL('a''b😀\\X2\\00E4\\X0\\',12.34,#2); /* ab */\r\n#2=IFCDOOR(#1);",
-            "FILE_SCHEMA /* x; */ (('IFC''4'));\n#1=ABC(#42949672960,1ABC,1FILE_SCHEMA,'a');#2=X(#1);",
-            "FILE_SCHEMA #1=ABC('IFC4');\n#2=ABC(12,#1);",
-            "FILE_SCHEMA;\n#1=ABC('IFC4');\n#2=ABC(12,#1);",
-            "FILE_SCHEMA(('IFC4'));\n/*\n#1=ABC('fake');\n*/\n#1=ABC('real');\n#1=ABC('last');",
-            "FILE_SCHEMA(('IFC4'));\n#1=ABC('unterminated\n#2=ABC('x');",
-            "FILE_SCHEMA(('IFC4'));\n#1=ABC(12);/* unterminated\n#2=ABC(3);\n",
-            "FILE_SCHEMA(('IFC4'));\n#1=ABC(12);/* a*x/ #5=ABC(#1); */\n",
-            "FILE_SCHEMA(('IFC4'));\n#1=ABC#2=XYZ#1;\n#3=ABC(12#2);",
-            "FILE_SCHEMA(('IFC4'));\n#1=ABC('','''abc',#2);\n#2=ABC(1);",
-        ];
-        let replacements = [
-            "", "x", "9", "_", " ", "\t", "\n", "'", "''", "/*", "*/", "#12=", ";", "😀", "\\X2\\",
-        ];
-        let mut parser = Parser::new();
-        let mut fast = 0;
-        for text in fixtures {
-            let original = Document::new_unloaded(text.to_string());
-            let boundaries: Vec<_> = text
-                .char_indices()
-                .map(|(i, _)| i)
-                .chain([text.len()])
-                .collect();
-            for (i, &start) in boundaries.iter().enumerate() {
-                for &end in boundaries[i..].iter().take(4) {
-                    let range = Range::new(
-                        original.offset_to_position(start).unwrap(),
-                        original.offset_to_position(end).unwrap(),
-                    );
-                    if original.position_to_offset(range.start) != Some(start)
-                        || original.position_to_offset(range.end) != Some(end)
-                    {
-                        continue;
-                    }
-                    for replacement in replacements {
-                        let mut document = Document::new_unloaded(text.to_string());
-                        fast += usize::from(document.can_keep_text_index(
-                            range,
-                            start,
-                            end,
-                            replacement,
-                        ));
-                        document
-                            .apply_content_changes(
-                                &mut parser,
-                                &[change(Some(range), replacement)],
-                                0,
-                            )
-                            .unwrap();
-                        assert_fresh_index(&document);
-                    }
-                }
-            }
-        }
-        assert!(fast > 100);
-    }
-
-    #[test]
-    fn random_edit_sequences_match_full_scan() {
-        let text = "FILE_SCHEMA(('IFC4'));\n#1 = IFCWALL('Name😀 a''b \\X2\\00E4\\X0\\',12.34,#2); /* comment */\n#2=IFCDOOR(#1);\n";
-        let replacements = [
-            "a", "Name", "IFCDOOR", "1", "99", "#2", "#12=", " ", "\t", "\n", "", ";", "'", "''",
-            "/*", "*/", "😀", "\\X2\\",
-        ];
-        let mut parser = Parser::new();
-        let mut fast = 0;
-        for seed in 1..=128u64 {
-            let mut state = seed;
-            let mut random = |limit: usize| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state as usize % limit
-            };
-            let mut document = Document::new_unloaded(text.to_string());
-            for step in 0..128 {
-                if step % 16 == 0 {
-                    document = Document::new_unloaded(text.to_string());
-                }
-                let mut changes = Vec::new();
-                let before = document.text.to_string();
-                for _ in 0..1 + random(3) {
-                    let boundaries: Vec<_> = document
-                        .text
-                        .char_indices()
-                        .map(|(i, _)| i)
-                        .chain([document.text.len()])
-                        .collect();
-                    let i = random(boundaries.len());
-                    let start = boundaries[i];
-                    let end = boundaries[(i + random(4)).min(boundaries.len() - 1)];
-                    let range = Range::new(
-                        document.offset_to_position(start).unwrap(),
-                        document.offset_to_position(end).unwrap(),
-                    );
-                    if document.position_to_offset(range.start) != Some(start)
-                        || document.position_to_offset(range.end) != Some(end)
-                    {
-                        continue;
-                    }
-                    let replacement = replacements[random(replacements.len())];
-                    fast +=
-                        usize::from(document.can_keep_text_index(range, start, end, replacement));
-                    let event = change(Some(range), replacement);
-                    document
-                        .apply_content_changes(&mut parser, std::slice::from_ref(&event), 0)
-                        .unwrap();
-                    assert_fresh_index(&document);
-                    changes.push(event);
-                }
-                let mut batched = Document::new_unloaded(before);
-                batched
-                    .apply_content_changes(&mut parser, &changes, 0)
-                    .unwrap();
-                assert_eq!(batched.text, document.text, "seed {seed}");
-                assert_fresh_index(&batched);
-            }
-        }
-        assert!(fast > 100);
-    }
-
-    #[test]
-    fn point_after_multiline_text_uses_byte_columns() {
-        assert_eq!(
-            point_after_text(Point::new(3, 7), "😀\nabc"),
-            Point::new(4, 3)
-        );
-        assert_eq!(point_after_text(Point::new(3, 7), "😀"), Point::new(3, 11));
-    }
-
-    #[test]
-    fn discovers_entities_inside_error_recovery() {
-        let document = parse_document(concat!(
-            "DATA;\n",
-            "#1=IFCCARTESIANPOINT((0.,1.,2.));\n",
-            "#2=IFCPOLYLINE((#1,#4))\n",
-            "#3=IFCDIRECTION((1.,0.,0.));\n",
-            "#4=IFCWALL('a',(#2,#3);\n",
-            "#5=IFCDIRECTION((1.,0.,0.));\n",
-            "#6=IFCWALL('b',$) stray;\n",
-            "#7=IFCCARTESIANPOINT((3.,4.,5.));\n",
-            "#8=IFCWALL(g',$,.T.,IFCLABEL('x'),(#1,#2),*);\n",
-            "#9=IFCDIRECTION((1.,0.,0.));\n",
-            "ENDSEC;\n",
-        ));
-        let instances = instances(&document);
-        let discovered: Vec<_> = instances
-            .instances
-            .iter()
-            .map(|instance| {
-                (
-                    instance.id,
-                    instance.entity_name.as_str(),
-                    instance.parameters.len(),
-                )
-            })
-            .collect();
-
-        assert_eq!(
-            discovered,
-            [
-                (Some(1), "IFCCARTESIANPOINT", 1),
-                (Some(2), "IFCPOLYLINE", 1),
-                (Some(3), "IFCDIRECTION", 1),
-                (Some(4), "IFCWALL", 2),
-                (Some(5), "IFCDIRECTION", 1),
-                (Some(6), "IFCWALL", 2),
-                (Some(7), "IFCCARTESIANPOINT", 1),
-            ]
-        );
-    }
-
-    #[test]
-    fn discovers_entities_after_malformed_syntax() {
-        let document = parse_document(concat!(
-            "DATA;\n",
-            "#1=IFCCARTESIANPOINT((0.,1.,2.));\n",
-            "#2=IFCPOLYLINE((#1,#4))\n",
-            "#3=IFCDIRECTION((1.,0.,0.));\n",
-            "#4=IFCWALL('a',IFCLABEL('x',(#2,#3));\n",
-            "#5=IFCDIRECTION((1.,0.,0.));\n",
-            "#6=IFCWALL('b',$,%);\n",
-            "#7=IFCCARTESIANPOINT((3.,4.,5.));\n",
-            "ENDSEC;\n",
-        ));
-        let ids: Vec<_> = instances(&document)
-            .instances
-            .iter()
-            .map(|instance| instance.id)
-            .collect();
-
-        assert_eq!(ids, (1..=7).map(Some).collect::<Vec<_>>());
-    }
-}
+mod tests;

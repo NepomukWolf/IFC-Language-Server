@@ -3,12 +3,14 @@
 //! intermediates that should not leak into feature code.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone)]
 pub struct SchemaDoc {
-    pub entities: HashMap<String, EntityDoc>,
-    pub types: HashMap<String, TypeDoc>,
+    pub entities: FxHashMap<String, EntityDoc>,
+    pub types: FxHashMap<String, TypeDoc>,
 }
 
 impl SchemaDoc {
@@ -45,7 +47,7 @@ pub struct EntityDoc {
     pub name: String,
     pub attributes: Vec<EntityAttributeDoc>,
     pub url: String,
-    pub all_supertypes: HashSet<String>,
+    pub all_supertypes: FxHashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2,13 +2,15 @@
 //! It flattens inherited attributes, marks derived inherited attributes as omittable, and records
 //! transitive supertypes for reference compatibility checks.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::types::{DerivedAttributeDef, EntityDef, RawSchema};
 use crate::schema::{EntityAttributeDoc, EntityDoc, IfcVersion, SchemaDoc, TypeDoc};
 
 pub(crate) fn resolve_schema(version: Option<IfcVersion>, raw: RawSchema) -> SchemaDoc {
-    let mut entities = HashMap::new();
+    let mut entities = FxHashMap::default();
 
     for name in raw.entities.keys() {
         let attributes = resolve_all_attributes(&raw.entities, name, &mut HashSet::new());
@@ -33,7 +35,10 @@ pub(crate) fn resolve_schema(version: Option<IfcVersion>, raw: RawSchema) -> Sch
 
     SchemaDoc {
         entities,
-        types: raw.types.into_iter().collect::<HashMap<String, TypeDoc>>(),
+        types: raw
+            .types
+            .into_iter()
+            .collect::<FxHashMap<String, TypeDoc>>(),
     }
 }
 
@@ -95,12 +100,12 @@ fn resolve_all_supertypes(
     entities: &BTreeMap<String, EntityDef>,
     name: &str,
     visiting: &mut HashSet<String>,
-) -> HashSet<String> {
+) -> FxHashSet<String> {
     if !visiting.insert(name.to_string()) {
-        return HashSet::new();
+        return FxHashSet::default();
     }
 
-    let mut all_supertypes = HashSet::new();
+    let mut all_supertypes = FxHashSet::default();
 
     if let Some(entity) = entities.get(name) {
         for supertype in &entity.supertypes {

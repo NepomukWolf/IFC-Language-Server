@@ -19,14 +19,13 @@ Prefer the simplest implementation that matches the documented current scope in 
 - Keep changes aligned with the current `Backend` / `Document` / `document_index` / `SchemaDocCollection` split.
 - Prefer feature logic that operates on `&Document` instead of pushing more logic into the LSP trait implementation.
 - Preserve the current single-document model unless the work explicitly requires widening scope.
-- Preserve incremental tree-sitter parsing for document changes; use full parsing when loading AST state from scratch or receiving a full-text replacement.
+- Preserve statement-local re-parsing for document changes; use full parsing when loading a document from scratch or receiving a full-text replacement.
 - Keep text indexing full-document unless measurements demonstrate that further incremental complexity is needed.
-- Materialize complete entity-instance collections only in bounded background or explicit on-demand work; use targeted AST extraction for local feature requests.
-- Keep per-document text indexes small and independent from tree-sitter.
+- Materialize complete entity-instance collections only in bounded background or explicit on-demand work; decode only the statements a local feature request reads.
+- Keep per-document text indexes small and independent from the statement index.
 - Prefer the lightweight text index for navigation and simple token lookup.
-- Use tree-sitter only when syntax structure or parsed parameter values are required.
-- Do not retain AST-backed parse state for every open document.
-- New features must account for files above the configured AST parsing limit.
+- Use the statement index only when syntax structure or parsed parameter values are required.
+- Do not retain a statement index for every open document.
 
 ## Code Style
 
@@ -45,7 +44,7 @@ Prefer the simplest implementation that matches the documented current scope in 
   - Prefer the standard library or existing dependencies for small tasks.
 - Major architectural changes require approval.
 - Large refactors require approval.
-- Changes to the document memory strategy, AST loading/unloading behavior, or AST size-threshold behavior require explicit user approval.
+- Changes to the document memory strategy or statement-index loading/unloading behavior require explicit user approval.
 - No modifications to `./docs` without specific instructions by the user.
 - No deleting, resetting, or reverting unrelated work without approval.
 - Ask the user when encountering ambiguous requirements, conflicting docs, or risky edits.
@@ -53,7 +52,7 @@ Prefer the simplest implementation that matches the documented current scope in 
 ## Error Handling
 
 - Handle errors deliberately; do not ignore them silently.
-- Prefer graceful fallbacks for unsupported schema versions, missing docs, absent syntax nodes, and documents without loaded AST state.
+- Prefer graceful fallbacks for unsupported schema versions, missing docs, malformed statements, and documents without a loaded statement index.
 - Use `expect` only when failure is truly unrecoverable or in tests.
 - Avoid panics in normal LSP request handling paths.
 - Prefer runtime logging through `tracing` on `stderr`; keep `stdout` reserved for the LSP protocol stream.
@@ -62,7 +61,7 @@ Prefer the simplest implementation that matches the documented current scope in 
 
 - Prefer small unit tests close to the code they exercise.
 - Test behavior, not implementation noise.
-- When changing text indexing, parsing, AST loading/unloading, AST size limits, schema loading, version detection, or hover rendering, update tests in the same module.
+- When changing text indexing, parsing, statement-index loading/unloading, schema loading, version detection, or hover rendering, update tests in the same module.
 - Use short IFC snippets in tests unless a repository sample file is clearly more useful.
 - Note: Builds require internet access due to the EXPRESS schema pulling at compile time in `build.rs`.
 

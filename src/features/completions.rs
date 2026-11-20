@@ -1,5 +1,5 @@
 //! Lightweight STEP and schema-aware completions.
-//! Completion context is derived from document text and schema docs without loading AST state.
+//! Completion context is derived from document text and schema docs without the statement index.
 
 use std::collections::{HashMap, HashSet};
 
@@ -862,7 +862,7 @@ pub fn resolve_completion_item(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use crate::schema::{
         AggregateKind, AggregateTypeRef, AliasTypeDef, EntityAttributeDoc, EntityDoc,
@@ -907,7 +907,7 @@ mod tests {
             optional: false,
         });
         SchemaDoc {
-            entities: HashMap::from([
+            entities: FxHashMap::from_iter([
                 (
                     "IFCWALL".to_string(),
                     entity(
@@ -944,7 +944,7 @@ mod tests {
                     entity("IfcOwnerHistory", Vec::new(), &[]),
                 ),
             ]),
-            types: HashMap::from([
+            types: FxHashMap::from_iter([
                 (
                     "IFCGLOBALLYUNIQUEID".to_string(),
                     TypeDoc::Alias(AliasTypeDef {
@@ -1458,8 +1458,7 @@ mod tests {
 
     #[test]
     fn schema_aware_completions_do_not_require_ast() {
-        let mut document = Document::new_unloaded("#1=IFCWALL(".to_string());
-        document.ast_skipped = true;
+        let document = Document::new_unloaded("#1=IFCWALL(".to_string());
         let position = document.offset_to_position(document.text.len()).unwrap();
         assert!(
             completions(
@@ -1502,6 +1501,6 @@ mod tests {
     fn test_schema_has_no_accidental_duplicate_supertypes() {
         let schema = schema();
         let supers = &schema.entity("IfcWall").unwrap().all_supertypes;
-        assert_eq!(supers, &HashSet::from(["IFCROOT".to_string()]));
+        assert_eq!(supers, &FxHashSet::from_iter(["IFCROOT".to_string()]));
     }
 }

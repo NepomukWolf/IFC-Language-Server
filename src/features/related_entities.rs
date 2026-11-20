@@ -237,7 +237,7 @@ fn self_entity_id(
     position: Position,
     sorted_defs: &mut Option<Vec<(usize, u32)>>,
 ) -> Option<u32> {
-    if let Some((id, _)) = document.id_token_at_position(position) {
+    if let Some(id) = document.instance_id_at_position(position) {
         return Some(id);
     }
 
@@ -266,8 +266,6 @@ fn enclosing_definition_id(sorted_defs: &[(usize, u32)], offset: usize) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet as StdHashSet;
-
     use tower_lsp::lsp_types::CodeActionKind;
 
     use super::*;
@@ -289,7 +287,7 @@ mod tests {
             name: name.to_string(),
             attributes: attribute_names.iter().map(|name| attribute(name)).collect(),
             url: String::new(),
-            all_supertypes: StdHashSet::new(),
+            all_supertypes: Default::default(),
         }
     }
 
@@ -325,7 +323,8 @@ mod tests {
                     ),
                 ),
             ]
-            .into(),
+            .into_iter()
+            .collect(),
             types: Default::default(),
         }
     }

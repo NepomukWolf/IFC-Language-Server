@@ -382,6 +382,11 @@ impl Lookahead {
         found
     }
 
+    /// The furthest offset comment searches have read up to since the last call.
+    pub(crate) fn take_comment_reach(&mut self) -> usize {
+        std::mem::take(&mut self.comment_reach)
+    }
+
     /// Whether a line break lies in `text[from..to]`.
     pub(crate) fn line_break(&mut self, text: &[u8], from: usize, to: usize) -> bool {
         first_match(&mut self.line_break, text, from, text.len(), 1, |hay| {
