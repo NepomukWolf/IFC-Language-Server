@@ -15,7 +15,7 @@
 - Signature help for IFC entity parameter lists
 - Document symbols for editor Outline, breadcrumbs, and go-to-symbol navigation
 - IFC STEP boilerplate via `!ifc` / `!!ifc` / `!!!ifc` completions and empty-document code actions
-- Range-based semantic tokens for syntax highlighting
+- Range-based semantic tokens for syntax highlighting, off by default (see `semanticTokensEnabled`)
 - Schema-aware diagnostics for:
   - invalid local reference targets
   - primitive datatype mismatches
@@ -125,7 +125,7 @@ Supported options:
 
 - `semanticTokensEnabled`
   - Enables range-based semantic tokens.
-  - Defaults to `true`.
+  - Defaults to `false`. The tokens only mark lexical categories (keywords, entity names, ids, strings, numbers, enumerations, operators, comments), which every supported editor already colours with its own grammar or syntax file. Requesting them on top costs time on large files.
 
 Configuration changes currently require restarting the server.
 
