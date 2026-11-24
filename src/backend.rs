@@ -25,7 +25,7 @@ use crate::schema::{
     SchemaDoc, SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ConfigState {
     forced_schema_name: Option<String>,
     additional_schema_paths: HashMap<String, std::path::PathBuf>,
@@ -33,19 +33,6 @@ struct ConfigState {
     semantic_tokens_enabled: bool,
     completion_snippet_support: bool,
     completion_documentation_resolve_support: bool,
-}
-
-impl Default for ConfigState {
-    fn default() -> Self {
-        Self {
-            forced_schema_name: None,
-            additional_schema_paths: HashMap::new(),
-            pending_init_config: None,
-            semantic_tokens_enabled: true,
-            completion_snippet_support: false,
-            completion_documentation_resolve_support: false,
-        }
-    }
 }
 
 const DIAGNOSTICS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);

@@ -167,7 +167,7 @@ The language server should provide range-based semantic tokens for IFC STEP synt
 
 Semantic tokens should:
 
-- be enabled by default
+- be disabled by default: in their current form they mark only lexical categories, which every supported editor already colours with its own grammar or syntax file
 - be configurable through `initializationOptions.semanticTokensEnabled`
 - remain available without the statement index
 - support large files through range requests rather than requiring full-document tokenization
