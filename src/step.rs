@@ -349,22 +349,37 @@ impl Document {
                 })
                 .collect();
         }
+        self.read_parameters(text, index, true).1
+    }
+
+    /// Whether decoding a statement produces a parameter list, without retaining its values.
+    pub fn has_parameters(&self, text: &[u8], index: usize) -> bool {
+        if self.retain {
+            self.statements[index].param_len != 0
+        } else {
+            self.read_parameters(text, index, false).0
+        }
+    }
+
+    fn read_parameters(&self, text: &[u8], index: usize, retain: bool) -> (bool, Vec<Param>) {
+        let s = self.statements[index];
         let mut params = Vec::new();
         let mut r = Reader {
             text,
             p: s.name.end as usize,
             end: s.span.end as usize,
             params: &mut params,
-            retain: true,
+            retain,
             depth: 0,
             recovered: false,
             skipped: Vec::new(),
             ahead: Lookahead::default(),
         };
-        if r.list(Kind::List).is_err() && !r.recovered {
+        let valid = r.list(Kind::List).is_ok() || r.recovered;
+        if !valid {
             params.clear();
         }
-        params
+        (valid, params)
     }
 
     pub fn edit(&mut self, removed: &[u8], new: &[u8], edit: Edit) -> EditOutcome {

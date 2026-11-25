@@ -3,12 +3,22 @@ use std::collections::HashMap;
 use crate::document::Document;
 use crate::schema::SchemaDoc;
 
-use super::step_scan::{ScannedInstance, string_literal};
+use super::step_scan::{ScannedInstance, scan_document_instance, string_literal};
 
 #[derive(Default)]
 pub(super) struct Label {
     pub(super) global_id: Option<String>,
     pub(super) name: Option<String>,
+}
+
+impl Label {
+    pub(super) fn contains(&self, lowercase_query: &str) -> bool {
+        [&self.global_id, &self.name].into_iter().any(|value| {
+            value
+                .as_deref()
+                .is_some_and(|value| value.to_lowercase().contains(lowercase_query))
+        })
+    }
 }
 
 pub(super) struct LabelReader<'a> {
@@ -24,6 +34,15 @@ impl<'a> LabelReader<'a> {
             schema,
             attribute_indexes: HashMap::new(),
         }
+    }
+
+    pub(super) fn read(&mut self, offset: usize, entity: &str) -> Label {
+        let (global_id_index, name_index) = self.attribute_indexes(entity);
+        if global_id_index.is_none() && name_index.is_none() {
+            return Label::default();
+        }
+        scan_document_instance(self.document, offset)
+            .map_or_else(Label::default, |(instance, _)| self.read_scanned(&instance))
     }
 
     pub(super) fn read_scanned(&mut self, instance: &ScannedInstance) -> Label {

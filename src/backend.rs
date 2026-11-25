@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockWriteGuard, Semaphore};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp::{Client, ClientSocket, LanguageServer, LspService};
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::{ServerConfig, expand_schema_candidates, parse_server_config};
@@ -18,8 +18,8 @@ use crate::diagnostics::scheduler::{DiagnosticScheduler, DiagnosticTicket};
 use crate::document::{Document, EntityInstanceCache};
 use crate::features::{
     call_hierarchy, completions, definition, document_highlight, document_symbols, hover,
-    inlay_hints, references, related_entities, scaffold_completions, semantic_tokens,
-    signature_help,
+    inlay_hints, instance_queries, instances, references, related_entities, scaffold_completions,
+    semantic_tokens, signature_help,
 };
 use crate::schema::{
     SchemaDoc, SchemaDocCollection, inspect_local_schema_name, load_local_schema, normalize_name,
@@ -46,6 +46,7 @@ pub struct Backend {
     unknown_schema_warned: Arc<RwLock<HashMap<Url, Option<String>>>>,
     diagnostic_scheduler: DiagnosticScheduler,
     instance_cache: Arc<EntityInstanceCache>,
+    instance_work: Arc<Semaphore>,
 }
 
 impl Backend {
@@ -59,7 +60,19 @@ impl Backend {
             unknown_schema_warned: Arc::new(RwLock::new(HashMap::new())),
             diagnostic_scheduler,
             instance_cache: Arc::new(EntityInstanceCache::default()),
+            instance_work: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    pub fn service() -> (LspService<Self>, ClientSocket) {
+        LspService::build(Self::new)
+            .custom_method(instances::METHOD, Self::instances)
+            .custom_method(instance_queries::ENTITY_COUNTS_METHOD, Self::entity_counts)
+            .custom_method(
+                instance_queries::FIND_INSTANCES_METHOD,
+                Self::find_instances,
+            )
+            .finish()
     }
 
     #[instrument(skip(self), fields(uri = %uri, schema_name = schema_name.unwrap_or("<none>")))]
@@ -389,6 +402,107 @@ impl Backend {
                 None
             }
         }
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.uri))]
+    async fn instances(
+        &self,
+        params: instances::InstancesParams,
+    ) -> Result<Option<instances::Instances>> {
+        let uri = params.uri;
+        let mut documents = self.documents.write().await;
+        let diagnostic_snapshot = match self.ensure_document_loaded(&mut documents, &uri).await {
+            Some(snapshot) => snapshot,
+            None => return Ok(None),
+        };
+        let Some(document) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let schema_name = document.schema_name.clone();
+        let text = Arc::clone(&document.text);
+        let line_offsets = document.line_offsets.clone();
+        let parsed = document
+            .statement_index
+            .clone()
+            .expect("document is loaded");
+        drop(documents);
+
+        let schema = self.resolve_schema(schema_name.as_deref()).await;
+        let permit = Arc::clone(&self.instance_work)
+            .acquire_owned()
+            .await
+            .expect("instance work limiter is open");
+        let result = crate::rt::spawn_blocking(move || {
+            let _permit = permit;
+            instances::instances(
+                &text,
+                &line_offsets,
+                &parsed,
+                schema
+                    .as_ref()
+                    .map(|(name, schema)| (name.as_str(), schema.as_ref())),
+                params.limit,
+            )
+        })
+        .await
+        .map_err(|error| {
+            warn!(%error, "instances task failed");
+            tower_lsp::jsonrpc::Error::internal_error()
+        })?;
+
+        self.request_time_diagnostics(diagnostic_snapshot, &uri)
+            .await;
+        debug!(
+            total = result.total,
+            listed = result.instances.len(),
+            "instances request completed"
+        );
+
+        Ok(Some(result))
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.uri))]
+    async fn entity_counts(
+        &self,
+        params: instance_queries::EntityCountsParams,
+    ) -> Result<Option<instance_queries::EntityCounts>> {
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&params.uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = instance_queries::entity_counts(
+            document,
+            schema.as_ref().map(|(name, _)| name.as_str()),
+        );
+        debug!(total = result.total, "entity counts request completed");
+
+        Ok(Some(result))
+    }
+
+    #[instrument(skip(self, params), fields(uri = %params.uri))]
+    async fn find_instances(
+        &self,
+        params: instance_queries::FindInstancesParams,
+    ) -> Result<Option<instance_queries::FoundInstances>> {
+        let documents = self.documents.read().await;
+        let Some(document) = documents.get(&params.uri) else {
+            return Ok(None);
+        };
+        let schema = self.resolve_schema(document.schema_name.as_deref()).await;
+
+        let result = instance_queries::find_instances(
+            document,
+            schema.as_ref().map(|(_, schema)| schema.as_ref()),
+            &params,
+        );
+        debug!(
+            total = result.as_ref().map_or(0, |result| result.total),
+            "find instances request completed"
+        );
+
+        Ok(result)
     }
 
     #[instrument(skip(self, config))]
@@ -1552,6 +1666,33 @@ mod tests {
             None,
         );
         document_symbols::document_symbols(&document.text, &instances, None)
+    }
+
+    #[tokio::test]
+    async fn instances_wait_for_the_work_permit() {
+        let (service, _socket) = LspService::new(Backend::new);
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/instances.ifc").unwrap();
+        backend.documents.write().await.insert(
+            uri.clone(),
+            Document::new_unloaded("DATA;\n#1=IFCX($);\nENDSEC;\n".to_string()),
+        );
+        let permit = backend.instance_work.clone().acquire_owned().await.unwrap();
+        let request = backend.instances(instances::InstancesParams { uri, limit: None });
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut request)
+                .await
+                .is_err()
+        );
+        drop(permit);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.instances[0].id, Some(1));
     }
 
     #[tokio::test]
